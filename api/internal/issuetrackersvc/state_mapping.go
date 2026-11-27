@@ -78,6 +78,39 @@ func (s *Service) linkedSource(ctx context.Context, userID, repoID uuid.UUID) (s
 	return src, nil
 }
 
+// listCheckedStates refuses a linked project whose State field is run by a state machine
+// (PRD #4173, StateMachineRefusal), then lists its States. The check comes first so nothing
+// is saved or shown for a project uzi cannot write.
+func (s *Service) listCheckedStates(ctx context.Context, userID uuid.UUID, src store.GetRepoIssueSourceForUserRow) ([]issuetracker.State, error) {
+	// The stored project id goes into every driver request, so it is checked before a
+	// driver is built.
+	if !issuetracker.ValidProjectID(src.IssueTrackerProjectID.String) {
+		return nil, &Error{Kind: KindBadRequest, Message: "invalid project id"}
+	}
+	connID := uuid.UUID(src.LinkedConnectionID.Bytes)
+	d, err := s.DriverFor(ctx, userID, connID, issuetracker.Binding{}, issuetracker.StateMapping{})
+	if err != nil {
+		return nil, err
+	}
+	if err := checkStateField(ctx, d, issuetracker.ProjectRef{ID: src.IssueTrackerProjectID.String, ShortName: src.IssueTrackerProjectShort.String}); err != nil {
+		return nil, err
+	}
+	return listStates(ctx, d, src.IssueTrackerProjectID.String)
+}
+
+// listStates lists the issue states of one project through d; a driver failure is a bad
+// gateway. The project id check repeats the caller's, as a backstop for a new caller.
+func listStates(ctx context.Context, d issuetracker.Driver, projectID string) ([]issuetracker.State, error) {
+	if !issuetracker.ValidProjectID(projectID) {
+		return nil, &Error{Kind: KindBadRequest, Message: "invalid project id"}
+	}
+	states, err := d.ListStates(ctx, projectID)
+	if err != nil {
+		return nil, &Error{Kind: KindBadGateway, Message: "could not list states: " + err.Error()}
+	}
+	return states, nil
+}
+
 // GetStateMapping returns the saved state mapping of a linked repo and the States of its
 // project. A repo that is not the user's is NotFound and one that is not linked is a
 // Conflict.
@@ -86,7 +119,7 @@ func (s *Service) GetStateMapping(ctx context.Context, userID, repoID uuid.UUID)
 	if err != nil {
 		return StateMappingView{}, err
 	}
-	states, err := s.ListStates(ctx, userID, uuid.UUID(src.LinkedConnectionID.Bytes), src.IssueTrackerProjectID.String)
+	states, err := s.listCheckedStates(ctx, userID, src)
 	if err != nil {
 		return StateMappingView{}, err
 	}
@@ -133,7 +166,7 @@ func (s *Service) SetStateMapping(ctx context.Context, userID, repoID uuid.UUID,
 	if err != nil {
 		return StateMapping{}, err
 	}
-	states, err := s.ListStates(ctx, userID, uuid.UUID(src.LinkedConnectionID.Bytes), src.IssueTrackerProjectID.String)
+	states, err := s.listCheckedStates(ctx, userID, src)
 	if err != nil {
 		return StateMapping{}, err
 	}

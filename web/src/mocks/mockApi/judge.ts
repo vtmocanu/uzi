@@ -57,8 +57,8 @@ const pendingJudges: Record<string, PendingJudge> = Object.fromEntries(
 // The recorded automatic-judge skips (PRD #3257), the same mutable-copy pattern. getRunReview
 // reads it; rerunJudge refuses a skipped target (the demo owner still has no usable credential
 // for the judge's harness, or a provider refusal still applies), so no mock judge is created
-// over a skip row, except a historical Claude provider_lane_unsupported row (#4322 M1a), which
-// the real server now judges on the owner's provider source.
+// over a skip row, except a historical Claude or Codex provider_lane_unsupported row (#4322 M1a,
+// #4574), which the real server now judges on the owner's provider source.
 const judgeSkips: Record<string, JudgeSkip> = Object.fromEntries(
   Object.entries(mockJudgeSkips).map(([id, s]) => [id, { ...s }]),
 );
@@ -1005,10 +1005,12 @@ export const judgeApi = {
     // still has no usable credential for the judge's harness in the demo, so Run judge returns the real 422 (handler RerunJudge's
     // no_credential_for_harness body) and the panel shows it inline. No judge is created on
     // the other harness.
-    // A historical Claude provider_lane_unsupported row (#4322 M1a): a Claude judge now runs on
-    // the owner's provider source, so the real server would create the judge; so does the mock.
-    const historicalClaudeLane = judgeSkips[id]?.reason === "provider_lane_unsupported" && judgeSkips[id]?.harness === "claude";
-    const skip = historicalClaudeLane ? undefined : judgeSkips[id];
+    // A historical provider_lane_unsupported row (Claude: #4322 M1a, Codex: #4574): both judges
+    // now run on the owner's provider source, so the real server would create the judge; so does
+    // the mock.
+    const historicalLane = judgeSkips[id]?.reason === "provider_lane_unsupported"
+      && (judgeSkips[id]?.harness === "claude" || judgeSkips[id]?.harness === "codex");
+    const skip = historicalLane ? undefined : judgeSkips[id];
     // A provider_* skip mirrors writeRerunJudgeError's 409 reason codes and messages.
     const providerRefusal: Record<string, string> = {
       provider_source_unusable: "your source is a model provider that cannot serve a run",

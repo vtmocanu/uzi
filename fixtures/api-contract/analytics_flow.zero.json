@@ -1,0 +1,171 @@
+{
+  "scope": {
+    "route": "",
+    "user": ""
+  },
+  "generated_at": "0001-01-01T00:00:00Z",
+  "window": "",
+  "timezone": "",
+  "from": "0001-01-01T00:00:00Z",
+  "to": "0001-01-01T00:00:00Z",
+  "history_start": null,
+  "bucket_width_days": 0,
+  "buckets": null,
+  "rolling": null,
+  "selected_user": "",
+  "filters": {
+    "repo": null,
+    "harness": null,
+    "kinds": null
+  },
+  "waiting_now": {
+    "time_basis": "",
+    "population": "",
+    "states": null,
+    "total": 0
+  },
+  "activity": {
+    "created": {
+      "time_basis": "",
+      "population": "",
+      "total": 0,
+      "buckets": null
+    },
+    "finished": {
+      "time_basis": "",
+      "population": "",
+      "excluded_kinds": null,
+      "total": {
+        "completed": 0,
+        "cancelled": 0,
+        "plan_rejected": 0,
+        "base_diverged": 0,
+        "failed": 0,
+        "total": 0
+      },
+      "buckets": null
+    }
+  },
+  "first_start_delay": {
+    "time_basis": "",
+    "population": "",
+    "approximate": false,
+    "limitations": null,
+    "observed": 0,
+    "not_started": 0,
+    "invalid": 0,
+    "p50_seconds": {
+      "value": null,
+      "reason": null
+    },
+    "p90_seconds": {
+      "value": null,
+      "reason": null
+    }
+  },
+  "plan_response": {
+    "time_basis": "",
+    "population": "",
+    "approximate": false,
+    "n": 0,
+    "p50_seconds": {
+      "value": null,
+      "reason": null
+    },
+    "p90_seconds": {
+      "value": null,
+      "reason": null
+    },
+    "unknown": {
+      "total": 0,
+      "reasons": {
+        "ambiguous": 0,
+        "no_presentation": 0,
+        "invalid_chronology": 0,
+        "excluded_disposition": 0,
+        "reconciliation_only": 0,
+        "legacy_unbound": 0
+      }
+    },
+    "not_approved": 0
+  },
+  "delivery_funnel": {
+    "time_basis": "",
+    "population": "",
+    "applicable": false,
+    "reason": null,
+    "stages": {
+      "created": 0,
+      "plan_settled": 0,
+      "completed": 0,
+      "pr_present": 0,
+      "merged": 0
+    },
+    "planning": {
+      "settled_human": 0,
+      "settled_auto": 0,
+      "skipped": 0,
+      "rejected": 0,
+      "in_progress": 0,
+      "failed": 0,
+      "cancelled": 0,
+      "unknown": 0
+    },
+    "outcomes": {
+      "completed": 0,
+      "failed": 0,
+      "cancelled": 0,
+      "plan_rejected": 0,
+      "base_diverged": 0,
+      "in_progress": 0
+    },
+    "disclosure": {
+      "historical_approval_only": 0,
+      "ambiguous_current": 0,
+      "legacy_evidence": 0
+    },
+    "pr_units": {
+      "present": 0,
+      "merged": 0,
+      "buckets": null
+    }
+  },
+  "approval": {
+    "time_basis": "",
+    "population": "",
+    "applicable": false,
+    "reason": null,
+    "total": 0,
+    "human": 0,
+    "auto_approve_configured": 0,
+    "unknown": {
+      "total": 0,
+      "reasons": {
+        "ambiguous": 0,
+        "legacy_unbound": 0,
+        "historical_approval_only": 0,
+        "no_evidence": 0
+      }
+    }
+  },
+  "issue_elapsed": {
+    "time_basis": "",
+    "population": "",
+    "applicable": false,
+    "reason": null,
+    "n": 0,
+    "unfinished": 0,
+    "invalid": 0,
+    "incomplete": false,
+    "p50_seconds": {
+      "value": null,
+      "reason": null
+    },
+    "p90_seconds": {
+      "value": null,
+      "reason": null
+    },
+    "histogram": null,
+    "buckets": null
+  }
+}

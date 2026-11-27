@@ -785,7 +785,7 @@ func (m tuiModel) detailHeaderLines() []string {
 		crumb += m.pal.faint.Render(" · " + m.renderer.Plain(d.run.Kind, 12))
 	}
 	if d.run.IssueIID != nil {
-		styledIID := m.pal.title.Render("#" + itoa(int(*d.run.IssueIID)))
+		styledIID := m.pal.title.Render(issueRef(*d.run.IssueIID, m.renderer.Plain(d.run.IssueKey, tuiIssueKeyCells)))
 		crumb += m.pal.faint.Render(" · ") + m.issueLink(d.run, styledIID)
 	}
 

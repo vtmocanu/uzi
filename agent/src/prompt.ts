@@ -186,6 +186,9 @@ const LEAD_EXPORT_SLOT_RULE = [
  * Codex, GOCACHE is the adopted per-run cache outside the per-command HOME, so the filesystem
  * read is the one holding the resolved GOCACHE. In the runtime append so a customized lead
  * carries it on both harnesses; the subagent half is SUBAGENT_GO_CLEAN_RULE.
+ * Issue #4741: the rule only said what to do with a reading, so leads reached handoffs with a
+ * stale or no reading; the Handoff paragraph requires a fresh reading at every settled
+ * validation handoff and exactly one recorded disposition, without changing any threshold or guard.
  */
 const LEAD_GO_CACHE_RULE = [
   "Go build cache under disk pressure (advisory; not an enforced cap or a predicted next-wave",
@@ -205,6 +208,22 @@ const LEAD_GO_CACHE_RULE = [
   "reading below 70%, then a later reading at or above 75%. Fresh cache growth to at least",
   "12 GiB may independently trigger another attempt at a settled boundary. Keep stable export",
   "slots and warm reuse within a wave.",
+  "Handoff: at every completed validation-wave handoff that ran or will run Go builds or tests",
+  "(a milestone close, a review or rework dispatch, the step before the next wave), when",
+  "settlement, ownership (verified as under Ownership below) and a safe measurement of the",
+  "resolved, verified run-owned `GOCACHE` are all established and no independent consumer is",
+  "known or suspected, take a fresh reading of that cache's size and its filesystem use; a",
+  "reading from an earlier handoff is never reused. Record exactly one disposition in the run's",
+  "progress notes:",
+  "- `skipped: <reason>` when settlement or ownership is unknown, safe measurement is not",
+  "  possible, or an independent consumer is known or suspected. No reading is forced, and the",
+  "  guard above holds.",
+  "- `skipped: reading failed` for a failed or partial reading (unknown, not zero, not a trigger).",
+  "- `kept (below threshold)` when the cache is below 12 GiB and the filesystem below 75%.",
+  "- `kept (filesystem episode not re-armed)` when the filesystem is still at or above 75% in an",
+  "  episode with a previous cleanup attempt (successful or failed) and not re-armed (no reading",
+  "  below 70% since), with the cache below 12 GiB.",
+  "- `cleared (before → after)` or `cleanup failed` when a trigger fires.",
   "Ownership: before cleaning, resolve `go env GOCACHE` in the same tool environment that built",
   "the code and confirm by its canonical path that it is this run's own cache, with no explicit",
   "shared or external override and no `GOCACHEPROG` backend. On Codex, `GOCACHE` legitimately",

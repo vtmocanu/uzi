@@ -11,7 +11,7 @@
 // Settings → Models. This page keeps only behavior, plus a read-only summary of what
 // the judge runs on and a link to change it there.
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { api } from "../lib/api";
@@ -89,6 +89,24 @@ function RunDefaultsEditor() {
   const [committedSettings, setCommittedSettings] = useState<UserSettings | null>(null);
   const [autopilotBusy, setAutopilotBusy] = useState(false);
   const [autopilotError, setAutopilotError] = useState("");
+  // Whether the user has a repo linked to an issue tracker (PRD 4173 M6). Autopilot has no
+  // per-repo control and never acts there, so the section says so, to this user only. The
+  // note is advisory: a failed read shows no note and no error.
+  const [hasLinkedRepo, setHasLinkedRepo] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const { repos } = await api.listRepos();
+        if (alive) setHasLinkedRepo(repos.some((r) => r.issue_tracker_link));
+      } catch {
+        // Advisory only.
+      }
+    })();
+    return () => {
+      alive = false;
+    };
+  }, []);
 
   const toggleAutopilot = async (enabled: boolean) => {
     setAutopilotError("");
@@ -446,6 +464,9 @@ function RunDefaultsEditor() {
             forge username you set under Forge, so only issues that trace back to you can spend your tokens.
             Off by default.
           </p>
+          {hasLinkedRepo && (
+            <p className="mt-2 text-sm text-muted">Autopilot does not act on repos linked to an issue tracker.</p>
+          )}
         </div>
 
         {autopilotError && <Alert message={autopilotError} />}

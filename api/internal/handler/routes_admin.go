@@ -84,11 +84,16 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			r.With(forgeLimiter.PerUserMiddleware).Get("/guardrail-impact", h.AdminGuardrailImpact)
 			// Factory-wide token/cost usage + per-user breakdown (PRD #40).
 			r.Get("/usage", h.AdminUsage)
-			// Scoped usage analytics (issue #4684): filter options and Spend. The admin read
-			// group only; reveal-repos comes from this mount, never from the query.
+			// Scoped usage analytics (issue #4684): filter options and Spend; Reliability (#4685),
+			// Capacity (#4731) and Quality (#4730). The admin read group only; reveal-repos comes
+			// from this mount, never from the query.
 			r.Get("/analytics/options", h.AdminAnalyticsOptions)
 			r.Get("/analytics/spend", h.AdminAnalyticsSpend)
 			r.Get("/analytics/reliability", h.AdminAnalyticsReliability)
+			r.Get("/analytics/capacity", h.AdminAnalyticsCapacity)
+			r.Get("/analytics/quality", h.AdminAnalyticsQuality)
+			// Scoped run Flow (issue #4729), same admin read group and reveal rules.
+			r.Get("/analytics/flow", h.AdminAnalyticsFlow)
 			// Every user's Claude rate-limit meters + staleness (PRD #53). Mirrors
 			// /usage: admin-only via this group, per-user rows incl. no_token.
 			r.Get("/rate-limits", h.AdminRateLimits)

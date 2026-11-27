@@ -1384,6 +1384,23 @@ describe("lead Go build-cache cleanup rule (issue #4346)", () => {
     "Never narrow a required check, drop `-race`, or waive a frozen acceptance criterion",
     "Subagents never run `go clean`",
   ];
+  // Issue #4741: a fresh reading and exactly one recorded disposition at every settled
+  // handoff. Each disposition is pinned together with its condition, so a token moved onto
+  // the wrong condition fails.
+  const HANDOFF_PHRASES = [
+    "at every completed validation-wave handoff that ran or will run Go builds or tests",
+    "(a milestone close, a review or rework dispatch, the step before the next wave)",
+    "when settlement, ownership (verified as under Ownership below) and a safe measurement of the resolved, verified run-owned `GOCACHE` are all established and no independent consumer is known or suspected",
+    "take a fresh reading of that cache's size and its filesystem use",
+    "a reading from an earlier handoff is never reused",
+    "Record exactly one disposition in the run's progress notes",
+    "`skipped: <reason>` when settlement or ownership is unknown, safe measurement is not possible, or an independent consumer is known or suspected",
+    "No reading is forced, and the guard above holds",
+    "`skipped: reading failed` for a failed or partial reading",
+    "`kept (below threshold)` when the cache is below 12 GiB and the filesystem below 75%",
+    "`kept (filesystem episode not re-armed)` when the filesystem is still at or above 75% in an episode with a previous cleanup attempt (successful or failed) and not re-armed (no reading below 70% since), with the cache below 12 GiB",
+    "`cleared (before → after)` or `cleanup failed` when a trigger fires",
+  ];
   const cases = [
     ["builtin lead, claude", undefined, { harness: "claude" }],
     ["customized lead, claude", "custom lead prompt", { harness: "claude" }],
@@ -1395,6 +1412,7 @@ describe("lead Go build-cache cleanup rule (issue #4346)", () => {
     it(`${label}: the composed system prompt carries the cache rule`, () => {
       const append = flat(buildLeadSystemPrompt(body, opts).append);
       for (const phrase of CACHE_RULE_PHRASES) assert.ok(append.includes(phrase), `missing ${JSON.stringify(phrase)}`);
+      for (const phrase of HANDOFF_PHRASES) assert.ok(append.includes(phrase), `missing handoff ${JSON.stringify(phrase)}`);
       // The subagent-only prohibition is not part of the lead's composition.
       assert.ok(!append.includes(SUBAGENT_GO_CLEAN_RULE), "lead append must not carry the subagent prohibition");
     });

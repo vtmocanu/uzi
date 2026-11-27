@@ -35,8 +35,9 @@ type Link struct {
 // (PRD #4173 D13, D14). It is refused unless the repo is still awaiting its
 // first enable and is not linked yet; there is no relink and no unlink.
 //
-// The check against the issue tracker is read-only (token, project list, tag
-// list); it never writes to the tracker. The tag must be one the connection's
+// The check against the issue tracker is read-only (token, project list, a
+// sample of the project's issues to see whether its State field is run by a
+// state machine, tag list); it never writes to the issue tracker. The tag must be one the connection's
 // account can apply and that someone else can apply too. That is a statement
 // about the tag's sharing settings only: it does not prove that anyone can edit
 // issues in the project, and no message here says it does. The database part runs
@@ -143,7 +144,7 @@ func errAccountChanged() *Error {
 }
 
 // checkLinkTarget is the read-only part of LinkRepo. It returns the verified
-// account and the project and tag exactly as the tracker listed them.
+// account and the project and tag exactly as the issue tracker listed them.
 func (s *Service) checkLinkTarget(ctx context.Context, userID, connID uuid.UUID, row store.IssueTrackerConnection, projectID, tagID string) (issuetracker.Account, issuetracker.Project, issuetracker.Tag, error) {
 	var (
 		noAccount issuetracker.Account
@@ -195,6 +196,10 @@ func (s *Service) checkLinkTarget(ctx context.Context, userID, connID uuid.UUID,
 	if utf8.RuneCountInString(project.ShortName) > maxProjectShortLen ||
 		issuetracker.ValidProjectRef(issuetracker.ProjectRef{ID: project.ID, ShortName: project.ShortName}) != nil {
 		return noAccount, noProject, noTag, &Error{Kind: KindBadRequest, Message: "the project's short name cannot be used for a link: it must start with a letter, hold only letters, digits and underscores, and be at most 44 characters"}
+	}
+
+	if err := checkStateField(ctx, d, issuetracker.ProjectRef{ID: project.ID, ShortName: project.ShortName}); err != nil {
+		return noAccount, noProject, noTag, err
 	}
 
 	tags, err := d.ListTags(ctx)

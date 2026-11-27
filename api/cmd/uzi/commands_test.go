@@ -553,7 +553,7 @@ func TestReviewShowJudgeSkip(t *testing.T) {
 		{"codex", "credential_disabled", "Judge skipped 2026-11-10: the Codex credential is disabled."},
 		{"codex", "codex_pool_unavailable", "Judge skipped 2026-11-10: no pooled Codex account was available."},
 		{"claude", "provider_lane_unsupported", "Judge skipped 2026-11-10: the selected source was a model provider, which the judge did not support at the time."},
-		{"codex", "provider_lane_unsupported", "Judge skipped 2026-11-10: the selected Codex source is a model provider, which the Codex judge does not support yet."},
+		{"codex", "provider_lane_unsupported", "Judge skipped 2026-11-10: the selected Codex source is a model provider, which the Codex judge did not support at the time."},
 		{"gemini", "provider_lane_unsupported", "Judge skipped 2026-11-10: the selected source is a model provider, which the judge does not support yet."},
 		{"claude", "provider_source_unusable", "Judge skipped 2026-11-10: the selected model provider could not serve the judge."},
 		{"claude", "provider_model_unmapped", "Judge skipped 2026-11-10: the model provider did not map the judge's model."},

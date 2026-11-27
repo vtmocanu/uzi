@@ -774,6 +774,9 @@ WHERE r.id = @repo_id;
 SELECT sqlc.embed(r), rp.path_with_namespace AS repo_path, w.name AS worker_name,
        c.forge_type,
        i.web_url                 AS issue_web_url,   -- PRD #411: the forge issue's web URL for the run's clickable #<iid> link
+       -- PRD #4173 M6: the issue tracker project short name of a LINKED repo (empty for an unlinked or repo-less run),
+       -- so the handler derives the run's issue_key without a per-row repo read.
+       COALESCE(CASE WHEN rp.issue_tracker_connection_id IS NOT NULL AND rp.issue_tracker_project_short <> '' THEN rp.issue_tracker_project_short END, '')::text AS issue_tracker_project_short,
        -- PRD #320 D8: the DISPLAY priority class from the ONE SQL function, so the
        -- Runs-list pill and ClaimRun's ORDER BY are the same decision. @background_grace_cutoff
        -- (now − RUN_BACKGROUND_GRACE) is the D4 fail-open flag: a demoted run created
@@ -956,6 +959,9 @@ WHERE run_id = @run_id::uuid
 SELECT sqlc.embed(r), rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email,
        c.forge_type,
        i.web_url                 AS issue_web_url,   -- PRD #411: the forge issue's web URL for the run's clickable #<iid> link
+       -- PRD #4173 M6: the issue tracker project short name of a LINKED repo (empty for an unlinked or repo-less run),
+       -- so the handler derives the run's issue_key without a per-row repo read.
+       COALESCE(CASE WHEN rp.issue_tracker_connection_id IS NOT NULL AND rp.issue_tracker_project_short <> '' THEN rp.issue_tracker_project_short END, '')::text AS issue_tracker_project_short,
        -- PRD #320 D8: the DISPLAY priority class from the ONE SQL function (same as
        -- ListRunsForUser), so the admin overview pill and the claim order agree.
        -- @background_grace_cutoff (now − RUN_BACKGROUND_GRACE) is the D4 fail-open flag.
@@ -1018,6 +1024,9 @@ LIMIT 500;
 SELECT sqlc.embed(r), rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email,
        c.forge_type,
        i.web_url                 AS issue_web_url,   -- PRD #411: the forge issue's web URL for the run's clickable #<iid> link
+       -- PRD #4173 M6: the issue tracker project short name of a LINKED repo (empty for an unlinked or repo-less run),
+       -- so the handler derives the run's issue_key without a per-row repo read.
+       COALESCE(CASE WHEN rp.issue_tracker_connection_id IS NOT NULL AND rp.issue_tracker_project_short <> '' THEN rp.issue_tracker_project_short END, '')::text AS issue_tracker_project_short,
        -- PRD #320 D8: the DISPLAY priority class from the ONE SQL function (same as
        -- ListRunsForUser), so the admin overview pill and the claim order agree.
        -- @background_grace_cutoff (now − RUN_BACKGROUND_GRACE) is the D4 fail-open flag.
@@ -1555,7 +1564,7 @@ WITH checker_template_pins AS MATERIALIZED (
       -- unknown claim key and start the run with no model credential. Same @worker_protocol_caps.
       AND (r.model_provider_key_mode IS NULL
            OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(@worker_protocol_caps::text[]) AND (r.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY(@worker_protocol_caps::text[])))
-           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(@worker_protocol_caps::text[])))
+           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(@worker_protocol_caps::text[]) AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(@worker_protocol_caps::text[]))))
       AND (NOT (r.plan_cross_check_required OR (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan')))
            OR 'cross_check_v1' = ANY(@worker_protocol_caps::text[]))
       AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
@@ -1643,6 +1652,10 @@ WITH checker_template_pins AS MATERIALIZED (
       AND (r.kind <> 'job'
            OR (NOT @is_docker_worker::boolean AND 'job_runner_v1' = ANY(@worker_protocol_caps::text[])
                AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(@worker_protocol_caps::text[]))
+               -- PRD #4322 M1b (the claude_provider_job_v1 ROLLOUT GATE): a provider-bound job (every one
+               -- stamps model_provider_key_mode) additionally needs 'claude_provider_job_v1'; the generic
+               -- provider clause above already requires 'claude_provider_v1'. Vendor jobs are unchanged.
+               AND (r.model_provider_key_mode IS NULL OR 'claude_provider_job_v1' = ANY(@worker_protocol_caps::text[]))
                -- PRD #1976 M1 (the isolated_job_v1 ROLLOUT GATE): a profile-bound job (runs.egress_profile_id)
                -- additionally needs 'isolated_job_v1', so a lane worker released before profile-bound jobs
                -- (isolated_fetch_v1 + job_runner_v1 only) never claims one. Same OUTSIDE-the-bypasses rule;
@@ -1868,7 +1881,7 @@ WITH checker_template_pins AS MATERIALIZED (
                 -- provider-bound run to a peer that lacks its engine's provider capability and could never claim it.
                 AND (r.model_provider_key_mode IS NULL
            OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(p.protocol_capabilities) AND (r.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY(p.protocol_capabilities)))
-           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(p.protocol_capabilities)))
+           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(p.protocol_capabilities) AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(p.protocol_capabilities))))
       AND (NOT (r.plan_cross_check_required OR (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan')))
            OR 'cross_check_v1' = ANY(p.protocol_capabilities))
       AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
@@ -1939,6 +1952,8 @@ WITH checker_template_pins AS MATERIALIZED (
                 AND (r.kind <> 'job'
                      OR (NOT COALESCE(p.docker_enabled, false) AND 'job_runner_v1' = ANY(p.protocol_capabilities)
                          AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(p.protocol_capabilities))
+                         -- PRD #4322 M1b: and the claude_provider_job_v1 arm for a provider-bound job.
+                         AND (r.model_provider_key_mode IS NULL OR 'claude_provider_job_v1' = ANY(p.protocol_capabilities))
                          -- PRD #1976 M1: and the isolated_job_v1 arm for a profile-bound job.
                          AND (r.egress_profile_id IS NULL OR 'isolated_job_v1' = ANY(p.protocol_capabilities))))
                 AND COALESCE(codex_admission_run_eligible_at(r.id) <= now(), true)
@@ -11649,7 +11664,7 @@ WHERE repo_id = @repo_id::uuid AND issue_iid = @issue_iid AND move_pending_since
 
 -- MR-close watcher (PRD #24) --------------------------------------------------
 
--- name: SetRunMRState :execrows
+-- name: SetRunMRState :one
 -- Record the merge-request state the watcher just observed for this run. This is
 -- the ONLY SQL statement that writes runs.mr_state (the watcher-owned invariant,
 -- review finding 11): no run-status path writes it. It now has TWO Go callers over
@@ -11660,8 +11675,85 @@ WHERE repo_id = @repo_id::uuid AND issue_iid = @issue_iid AND move_pending_since
 -- prompt/self_improve are excluded by its CTE (see recordMRState). The run itself
 -- stays terminal — closing an MR is review feedback, not a run-status event — so
 -- this touches mr_state (and updated_at) only.
-UPDATE runs SET mr_state = @mr_state, updated_at = now()
-WHERE id = @id;
+--
+-- PRD #4691: the same statement also records PR history, atomically, with
+-- data-modifying CTEs. CTE order: prev (lock the run row, read its previous state and
+-- whether the run's owner owns the repo's forge connection) -> upd (write mr_state) ->
+-- head (upsert pr_history_heads) -> ev (append the transition event). PG16 has no
+-- RETURNING OLD, so the head upsert carries the latest transition through the head's
+-- transport-only last_* columns and RETURNING; ev reads them from that.
+--   * Unknown state: the prev CTE yields no row, so NOTHING is written (not even mr_state).
+--   * Owner filter: history is recorded only when the run's user owns the repo's forge
+--     connection; mr_state is still written for any owner.
+--   * Watermark: a head advances only when the observation is strictly newer than
+--     head.observed_at (WHERE on the DO UPDATE). An older or tied observation updates
+--     runs.mr_state only, and writes no head change and no event.
+--   * Bootstrap: the first head insert for a run that already carried a pre-tracking
+--     mr_state records that state as from_state (provenance), with bootstrap = true.
+--   * First merge: first_merged_* is set once, on the first change to merged; the unique
+--     partial index pr_history_events_first_merge_uq backs it.
+--   * provider_at is dropped (NULL) when it is after observed_at or older than the newest
+--     provider time already on the head (never moves backwards): the event is then an
+--     observation_fallback. Every SET right-hand side reads only h or EXCLUDED, never a
+--     stored transport column of h.
+-- Returns the number of runs updated (0 or 1).
+WITH prev AS (
+  SELECT r.id, r.repo_id, r.mr_iid,
+         CASE WHEN r.mr_state IN ('opened','closed','merged','locked') THEN r.mr_state END AS prev_state,
+         (r.user_id = fc.user_id) AS owner_match
+  FROM runs r
+  JOIN repos rp ON rp.id = r.repo_id
+  JOIN forge_connections fc ON fc.id = rp.connection_id
+  WHERE r.id = @id AND @mr_state::text IN ('opened','closed','merged','locked')
+  FOR NO KEY UPDATE OF r
+), upd AS (
+  UPDATE runs SET mr_state = @mr_state::text, updated_at = now()
+  FROM prev
+  WHERE runs.id = prev.id
+  RETURNING runs.id, runs.repo_id, runs.mr_iid, prev.prev_state, prev.owner_match
+), head AS (
+  INSERT INTO pr_history_heads AS h (repo_id, mr_iid, state, observed_at, last_provider_at, first_merged_at, first_merged_source,
+      last_changed, last_from_state, last_to_state, last_event_provider_at, last_time_source, last_bootstrap, last_first_merge)
+  SELECT u.repo_id, u.mr_iid, @mr_state::text, @observed_at::timestamptz, n.p,
+      CASE WHEN @mr_state::text = 'merged' THEN COALESCE(n.p, @observed_at::timestamptz) END,
+      CASE WHEN @mr_state::text = 'merged' THEN CASE WHEN n.p IS NULL THEN 'observation_fallback' ELSE 'provider' END END,
+      true, u.prev_state, @mr_state::text, n.p,
+      CASE WHEN n.p IS NULL THEN 'observation_fallback' ELSE 'provider' END,
+      true, @mr_state::text = 'merged'
+  FROM upd u
+  CROSS JOIN LATERAL (SELECT CASE WHEN sqlc.narg('provider_at')::timestamptz <= @observed_at::timestamptz
+                                  THEN sqlc.narg('provider_at')::timestamptz END AS p) n
+  WHERE u.owner_match AND u.mr_iid IS NOT NULL
+  ON CONFLICT (repo_id, mr_iid) DO UPDATE SET
+    state = EXCLUDED.state,
+    last_to_state = EXCLUDED.state,
+    last_from_state = h.state,
+    last_changed = (h.state IS DISTINCT FROM EXCLUDED.state),
+    observed_at = EXCLUDED.observed_at,
+    last_bootstrap = false,
+    last_event_provider_at = CASE WHEN EXCLUDED.last_provider_at < h.last_provider_at THEN NULL ELSE EXCLUDED.last_provider_at END,
+    last_time_source = CASE WHEN (CASE WHEN EXCLUDED.last_provider_at < h.last_provider_at THEN NULL ELSE EXCLUDED.last_provider_at END) IS NULL
+                            THEN 'observation_fallback' ELSE 'provider' END,
+    last_provider_at = GREATEST(h.last_provider_at, EXCLUDED.last_provider_at),
+    last_first_merge = (h.state IS DISTINCT FROM EXCLUDED.state) AND EXCLUDED.state = 'merged' AND h.first_merged_at IS NULL,
+    first_merged_at = CASE WHEN (h.state IS DISTINCT FROM EXCLUDED.state) AND EXCLUDED.state = 'merged' AND h.first_merged_at IS NULL
+                           THEN COALESCE(CASE WHEN EXCLUDED.last_provider_at < h.last_provider_at THEN NULL ELSE EXCLUDED.last_provider_at END, EXCLUDED.observed_at)
+                           ELSE h.first_merged_at END,
+    first_merged_source = CASE WHEN (h.state IS DISTINCT FROM EXCLUDED.state) AND EXCLUDED.state = 'merged' AND h.first_merged_at IS NULL
+                               THEN CASE WHEN (CASE WHEN EXCLUDED.last_provider_at < h.last_provider_at THEN NULL ELSE EXCLUDED.last_provider_at END) IS NULL
+                                         THEN 'observation_fallback' ELSE 'provider' END
+                               ELSE h.first_merged_source END,
+    updated_at = now()
+  WHERE EXCLUDED.observed_at > h.observed_at
+  RETURNING h.repo_id, h.mr_iid, h.last_changed, h.last_from_state, h.last_to_state, h.last_event_provider_at,
+            h.last_time_source, h.observed_at, h.last_bootstrap, h.last_first_merge
+), ev AS (
+  INSERT INTO pr_history_events (repo_id, mr_iid, from_state, to_state, provider_at, time_source, observed_at, bootstrap, first_merge)
+  SELECT repo_id, mr_iid, last_from_state, last_to_state, last_event_provider_at, last_time_source, observed_at, last_bootstrap, last_first_merge
+  FROM head WHERE last_changed
+  RETURNING 1
+)
+SELECT count(*)::bigint AS updated FROM upd;
 
 -- name: SetRunCheckpointTip :execrows
 -- Record the branch tip the worker last checkpoint-published for this run. Unlike
@@ -12208,7 +12300,7 @@ WHERE run.id = @run_id
   -- PRD #4320 module 5: the provider claim clause, mirrored (see ClaimRun).
   AND (run.model_provider_key_mode IS NULL
            OR (run.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities) AND (run.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities)))
-           OR (run.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities)))
+           OR (run.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities) AND (run.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities))))
       AND (NOT (run.plan_cross_check_required OR (run.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = run.id AND pc.stage = 'plan')))
            OR 'cross_check_v1' = ANY(w.protocol_capabilities))
       AND (NOT (run.kind = 'cross_check' AND run.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = run.id AND pc.stage = 'plan'))
@@ -12281,6 +12373,8 @@ WHERE run.id = @run_id
   AND (run.kind <> 'job'
        OR (NOT COALESCE(w.docker_enabled, false) AND 'job_runner_v1' = ANY(w.protocol_capabilities)
            AND (run.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))
+           -- PRD #4322 M1b: and the claude_provider_job_v1 arm for a provider-bound job.
+           AND (run.model_provider_key_mode IS NULL OR 'claude_provider_job_v1' = ANY(w.protocol_capabilities))
            -- PRD #1976 M1: and the isolated_job_v1 arm for a profile-bound job.
            AND (run.egress_profile_id IS NULL OR 'isolated_job_v1' = ANY(w.protocol_capabilities))))
   AND (run.released_worker_id IS NULL
@@ -12569,12 +12663,13 @@ WHERE w.user_id = @user_id
   -- lane worker never claims an unbound run, so it is never a satisfier here.
   AND NOT w.isolated_lane
   AND (
-    (@engine::text = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities) AND (@kind::text <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities)))
+    (@engine::text = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities) AND (@kind::text <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities)) AND (@kind::text <> 'job' OR 'claude_provider_job_v1' = ANY(w.protocol_capabilities)))
     OR (@engine::text = 'codex'
         AND 'codex_provider_v1' = ANY(w.protocol_capabilities)
         AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
         AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)
-        AND 'codex_runtime_v3' = ANY(w.protocol_capabilities))
+        AND 'codex_runtime_v3' = ANY(w.protocol_capabilities)
+        AND (@kind::text <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities)))
   );
 
 -- name: CountOnlineWorkersSatisfyingCodexRuntime :one
@@ -12678,7 +12773,11 @@ WHERE w.user_id = @user_id
   AND 'job_runner_v1' = ANY(w.protocol_capabilities)
   -- PRD #1909 M1: a job stamped with runs.job_protocol (@requires_job_files) also needs the
   -- 'job_files_v1' protocol capability; the caller passes runs.job_protocol IS NOT NULL.
-  AND (NOT @requires_job_files::boolean OR 'job_files_v1' = ANY(w.protocol_capabilities));
+  AND (NOT @requires_job_files::boolean OR 'job_files_v1' = ANY(w.protocol_capabilities))
+  -- PRD #4322 M1b: a provider-bound job (@requires_provider_job: runs.model_provider_key_mode IS NOT
+  -- NULL) also needs 'claude_provider_v1' AND 'claude_provider_job_v1' (the claim clauses' conjunction).
+  AND (NOT @requires_provider_job::boolean
+       OR ('claude_provider_v1' = ANY(w.protocol_capabilities) AND 'claude_provider_job_v1' = ANY(w.protocol_capabilities)));
 
 -- name: ListUnplaceableQueuedRunsForEphemeral :many
 -- The trigger query for the ephemeral auto-provisioner (PRD #529 M2). It returns the
@@ -12798,6 +12897,11 @@ WHERE r.status = 'queued'
   -- original leading AND something to attach to.
   AND (
       TRUE
+  -- PRD #4322 M1b: the generic arm never decides a job. A provider-bound job would satisfy this
+  -- arm's model_provider_key_mode demand disjunct, so the job arm below (which carries the
+  -- job-runner and provider-job capabilities) is the only decider for kind 'job'. The conjunct
+  -- sits INSIDE this first AND chain, before the OR, so it cannot gate the job arm.
+  AND r.kind <> 'job'
   -- Orphan PLAN children retain the legacy capability-gap provisioning path;
   -- the CODE exclusion above keeps known CODE children on their own worker.
   -- PRD #2865: a GUARDED run (ci_config_guard) is demand too: with no worker reporting
@@ -12854,6 +12958,9 @@ WHERE r.status = 'queued'
         AND 'job_runner_v1' = ANY(wj.protocol_capabilities)
         -- PRD #1909 M1: and 'job_files_v1' for a stamped job (runs.job_protocol).
         AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(wj.protocol_capabilities))
+        -- PRD #4322 M1b: and both provider capabilities for a provider-bound job.
+        AND (r.model_provider_key_mode IS NULL
+             OR ('claude_provider_v1' = ANY(wj.protocol_capabilities) AND 'claude_provider_job_v1' = ANY(wj.protocol_capabilities)))
         -- PRD #1976 M1: and 'isolated_job_v1' for a profile-bound job (runs.egress_profile_id).
         AND (r.egress_profile_id IS NULL OR 'isolated_job_v1' = ANY(wj.protocol_capabilities))
   ))
@@ -13065,7 +13172,7 @@ WHERE r.status = 'queued'
   -- PRD #4320 module 5: the provider claim clause, mirrored (see ClaimRun).
   AND (r.model_provider_key_mode IS NULL
            OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities) AND (r.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities)))
-           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities)))
+           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities) AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities))))
                  AND (
                      NOT (
                          r.harness = 'codex'
@@ -13129,6 +13236,7 @@ WHERE r.status = 'queued'
         -- 'job_runner_v1'), ClaimRun's non-bypassable clause; the same arm sits in the free-slot test.
         AND (r.kind <> 'job' OR (NOT COALESCE(w.docker_enabled, false) AND 'job_runner_v1' = ANY(w.protocol_capabilities)
                                  AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))
+                                 AND (r.model_provider_key_mode IS NULL OR 'claude_provider_job_v1' = ANY(w.protocol_capabilities))
                                  AND (r.egress_profile_id IS NULL OR 'isolated_job_v1' = ANY(w.protocol_capabilities))))
   )
   AND NOT EXISTS (
@@ -13185,7 +13293,7 @@ WHERE r.status = 'queued'
   -- PRD #4320 module 5: the provider claim clause, mirrored (see ClaimRun).
   AND (r.model_provider_key_mode IS NULL
            OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities) AND (r.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities)))
-           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities)))
+           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities) AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities))))
                  AND (
                      NOT (
                          r.harness = 'codex'
@@ -13247,6 +13355,7 @@ WHERE r.status = 'queued'
         AND r.required_capabilities <@ fn_effective_worker_caps(w.capabilities, COALESCE(w.docker_enabled, false))
         AND (r.kind <> 'job' OR (NOT COALESCE(w.docker_enabled, false) AND 'job_runner_v1' = ANY(w.protocol_capabilities)
                                  AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))
+                                 AND (r.model_provider_key_mode IS NULL OR 'claude_provider_job_v1' = ANY(w.protocol_capabilities))
                                  AND (r.egress_profile_id IS NULL OR 'isolated_job_v1' = ANY(w.protocol_capabilities))))
         AND (r.kind = 'cross_check' OR w.max_concurrent_runs IS NULL
              OR (SELECT count(*) FROM runs r2

@@ -33,7 +33,13 @@ func (f *forgejo) GetMergeRequest(ctx context.Context, projectID, mrIID int64) (
 // Forgejo's PR index (json "number") is GitLab's iid, and its state vocabulary
 // differs — see forgejoMRState.
 func toForgejoMergeRequest(pr *gitea.PullRequest) MergeRequest {
-	return MergeRequest{IID: pr.Index, State: forgejoMRState(pr), WebURL: pr.HTMLURL}
+	return MergeRequest{
+		IID:      pr.Index,
+		State:    forgejoMRState(pr),
+		WebURL:   pr.HTMLURL,
+		MergedAt: copyTime(pr.Merged),
+		ClosedAt: copyTime(pr.Closed),
+	}
 }
 
 // forgejoMRState maps a Forgejo PR onto the neutral MRState* vocabulary. Forgejo

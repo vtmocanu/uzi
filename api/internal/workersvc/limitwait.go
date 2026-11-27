@@ -832,15 +832,24 @@ func limitAwareFailureReason(harness string, req StateRequest) pgtype.Text {
 // limit: a judge never parks or waits, so it fails terminally with the limit recorded (PRD #4322 D-G).
 const providerJudgeGatewayLimitReason = "Provider gateway rate limit reached; a provider judge does not wait on rate limits"
 
-// failedReportReason is the `failed` arm's failure reason. A provider-bound JUDGE that reports any
+// providerJobGatewayLimitReason is the same for a provider-bound job (PRD #4322 M1b): a job never
+// parks or waits (PRD #1908 D-E), so a reported limit fails it terminally with this sentence.
+const providerJobGatewayLimitReason = "Provider gateway rate limit reached; a provider job does not wait on rate limits"
+
+// failedReportReason is the `failed` arm's failure reason. A provider-bound JUDGE or JOB that reports any
 // limit fact has its report coerced to the provider gateway limit with no reset (whatever type or reset
 // the worker sent is ignored, as decideProviderLimitPark ignores them for a provider run), so the
 // recorded text never claims a vendor window. Every other run, an ordinary provider run and a vendor
-// judge included, takes limitAwareFailureReason unchanged; a provider judge report without limit facts
-// stays on that plain path too.
+// judge or job included, takes limitAwareFailureReason unchanged; a provider judge or job report
+// without limit facts stays on that plain path too.
 func failedReportReason(owned store.Run, req StateRequest) pgtype.Text {
-	if providerBoundRun(owned) && owned.Kind == runkind.Judge && (req.RateLimitType != nil || req.LimitResetsAt != nil) {
-		return pgconv.TextOrNull(providerJudgeGatewayLimitReason)
+	if providerBoundRun(owned) && (req.RateLimitType != nil || req.LimitResetsAt != nil) {
+		switch owned.Kind {
+		case runkind.Judge:
+			return pgconv.TextOrNull(providerJudgeGatewayLimitReason)
+		case runkind.Job:
+			return pgconv.TextOrNull(providerJobGatewayLimitReason)
+		}
 	}
 	return limitAwareFailureReason(owned.Harness, req)
 }

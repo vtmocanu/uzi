@@ -36,15 +36,25 @@ type harnessCreationOrigin struct {
 	InheritFrom *store.Run
 	// RefuseProviderOwner refuses the creation (ErrProviderLaneUnsupported) when the owner selected
 	// a Claude source (both lanes), or a Codex source (Codex lane only). Guarded origins
-	// require an explicit recognized harness, and resolve vendor credentials only. Jobs and the
-	// plan/code checkers use it; the judge does not (JudgeLane).
+	// require an explicit recognized harness, and resolve vendor credentials only. The plan/code
+	// checkers use it; the judge (JudgeLane) and the job (JobLane) do not.
 	RefuseProviderOwner bool
 	// JudgeLane marks a judge creation (PRD #4322 M1a). The judge's own pin policy and provider
 	// sources decide its lane in the create transaction under the shared secret-mutation lock: a
 	// Claude judge is vendor (pinned with a credential, or no Claude source) or provider-bound to
-	// the owner's Claude source; a Codex judge is vendor-only and refused for a Codex source. It
+	// the owner's Claude source; a Codex judge is vendor (no Codex source) or provider-bound to the
+	// owner's Codex source (PRD #4574 M1). It
 	// requires an explicit recognized harness and is mutually exclusive with RefuseProviderOwner.
 	JudgeLane bool
+	// JobLane marks a job creation (PRD #4322 M1b). Under the shared secret-mutation lock, taken
+	// before the lane read, a job whose owner selected no Claude source is a vendor job (resolved
+	// exactly as before), and one whose owner selected a Claude source is provider-bound to it (frozen
+	// under the same lock, then verified against its model map); a job on a site list (JobSiteList) with
+	// a Claude source selected is refused (ErrProviderLaneUnsupported), usable or not. It requires an
+	// explicit recognized harness and is mutually exclusive with RefuseProviderOwner and JudgeLane.
+	JobLane bool
+	// JobSiteList says the job names an egress profile (a site list). Only meaningful with JobLane.
+	JobSiteList bool
 	// ConsumerGateRepo, when valid, makes createRunAtomic take that repository's shared terminal
 	// consumer gate as the first lock of the create transaction (issue #4488, ADR-4007 T3). The zero
 	// value gates nothing.

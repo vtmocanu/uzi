@@ -733,6 +733,9 @@ func newScheduleDeleteCmd(env Env, gf *globalFlags) *cobra.Command {
 func scheduleTarget(s apitypes.ScheduleDTO) string {
 	switch s.Target {
 	case schedTargetIssue:
+		if s.IssueIID != nil {
+			return issueRef(*s.IssueIID, s.IssueKey)
+		}
 		return "#" + int64Or(s.IssueIID, "?")
 	case schedTargetSweep:
 		if len(s.Labels) > 0 {

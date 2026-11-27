@@ -1834,3 +1834,117 @@ describe("IssueView — run-start preview (#3261)", () => {
     expect(within(panel).getByText("Codex").nextElementSibling?.textContent).toContain("gpt-6-sol");
   });
 });
+
+// PRD 4173 M6: an issue of a repo linked to an issue tracker carries issue_key and the
+// stored eligibility tag name. The page names the key, decides eligibility by the tag,
+// hides the autopilot badge (D12) and links to the issue tracker.
+describe("IssueView — a repo linked to an issue tracker (PRD 4173 M6)", () => {
+  const linked = (over: Partial<IssueDetail> = {}) =>
+    anIssue({
+      issue_key: "ABC-12",
+      eligibility_label: "send-to-uzi",
+      labels: ["send-to-uzi"],
+      web_url: "https://youtrack.example.com/issue/ABC-12",
+      ...over,
+    });
+
+  it("shows the key in the header and the breadcrumb once loaded, never #7", async () => {
+    setAuth();
+    mockApi.getIssue.mockResolvedValue({ issue: linked() });
+    const { container } = renderIssueView();
+    await screen.findByText("A small typo fix");
+    const crumb = container.querySelector("nav")!;
+    expect(crumb.textContent).toContain("ABC-12");
+    expect(crumb.textContent).not.toContain("#7");
+    expect(screen.getByRole("heading", { level: 1 }).parentElement!.textContent).toContain("ABC-12");
+    expect(container.textContent).not.toContain("#7");
+  });
+
+  it("keeps #iid on an unlinked repo's page", async () => {
+    setAuth();
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue() });
+    const { container } = renderIssueView();
+    await screen.findByText("A small typo fix");
+    expect(container.querySelector("nav")!.textContent).toContain("#7");
+    expect(screen.getByRole("heading", { level: 1 }).parentElement!.textContent).toContain("#7");
+  });
+
+  it("names the key in the Options button", async () => {
+    setAuth();
+    mockApi.getIssue.mockResolvedValue({ issue: linked() });
+    renderIssueView();
+    expect(await screen.findByRole("button", { name: "Run options for ABC-12" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Run options for #7" })).toBeNull();
+  });
+
+  it("names the key in the Run options dialog", async () => {
+    setAuth();
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker()] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: [aToken()] });
+    mockApi.getIssue.mockResolvedValue({ issue: linked() });
+    renderIssueView();
+    const button = await screen.findByRole("button", { name: "Run options for ABC-12" });
+    await waitFor(() => expect((button as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(button);
+    expect(screen.getByRole("dialog", { name: "Run options for ABC-12" })).toBeTruthy();
+  });
+
+  it("offers Promote on a linked issue without the eligibility tag, even with the uzi label and a bot assignment", async () => {
+    setAuth();
+    mockApi.getIssue.mockResolvedValue({
+      issue: linked({ labels: ["uzi", "bug"], assignee_ids: [4021] }),
+    });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+    expect(screen.getByRole("button", { name: /Promote to send-to-uzi/ })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /start run/i })).toBeNull();
+  });
+
+  it("is runnable by the eligibility tag alone", async () => {
+    setAuth();
+    mockApi.getIssue.mockResolvedValue({ issue: linked({ labels: ["send-to-uzi"] }) });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+    expect(screen.getByRole("button", { name: /start run/i })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Promote to/ })).toBeNull();
+  });
+
+  it("hides the autopilot badge on a linked repo and keeps it on an unlinked one", async () => {
+    setAuth();
+    mockApi.getIssue.mockResolvedValue({ issue: linked({ labels: ["send-to-uzi", "autopilot"] }) });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+    expect(screen.queryByTitle(/Autopilot: a run starts automatically/)).toBeNull();
+    cleanup();
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue({ labels: ["uzi", "autopilot"] }) });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+    expect(screen.getByTitle(/Autopilot: a run starts automatically/)).toBeTruthy();
+  });
+
+  it("reads the link Open in issue tracker, and Open on GitLab on an unlinked repo", async () => {
+    setAuth();
+    mockApi.getIssue.mockResolvedValue({ issue: linked() });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+    expect(screen.getByRole("button", { name: "Open in issue tracker" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /Open on/ })).toBeNull();
+    cleanup();
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue() });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+    expect(screen.getByRole("button", { name: "Open on GitLab" })).toBeTruthy();
+  });
+
+  it("follows the eligibility tag, not the configured uzi label, in the run badge", async () => {
+    setAuth(); // the configured uzi label is "uzi"
+    mockApi.getIssue.mockResolvedValue({
+      issue: linked({ eligibility_label: "ready-for-uzi", labels: ["ready-for-uzi"] }),
+    });
+    renderIssueView();
+    await screen.findByText("A small typo fix");
+    const badge = screen.getByTitle("This issue carries the ready-for-uzi tag, so uzi will run it.");
+    expect(badge.textContent).toBe("ready-for-uzi");
+    expect(screen.queryByTitle(/assigned to the uzi bot/)).toBeNull();
+  });
+});

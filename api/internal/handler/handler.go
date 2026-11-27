@@ -63,7 +63,10 @@ type Handler struct {
 	providerProbeLimiter *providers.ProbeLimiter
 	pool                 *pgxpool.Pool
 	q                    *store.Queries
-	cfg                  config.Config
+	// anthropicHistory is a test-only override of the usage-history recorder the test-connection
+	// handler copies accepted Anthropic readings through; nil means h.q (issue #4692).
+	anthropicHistory anthropicUsageHistory
+	cfg              config.Config
 	// secretTestProbeContext is a test-only deadline arm; nil retains the real probe budget.
 	secretTestProbeContext func(context.Context, time.Duration) (context.Context, context.CancelFunc)
 	// oauthBeginTx, when non-nil, replaces h.pool.Begin as the transaction source of the OAuth

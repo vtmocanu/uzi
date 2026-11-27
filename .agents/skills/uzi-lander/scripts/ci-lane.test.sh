@@ -45,8 +45,10 @@ jq -cn --arg tip "$TIP" --arg old "$OLD" --arg slot "$SLOT" --arg recent "$(date
     run(119;"CI";"fix/stale";"pull_request";$old;29;"ordinary"),
     run(120;"E2E";"main";"workflow_dispatch";$old;null;"ordinary"),
     run(121;"CI";"fix/relied-on";"pull_request";$old;30;"ordinary"),
-    run(122;"CI";"main";"push";$old;null;"ordinary")
-  ] | map(if .id==107 or .id==110 or .id==118 or .id==121 or .id==122 then .status="in_progress"
+    run(122;"CI";"main";"push";$old;null;"ordinary"),
+    run(123;"KinD Smoke";"main";"push";$old;null;"ordinary"),
+    run(124;"KinD Smoke";"main";"push";$tip;null;"current")
+  ] | map(if .id==107 or .id==110 or .id==118 or .id==121 or .id==122 or .id==123 then .status="in_progress"
           elif .id==114 or .id==119 or .id==120 then .created_at="2020-01-01T00:00:00Z" else . end)' > "$WORK/runs"
 jq -nc --arg head "$TIP" '
   [ {number:31,changedFiles:3,additions:5}, {number:32,changedFiles:1,additions:2},
@@ -88,7 +90,7 @@ case "$*" in
       echo '[{"total_count":1,"workflow_runs":[]}]'
     else
       jq -c --arg run_state "$run_state" --arg mode "${TIP_RUNS:-normal}" '
-        map(select(.status==$run_state and ($mode!="lost-on-apply" or .id==102)))
+        map(select(.status==$run_state and (($mode|IN("lost-on-apply","started-on-apply")|not) or .id==102)))
         | [{total_count:length,workflow_runs:.}]' "$WORK/runs"
     fi
     exit ;;
@@ -110,7 +112,7 @@ case "$*" in
   *'/force-cancel')
     endpoint=${!#}
     id=${endpoint#*/actions/runs/}; id=${id%%/*}
-    case "$id" in 102|105|106|110|116|118|122) ;; *) exit 99 ;; esac
+    case "$id" in 102|105|106|110|116|118|122|123) ;; *) exit 99 ;; esac
     [ "${NO_VERIFY:-0}" = 1 ] || touch "$WORK/cancelled-$id"
     : ;;
   *'/actions/runs/'*)
@@ -118,6 +120,8 @@ case "$*" in
     id=${endpoint##*/}
     if [ -e "$WORK/cancelled-$id" ]; then
       jq -ce --argjson id "$id" '.[]|select(.id==$id)|.status="completed"|.conclusion="cancelled"' "$WORK/runs"
+    elif [ "${TIP_RUNS:-normal}" = started-on-apply ] && [ "$id" = 102 ]; then
+      jq -ce --argjson id "$id" '.[]|select(.id==$id)|.status="in_progress"' "$WORK/runs"
     elif [ "${MOVED_ATTEMPT:-0}" = 1 ] && [ "$id" = 102 ]; then
       jq -ce --argjson id "$id" '.[]|select(.id==$id)|.run_attempt=2' "$WORK/runs"
     else jq -ce --argjson id "$id" '.[]|select(.id==$id)' "$WORK/runs"; fi ;;
@@ -139,10 +143,12 @@ if "$lane" grant 99 "$TIP" --owner unexpected; then echo 'FAILED: exceeded slot 
 "$lane" release 17
 
 "$lane" plan --json --evidence "$WORK/evidence" > "$WORK/plan"
+jq -e '[.runs[]|select(.id==122 or .id==123)|.decision] == ["KEEP","KEEP"]' "$WORK/plan" >/dev/null ||
+  { echo 'FAILED: plan must keep running main-push CI and KinD despite queued replacements' >&2; exit 1; }
 jq -e '
   .available_slots==1
-  and ([.runs[]|select(.decision=="CANCEL")|.id] == [102,105,106,110,116,118,122])
-  and ([.runs[]|select(.decision=="KEEP")|.id] == [101,103,104,107,108,109,115,121])
+  and ([.runs[]|select(.decision=="CANCEL")|.id] == [102,105,106,110,116,118])
+  and ([.runs[]|select(.decision=="KEEP")|.id] == [101,103,104,107,108,109,115,121,122,123,124])
   and ([.runs[]|select(.decision=="UNKNOWN")|.id] == [111,112,113,114,117])
   and ([.stale_runs[].id]==[119,120])
   and ([.next_slot_candidates[].pr] == [34,32,31,33,35])
@@ -160,6 +166,12 @@ done
 TIP_RUNS=lost-on-apply "$lane" apply --log "$WORK/lost-replacement" > "$WORK/lost-replacement.out"
 grep -qF 'SKIP run 102: KEEP' "$WORK/lost-replacement.out"
 ! grep -q -- 'force-cancel' "$CALLS"
+
+: > "$CALLS"
+TIP_RUNS=started-on-apply "$lane" apply --log "$WORK/started-replacement" > "$WORK/started-replacement.out"
+grep -qF 'SKIP run 102: KEEP' "$WORK/started-replacement.out"
+! grep -q -- 'force-cancel' "$CALLS"
+[ ! -s "$WORK/started-replacement" ]
 
 "$lane" plan --evidence "$WORK/evidence" > "$WORK/human"
 grep -Fq 'size: 1/+2; blocks: #4001, #4002' "$WORK/human"
@@ -179,7 +191,7 @@ jq -es 'length==1 and .[0].id==102 and .[0].result=="unverified"' "$WORK/unverif
 : > "$CALLS"
 MOVED_ATTEMPT=1 "$lane" apply --evidence "$WORK/evidence" --log "$WORK/verified" > "$WORK/notify"
 ! grep -q -- '/102/force-cancel' "$CALLS"
-[ "$(grep -c -- 'force-cancel' "$CALLS")" = 6 ]
-jq -es 'map(.id)==[105,106,110,116,118,122] and all(.[]; .result=="cancelled" and (.at|endswith("Z")))' "$WORK/verified" >/dev/null
+[ "$(grep -c -- 'force-cancel' "$CALLS")" = 5 ]
+jq -es 'map(.id)==[105,106,110,116,118] and all(.[]; .result=="cancelled" and (.at|endswith("Z")))' "$WORK/verified" >/dev/null
 grep -qF 'NOTIFY pr=16 branch=fix/wrong-head run=106 owner=session-one' "$WORK/notify"
 echo 'PASS ci-lane: slot protection, stale runs, main replacements, read retry, force-cancel verification and attempt change'

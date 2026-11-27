@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"sync"
 	"time"
@@ -28,6 +29,61 @@ type secretTestResult struct {
 	Status  string `json:"status"`
 	Reason  string `json:"reason,omitempty"`
 	Display string `json:"display,omitempty"`
+
+	// history holds the exact parameters of the gauge write an Anthropic test accepted, so
+	// TestMySecret can copy that reading into the usage history after its final re-read
+	// (issue #4692). Unexported and never serialized; set only on an accepted write.
+	history *store.UpsertRateLimitsParams
+}
+
+// anthropicUsageHistory is the narrow store surface the test-connection handler uses to copy
+// an accepted Anthropic reading into the usage history. *store.Queries satisfies it.
+type anthropicUsageHistory interface {
+	CopyAnthropicUsageSample(ctx context.Context, arg store.CopyAnthropicUsageSampleParams) (int64, error)
+}
+
+// anthropicHistoryCopyTimeout bounds one history copy, pool acquisition included.
+const anthropicHistoryCopyTimeout = 250 * time.Millisecond
+
+// anthropicHistoryRecorder returns the test override, else h.q; nil when neither is set.
+func (h *Handler) anthropicHistoryRecorder() anthropicUsageHistory {
+	if h.anthropicHistory != nil {
+		return h.anthropicHistory
+	}
+	if h.q != nil {
+		return h.q
+	}
+	return nil
+}
+
+// copyAnthropicHistory copies an accepted test reading into the usage history, best effort,
+// under one 250 ms context derived from the request (never the probe context). It logs a
+// fixed message with a fixed category and the token id, never error text. A timeout logs "outcome
+// unknown": PostgreSQL may have committed the sample before the client gave up. error and skipped
+// log "not recorded".
+func (h *Handler) copyAnthropicHistory(ctx context.Context, p store.UpsertRateLimitsParams) {
+	rec := h.anthropicHistoryRecorder()
+	if rec == nil {
+		return
+	}
+	cctx, cancel := context.WithTimeout(ctx, anthropicHistoryCopyTimeout)
+	defer cancel()
+	n, err := rec.CopyAnthropicUsageSample(cctx, store.CopyAnthropicUsageSampleParamsFrom(p))
+	category := ""
+	switch {
+	case err != nil && (errors.Is(err, context.DeadlineExceeded) || errors.Is(cctx.Err(), context.DeadlineExceeded)):
+		category = "timeout"
+	case err != nil:
+		category = "error"
+	case n == 0:
+		category = "skipped"
+	}
+	switch category {
+	case "timeout":
+		slog.Warn("test connection: usage history copy outcome unknown", "category", category, "secret", p.UserSecretID.String())
+	case "error", "skipped":
+		slog.Warn("test connection: usage history copy not recorded", "category", category, "secret", p.UserSecretID.String())
+	}
 }
 
 type anthropicTester interface {
@@ -134,6 +190,12 @@ func (h *Handler) TestMySecret(w http.ResponseWriter, r *http.Request) {
 	if err != nil || after.Kind != kind || after.DisabledAt.Valid || after.EnablementRev != before.EnablementRev || !after.UpdatedAt.Time.Equal(before.UpdatedAt.Time) {
 		result = secretTestResult{Status: "inconclusive", Reason: "superseded"}
 	}
+	// Copy an accepted Anthropic reading into the usage history only after the final re-read
+	// confirmed the credential is unchanged and the verdict is still ok. Best effort: it can add
+	// up to 250 ms here and never changes the response.
+	if result.Status == "ok" && result.history != nil {
+		h.copyAnthropicHistory(r.Context(), *result.history)
+	}
 	httpx.JSON(w, http.StatusOK, result)
 }
 
@@ -235,21 +297,24 @@ func (h *Handler) anthropicTestSuccess(ctx context.Context, row store.GetAnthrop
 		fhPct = pgtype.Int2{Int16: int16(reading.FiveHour.Pct), Valid: true} //nolint:gosec // G115: a rate-limit percentage (0-100), far within int16 range
 		fhReset = reading.FiveHour.ResetsAt
 	}
-	n, err := h.q.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
+	// synced_at is truncated to the column's microsecond precision, so the history copy compares
+	// against exactly the value the gauge stores.
+	params := store.UpsertRateLimitsParams{
 		UserSecretID: row.ID, UserID: row.UserID, EnablementRev: row.EnablementRev,
 		FiveHourPct:      fhPct,
 		FiveHourResetsAt: pgconv.TimePtr(fhReset),
 		SevenDayPct:      pgtype.Int2{Int16: int16(reading.SevenDay.Pct), Valid: true}, //nolint:gosec // G115: a rate-limit percentage (0-100), far within int16 range
 		SevenDayResetsAt: pgconv.TimePtr(reading.SevenDay.ResetsAt),
-		Source:           pgconv.Text(reading.Source), SyncedAt: pgconv.Time(time.Now().UTC()),
-	})
+		Source:           pgconv.Text(reading.Source), SyncedAt: pgconv.Time(time.Now().UTC().Truncate(time.Microsecond)),
+	}
+	n, err := h.q.UpsertRateLimits(ctx, params)
 	if err != nil {
 		return secretTestResult{Status: "inconclusive", Reason: "generic"}
 	}
 	if n == 0 {
 		return secretTestResult{Status: "inconclusive", Reason: "superseded"}
 	}
-	return secretTestResult{Status: "ok"}
+	return secretTestResult{Status: "ok", history: &params}
 }
 
 func (h *Handler) testOpenAISecret(ctx context.Context, userID, id uuid.UUID) secretTestResult {

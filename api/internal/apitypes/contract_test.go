@@ -275,6 +275,19 @@ func contractCases() []contractCase {
 		// (the zero.json carries nulls the handler normalizes to []); reason and latest_failure
 		// are present-as-null by design and totals.previous is omitempty.
 		newContractCase[AnalyticsReliabilityDTO]("analytics_reliability"),
+		// Issue #4731: the Capacity response; every slice is non-omitempty and the nullable
+		// measures are present-as-null.
+		newContractCase[AnalyticsCapacityDTO]("analytics_capacity"),
+		// Issue #4730: the Quality response. Every array (envelope buckets/rolling, the
+		// per-measure buckets, kinds, limitations) is non-omitempty (the zero.json carries
+		// nulls the handler normalizes to []); history_start, the section reasons, the
+		// coverage and not_tracked numbers and the effective repo/harness are present-as-null.
+		newContractCase[AnalyticsQualityDTO]("analytics_quality"),
+		// Issue #4729: the scoped run Flow response. Every slice (envelope, waiting states,
+		// bucket cells, histogram, limitations, filters.kinds) is non-omitempty (the zero.json
+		// carries nulls the handler normalizes to []); the nullable percentiles, filters.repo,
+		// filters.harness and the not_applicable reasons are present-as-null by design.
+		newContractCase[AnalyticsFlowDTO]("analytics_flow"),
 	}
 }
 

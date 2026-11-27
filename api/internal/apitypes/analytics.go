@@ -2,15 +2,18 @@ package apitypes
 
 import "time"
 
-// Issue #4684: wire DTOs of the scoped usage analytics API
-// (GET /api/analytics/{options,spend} and GET /api/admin/analytics/{options,spend}).
+// Issues #4684, #4685, #4729, #4730 and #4731: wire DTOs of the scoped usage analytics API
+// (GET /api/analytics/{options,spend,reliability,capacity,quality,flow} and GET /api/admin/analytics/{options,spend,reliability,capacity,quality,flow}).
 //
 // Conventions shared by every type below:
 //   - Dollar amounts (cost_usd, numerator_usd and ratio values) are float64 converted from the
 //     exact numeric strings the store returns; the tolerance of any sum over them is 1e-6 USD.
 //     They are a recorded-spend figure, not a bill.
-//   - A rate or ratio that is null always travels with a reason from the closed set no_completed_delivery_runs,
-//     no_merged_prs, no_applicable_runs, no_input_tokens, no_finished_runs, not_applicable.
+//   - A nullable measure, rate or ratio that is null travels with a reason (for example
+//     no_completed_delivery_runs, no_merged_prs, no_applicable_runs, no_input_tokens,
+//     no_finished_runs, not_applicable). Nullable metadata fields are null without a reason and
+//     say so on the field, for example history_start, limitations[].runs, filters.repo and
+//     filters.harness, excluded_kind_selected, identity user_id and email, and set_state.
 //   - "index" in a cell is the zero-based position in the response's buckets (or rolling) array.
 //   - Timestamps are UTC RFC 3339.
 
@@ -421,4 +424,187 @@ type AnalyticsSpendDTO struct {
 	CacheRead           AnalyticsCacheReadDTO   `json:"cache_read"`
 	TopRuns             []AnalyticsTopRunDTO    `json:"top_runs"`
 	Breakdown           AnalyticsBreakdownDTO   `json:"breakdown"`
+}
+
+// Issue #4731: the Capacity response (GET /api/analytics/capacity and GET
+// /api/admin/analytics/capacity). Every slice is non-null on the wire. A null value always
+// travels with a reason from the closed set zero_duration_bucket, zero_duration_range,
+// no_applicable_runs, not_tracked (and, on a gauge, gauge_unavailable,
+// vault_status_unavailable, not_selected).
+
+// AnalyticsCapacityFiltersDTO echoes the selectors the historical measures were computed with.
+type AnalyticsCapacityFiltersDTO struct {
+	// Repo is the authorized repo filter, null when none was given.
+	Repo *string `json:"repo"`
+	// Harness is claude or codex, null when none was given.
+	Harness *string `json:"harness"`
+	// Kinds are the run kinds the measures cover. Chat is never in the list: chat runs are
+	// outside the ordinary-work population (see ExcludedKindSelected).
+	Kinds []string `json:"kinds"`
+}
+
+// AnalyticsCapacityPopulationDTO counts the retained-interval population behind the occupancy
+// series. Candidates is the sum of WithInterval, WithoutStart and InvalidInterval.
+type AnalyticsCapacityPopulationDTO struct {
+	Candidates             int64 `json:"candidates"`
+	WithInterval           int64 `json:"with_interval"`
+	WithoutStart           int64 `json:"without_start"`
+	InvalidInterval        int64 `json:"invalid_interval"`
+	EndFromStatusSince     int64 `json:"end_from_status_since"`
+	Ongoing                int64 `json:"ongoing"`
+	CrossCheckKindIncluded int64 `json:"cross_check_kind_included"`
+}
+
+// AnalyticsCapacityLimitationDTO is one disclosed limit of the occupancy series. Code is from a
+// closed set; Runs is the number of runs the limit applies to, null when it is a property of
+// the method rather than of a counted subset.
+type AnalyticsCapacityLimitationDTO struct {
+	Code string `json:"code"`
+	Runs *int64 `json:"runs"`
+}
+
+// AnalyticsCapacityOccupancyCellDTO is one range's integral: RunSeconds is the time integral of
+// the number of concurrent run intervals and AverageConcurrentRuns is RunSeconds over
+// DurationSeconds, null with a reason when the duration is zero.
+type AnalyticsCapacityOccupancyCellDTO struct {
+	RunSeconds            float64  `json:"run_seconds"`
+	DurationSeconds       float64  `json:"duration_seconds"`
+	AverageConcurrentRuns *float64 `json:"average_concurrent_runs"`
+	Reason                *string  `json:"reason"`
+}
+
+// AnalyticsCapacityOccupancyBucketDTO is the cell of the envelope bucket at Index.
+type AnalyticsCapacityOccupancyBucketDTO struct {
+	Index int `json:"index"`
+	AnalyticsCapacityOccupancyCellDTO
+}
+
+// AnalyticsCapacityOccupancyDTO is the interval-overlap series: one retained interval per
+// ordinary run, from its first start to its retained end (or generated_at while it is not
+// finished). It is an elapsed envelope, not exact execution, and has no slot denominator,
+// percentage or clamp. TimeBasis is "interval_overlap" and Unit "average_concurrent_runs".
+type AnalyticsCapacityOccupancyDTO struct {
+	TimeBasis   string                                `json:"time_basis"`
+	Unit        string                                `json:"unit"`
+	Population  AnalyticsCapacityPopulationDTO        `json:"population"`
+	Limitations []AnalyticsCapacityLimitationDTO      `json:"limitations"`
+	Window      AnalyticsCapacityOccupancyCellDTO     `json:"window"`
+	Buckets     []AnalyticsCapacityOccupancyBucketDTO `json:"buckets"`
+}
+
+// AnalyticsCapacityUsageWaitCellDTO counts the runs created in the range (N) and those whose
+// retained limit_wait_count is above zero (Count). Share is Count over N, null with
+// no_applicable_runs when N is zero.
+type AnalyticsCapacityUsageWaitCellDTO struct {
+	Count  int64    `json:"count"`
+	N      int64    `json:"n"`
+	Share  *float64 `json:"share"`
+	Reason *string  `json:"reason"`
+}
+
+// AnalyticsCapacityUsageWaitBucketDTO is the cell of the envelope bucket at Index.
+type AnalyticsCapacityUsageWaitBucketDTO struct {
+	Index int `json:"index"`
+	AnalyticsCapacityUsageWaitCellDTO
+}
+
+// AnalyticsCapacityUsageWaitDTO is the creation-cohort usage-wait measure: TimeBasis is
+// "created_at", Cohort "creation" and Basis "limit_wait_count". A run counts once however many
+// times it waited and whether or not it is still parked; it does not place any wait in time.
+type AnalyticsCapacityUsageWaitDTO struct {
+	TimeBasis string                                `json:"time_basis"`
+	Cohort    string                                `json:"cohort"`
+	Basis     string                                `json:"basis"`
+	Current   AnalyticsCapacityUsageWaitCellDTO     `json:"current"`
+	Buckets   []AnalyticsCapacityUsageWaitBucketDTO `json:"buckets"`
+}
+
+// AnalyticsCapacityNotTrackedDTO names a measure this endpoint does not report. Value is always
+// null and Reason always "not_tracked".
+type AnalyticsCapacityNotTrackedDTO struct {
+	Measure string   `json:"measure"`
+	Value   *float64 `json:"value"`
+	Reason  string   `json:"reason"`
+}
+
+// AnalyticsCapacityEffectiveScopeDTO states which owner and provider a gauge describes and
+// which request selectors it could not honor. UnattributedSelectors lists, in the order repo
+// then kind, the selectors the request carried: a shared provider quota cannot be partitioned
+// by repo or run kind. Reason is "shared_quota_not_attributable" when the list is not empty.
+type AnalyticsCapacityEffectiveScopeDTO struct {
+	User                  string   `json:"user"`
+	Provider              string   `json:"provider"`
+	UnattributedSelectors []string `json:"unattributed_selectors"`
+	Reason                *string  `json:"reason"`
+}
+
+// AnalyticsCapacityGaugeBaseDTO is what both provider gauges share. Status is available,
+// unavailable or not_selected; Reason is null when available. TimeBasis is
+// "current_observation": a gauge is the latest stored reading, independent of the window.
+// SetState is empty, complete or truncated (identities are cut at 200), null unless available.
+type AnalyticsCapacityGaugeBaseDTO struct {
+	Provider       string                             `json:"provider"`
+	Status         string                             `json:"status"`
+	Reason         *string                            `json:"reason"`
+	TimeBasis      string                             `json:"time_basis"`
+	EffectiveScope AnalyticsCapacityEffectiveScopeDTO `json:"effective_scope"`
+	Truncated      bool                               `json:"truncated"`
+	SetState       *string                            `json:"set_state"`
+}
+
+// AnalyticsCapacityAnthropicIdentityDTO is one enabled Claude token: its label and uzi
+// secret id (never the value) and its stored reading. UserID and Email are set on an admin
+// all-users response and null otherwise.
+type AnalyticsCapacityAnthropicIdentityDTO struct {
+	SecretID  string       `json:"secret_id"`
+	Label     string       `json:"label"`
+	IsDefault bool         `json:"is_default"`
+	UserID    *string      `json:"user_id"`
+	Email     *string      `json:"email"`
+	Limits    RateLimitDTO `json:"limits"`
+}
+
+// AnalyticsCapacityAnthropicGaugeDTO is the Claude provider gauge.
+type AnalyticsCapacityAnthropicGaugeDTO struct {
+	AnalyticsCapacityGaugeBaseDTO
+	Identities []AnalyticsCapacityAnthropicIdentityDTO `json:"identities"`
+}
+
+// AnalyticsCapacityCodexIdentityDTO is one linked Codex account (one row however many enabled
+// aliases it has). UserID and Email are set on an admin all-users response and null otherwise.
+type AnalyticsCapacityCodexIdentityDTO struct {
+	CodexAccountRateLimitDTO
+	UserID *string `json:"user_id"`
+	Email  *string `json:"email"`
+}
+
+// AnalyticsCapacityCodexGaugeDTO is the Codex provider gauge. VaultStateBasis is
+// "live_observation": whether each owner's vault is locked is read live after the snapshot, not
+// from the historical database snapshot.
+type AnalyticsCapacityCodexGaugeDTO struct {
+	AnalyticsCapacityGaugeBaseDTO
+	VaultStateBasis string                              `json:"vault_state_basis"`
+	Identities      []AnalyticsCapacityCodexIdentityDTO `json:"identities"`
+}
+
+// AnalyticsCapacityGaugesDTO holds the two provider gauges.
+type AnalyticsCapacityGaugesDTO struct {
+	Anthropic AnalyticsCapacityAnthropicGaugeDTO `json:"anthropic"`
+	Codex     AnalyticsCapacityCodexGaugeDTO     `json:"codex"`
+}
+
+// AnalyticsCapacityDTO is the Capacity response: the calendar envelope, the interval-overlap
+// occupancy, the creation-cohort usage-wait measure and the current provider gauges.
+type AnalyticsCapacityDTO struct {
+	AnalyticsEnvelopeDTO
+	// SelectedUser is "all" for an admin response spanning every user, else the user id.
+	SelectedUser string                      `json:"selected_user"`
+	Filters      AnalyticsCapacityFiltersDTO `json:"filters"`
+	// ExcludedKindSelected is "chat" when kind=chat was requested (chat runs are outside the
+	// population, so the measures are empty), else null.
+	ExcludedKindSelected *string                          `json:"excluded_kind_selected"`
+	Occupancy            AnalyticsCapacityOccupancyDTO    `json:"occupancy"`
+	UsageWait            AnalyticsCapacityUsageWaitDTO    `json:"usage_wait"`
+	NotTracked           []AnalyticsCapacityNotTrackedDTO `json:"not_tracked"`
+	Gauges               AnalyticsCapacityGaugesDTO       `json:"gauges"`
 }

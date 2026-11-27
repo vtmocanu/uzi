@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -98,6 +99,10 @@ func (s *Service) syncOneMRState(ctx context.Context, repoID uuid.UUID, forgePro
 		slog.Warn("forgesvc: MR-state read failed", "repo", repoID, "issue", c.IssueIID, "mr", c.MrIID, "error", err)
 		return
 	}
+	// Capture the observation time right after the forge fetch returns, before any
+	// side effect (rework cancel, board move) can delay the write: PRD #4691 history
+	// orders concurrent observations of one PR by this instant.
+	observedAt := time.Now()
 	observed := mr.State
 
 	// Record and act on KNOWN states only (reviewer hardening, PRD #24 Decision
@@ -117,7 +122,7 @@ func (s *Service) syncOneMRState(ctx context.Context, repoID uuid.UUID, forgePro
 		// Acting on NULL→closed cannot distinguish "closed and stuck" from "closed
 		// yesterday, already triaged elsewhere", so pre-existing closed MRs at
 		// upgrade time never cause a wave of moves — a manual drag fixes those.
-		s.recordMRState(ctx, c.RunID, observed)
+		s.recordMRState(ctx, c.RunID, mr, observedAt)
 		return
 	}
 	stored := c.MrState.String
@@ -150,14 +155,14 @@ func (s *Service) syncOneMRState(ctx context.Context, repoID uuid.UUID, forgePro
 			// mr_state unadvanced so the next tick re-observes the edge and retries.
 			return
 		}
-		s.recordMRState(ctx, c.RunID, observed)
+		s.recordMRState(ctx, c.RunID, mr, observedAt)
 	case stored == forge.MRStateClosed && observed == forge.MRStateOpened:
 		// reopen-edge (Decision 6): restore the card Human Review-ward,
 		// symmetrically, guarded from In Progress (where the close-edge left it).
 		if s.laneMRMove(ctx, lane, repoID, forgeProjectID, c.IssueIID, tr, board.ColumnInProgress, board.ColumnHumanReview) == moveDeferred {
 			return
 		}
-		s.recordMRState(ctx, c.RunID, observed)
+		s.recordMRState(ctx, c.RunID, mr, observedAt)
 	default:
 		// A KNOWN non-edge transition: record, never move (this arm makes no board
 		// move). Unknown states never reach here — they are ignored before the
@@ -181,7 +186,7 @@ func (s *Service) syncOneMRState(ctx context.Context, repoID uuid.UUID, forgePro
 				return // leave mr_state unadvanced so the next tick retries
 			}
 		}
-		s.recordMRState(ctx, c.RunID, observed)
+		s.recordMRState(ctx, c.RunID, mr, observedAt)
 	}
 }
 
@@ -277,11 +282,14 @@ func (s *Service) guardedMRMove(ctx context.Context, repoID uuid.UUID, forgeProj
 			return moveSkipped
 		}
 		if ColumnMoveRefused(err) {
-			// The linked issue tracker refused the move before any request: the target
-			// column has no State mapped, the mapping is unset, or the State is not
-			// allowed. Unlike the run lifecycle, the MR watch does not replay it: the
-			// MR state is recorded and the card stays where it is (a manual drag
-			// fixes it). Accepted exception, PRD #4173 M5.
+			// The linked issue tracker refused the move before any write: the target
+			// column has no State mapped, the mapping is unset, the State is not
+			// allowed, the issue's State field is run by a state machine, or it cannot be
+			// read as a plain State field. Unlike
+			// the run lifecycle, the MR watch does not replay it: the MR state is
+			// recorded and the card stays where it is. A manual drag fixes a mapping
+			// refusal; a state-machine or unreadable-State-field refusal heals only by a
+			// YouTrack-side change (a drag is refused too). Accepted exception, PRD #4173 M5.
 			slog.Info("forgesvc: MR-state move refused by the issue tracker, edge consumed without a move", "repo", repoID, "issue", issueIID, "target", target, "reason", err)
 			return moveSkipped
 		}
@@ -305,11 +313,53 @@ func (s *Service) guardedMRMove(ctx context.Context, repoID uuid.UUID, forgeProj
 // reconciled by syncOneMRState, through SyncBoardFreeMRStatesWithIssueSide (PRD #4173 M5). Best-effort: a write failure only means the same edge is
 // re-observed next tick, and the guards make the retry a no-op if the card has
 // already moved.
-func (s *Service) recordMRState(ctx context.Context, runID uuid.UUID, state string) {
+//
+// PRD #4691: the same statement records PR merge/close history. Delivery is best
+// effort, never exactly-once. A lost reply (the write committed but the caller saw an
+// error) leaves no duplicate: runs.mr_state and the history committed together, so a
+// still-eligible run's next tick takes the same-state fast path. A write that really
+// failed is re-observed on the next eligible tick with a later observed_at; a
+// transition that happens before that retry, or a run that stops being eligible, goes
+// unrecorded; and a provider time missing from the first recorded event is never
+// back-filled by a later identical observation (docs/pr-history.md, coverage limits).
+func (s *Service) recordMRState(ctx context.Context, runID uuid.UUID, mr forge.MergeRequest, observedAt time.Time) {
 	if _, err := s.q.SetRunMRState(ctx, store.SetRunMRStateParams{
-		ID:      runID,
-		MrState: pgtype.Text{String: state, Valid: true},
+		ID:         runID,
+		MrState:    mr.State,
+		ObservedAt: pgtype.Timestamptz{Time: observedAt.UTC(), Valid: true},
+		ProviderAt: providerTimeParam(historyProviderTime(mr)),
 	}); err != nil {
-		slog.Warn("forgesvc: record MR state", "run", runID, "state", state, "error", err)
+		slog.Warn("forgesvc: record MR state", "run", runID, "state", mr.State, "error", err)
 	}
+}
+
+// historyProviderTime picks the provider-reported time that belongs to the observed
+// state: MergedAt for merged (ClosedAt is ignored, a merged PR's close time is not a
+// separate event), ClosedAt for closed, nil otherwise.
+func historyProviderTime(mr forge.MergeRequest) *time.Time {
+	switch mr.State {
+	case forge.MRStateMerged:
+		return mr.MergedAt
+	case forge.MRStateClosed:
+		return mr.ClosedAt
+	}
+	return nil
+}
+
+var (
+	providerTimeMin = time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+	providerTimeEnd = time.Date(10000, 1, 1, 0, 0, 0, 0, time.UTC) // exclusive
+)
+
+// providerTimeParam maps a provider time to the statement's nullable parameter: nil,
+// zero, before 1970-01-01T00:00:00Z or at/after 10000-01-01T00:00:00Z (UTC) is NULL.
+func providerTimeParam(t *time.Time) pgtype.Timestamptz {
+	if t == nil || t.IsZero() {
+		return pgtype.Timestamptz{}
+	}
+	u := t.UTC()
+	if u.Before(providerTimeMin) || !u.Before(providerTimeEnd) {
+		return pgtype.Timestamptz{}
+	}
+	return pgtype.Timestamptz{Time: u, Valid: true}
 }

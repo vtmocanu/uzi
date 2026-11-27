@@ -66,6 +66,7 @@ import { forgePlatform } from "../lib/forgeNoun";
 import { PlusIcon, XIcon } from "../components/icons";
 import { useAuth } from "../auth/AuthContext";
 import { stripUnsafeChars } from "../lib/safeText";
+import { issueRef } from "../lib/issueRef";
 import { useDemoMode } from "../lib/demoMode";
 import { maskRepoPath } from "../lib/demoMask";
 import { COLUMN_ACCENTS } from "./board/shared";
@@ -649,7 +650,7 @@ export function Board() {
             columnKeyForCard(before) !== columnKeyForCard(card) &&
             !suppressToastIids.current.has(card.iid)
           ) {
-            pushToast(`#${card.iid} → ${columnLabel(card)}`);
+            pushToast(`${issueRef(card.iid, card.issue_key)} → ${columnLabel(card)}`);
           }
         }
       }
@@ -856,14 +857,17 @@ export function Board() {
   // per-connection (unlike uziLabel, which is a session setting), so it comes off the
   // board payload, not useAuth(); 0 (unresolved) never marks a card runnable.
   const botForgeUserID = board?.bot_forge_user_id ?? 0;
+  // The stored eligibility tag name, set only on a repo linked to an issue tracker (PRD 4173
+  // M6): there an issue is uzi's when its labels include it, instead of the uzi label.
+  const eligibilityLabel = board?.eligibility_label;
 
   // Membership is now a single label (PRD #764, D3): a card is a board member when it
   // carries the `uzi` run-eligibility label. The old per-user `extra_labels` dimension
   // is retired on the client — the board_prefs row is still round-tripped (its
   // `show_all` half drives the toggle below), but its `extra_labels` goes unused here.
   const renderCards = useMemo(
-    () => visibleCards(payloadCards, uziLabel, botForgeUserID, showAll),
-    [payloadCards, uziLabel, botForgeUserID, showAll],
+    () => visibleCards(payloadCards, uziLabel, botForgeUserID, showAll, eligibilityLabel),
+    [payloadCards, uziLabel, botForgeUserID, showAll, eligibilityLabel],
   );
 
   // Board search filter (PRD #304 M2, Decision 6): membership → SEARCH → sort → cap.
@@ -929,8 +933,8 @@ export function Board() {
   // reveals. The `!closed` guard matches visibleCards so the count and the rendered set
   // agree on which "other issues" exist.
   const showAllCount = useMemo<number>(
-    () => payloadCards.filter((c) => !isUziCard(c, uziLabel, botForgeUserID) && !isSelfImproveTracker(c) && !c.closed).length,
-    [payloadCards, uziLabel, botForgeUserID],
+    () => payloadCards.filter((c) => !isUziCard(c, uziLabel, botForgeUserID, eligibilityLabel) && !isSelfImproveTracker(c) && !c.closed).length,
+    [payloadCards, uziLabel, botForgeUserID, eligibilityLabel],
   );
 
   // columnKeys is the board's lane order for the freeze: the implicit Backlog column
@@ -1109,12 +1113,12 @@ export function Board() {
       if (!anchor) return; // already at that end
       // Recorded BEFORE the await, because `reordering` flips to true inside applyDrop
       // and the button is blurred the moment it is disabled.
-      refocusName.current = `Move issue #${card.iid} ${direction} in ${columnLabel(card)}`;
+      refocusName.current = `Move issue ${issueRef(card.iid, card.issue_key)} ${direction} in ${columnLabel(card)}`;
       // ONLY on success. This is the announcement channel for users who cannot see the
       // board, so a toast that fires regardless is not a cosmetic slip — it is the
       // feedback saying the opposite of what happened.
       if (await applyDrop(card.iid, columnKeyForCard(card), anchor)) {
-        pushToast(`#${card.iid} moved ${direction} in ${columnLabel(card)}`);
+        pushToast(`${issueRef(card.iid, card.issue_key)} moved ${direction} in ${columnLabel(card)}`);
       }
     },
     [cardsByColumn, applyDrop, pushToast],
@@ -1171,8 +1175,11 @@ export function Board() {
   // board contains, rendered product copy invisible to any sweep of docs or code
   // comments. It names the CONFIGURED `uzi` label, since uzi_label is renameable
   // (PRD #764): runnable issues carry it, and "Issues" reveals the rest.
-  const boardDescription =
-    `Columns are ${forgePlatform(board?.forge_type)} labels. Cards move automatically as their runs progress; ` +
+  const boardDescription = eligibilityLabel
+    ? `Columns map to issue tracker States. Cards move automatically as their runs progress; ` +
+      `you can still drag a card to change its State in the issue tracker. Issues tagged ${stripUnsafeChars(eligibilityLabel)} are uzi's to run; ` +
+      `use "Issues" to show all other open issues alongside them.`
+    : `Columns are ${forgePlatform(board?.forge_type)} labels. Cards move automatically as their runs progress; ` +
     `you can still drag a card to change its label on the forge. ${uziLabel}-labeled issues are uzi's to run; ` +
     `use "Issues" to show all other open issues alongside them.`;
 
@@ -1300,7 +1307,7 @@ export function Board() {
             onToggleOpen={() => setIssuesOpen((o) => !o)}
             popRef={issuesPopRef}
             triggerRef={issuesTriggerRef}
-            uziLabel={uziLabel}
+            uziLabel={eligibilityLabel ? stripUnsafeChars(eligibilityLabel) : uziLabel}
             showAll={showAll}
             showAllCount={showAllCount}
             onToggleShowAll={toggleShowAll}
@@ -1422,13 +1429,14 @@ export function Board() {
                 // issue-less runs in the strip get distinct, meaningful accessible names
                 // instead of a repeated bare "Open run". issue_title is untrusted forge
                 // text, so it stays sanitized via stripUnsafeChars.
-                aria-label={`Open run${r.issue_iid != null ? ` for issue #${r.issue_iid}` : ""}${
+                aria-label={`Open run${r.issue_iid != null ? ` for issue ${issueRef(r.issue_iid, r.issue_key)}` : ""}${
                   r.issue_title.trim() ? `: ${stripUnsafeChars(r.issue_title)}` : ""
                 }`}
                 className="absolute inset-0 rounded-md"
               />
               <RunIssueRef
                 issueIid={r.issue_iid}
+                issueKey={r.issue_key}
                 issueWebUrl={r.issue_web_url}
                 kind={r.kind}
                 forgeType={r.forge_type}
@@ -1445,6 +1453,7 @@ export function Board() {
         <CreateIssueForm
           repoId={repoId}
           forgeType={board?.forge_type ?? ""}
+          eligibilityLabel={eligibilityLabel}
           onCreated={() => {
             setCreatingIssue(false);
             load();
@@ -1542,8 +1551,8 @@ export function Board() {
                   // is uzi's to run and renders solid with Start run; one without it is
                   // quiet and gets Promote. The matched `uzi` chip is hoisted ahead of
                   // MAX_CARD_CHIPS and highlighted so it reads as the runnable marker.
-                  const isEligible = isUziCard(card, uziLabel, botForgeUserID);
-                  const matchedUzi = isEligible ? [uziLabel] : [];
+                  const isEligible = isUziCard(card, uziLabel, botForgeUserID, eligibilityLabel);
+                  const matchedUzi = isEligible ? [eligibilityLabel || uziLabel] : [];
                   return (
                   <IssueCard
                     key={card.iid}
@@ -1616,9 +1625,9 @@ export function Board() {
                     onOptions={() => setOptionsIid(card.iid)}
                     fixCiBusy={card.pipeline != null && fixingRef === card.pipeline.ref}
                     onFixCi={() => card.pipeline && fixCi(card.pipeline.ref)}
-                    uziLabel={uziLabel}
+                    uziLabel={eligibilityLabel ? stripUnsafeChars(eligibilityLabel) : uziLabel}
                     isEligible={isEligible}
-                    canPromote={canPromote(card, uziLabel, botForgeUserID)}
+                    canPromote={canPromote(card, uziLabel, botForgeUserID, eligibilityLabel)}
                     promoting={promoting === card.iid}
                     onPromote={() => promote(card)}
                     onDragStart={(e) => {
@@ -1719,6 +1728,7 @@ export function Board() {
         <RunOptionsDialog
           key={optionsCard.iid}
           issueIid={optionsCard.iid}
+          issueKey={optionsCard.issue_key}
           issueTitle={optionsCard.title}
           facts={startFacts}
           gate={(harness) => cardGate(optionsCard, harness)}

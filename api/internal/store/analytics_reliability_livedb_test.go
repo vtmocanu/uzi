@@ -751,7 +751,7 @@ func TestAnalyticsReliabilityFiltersLiveDB(t *testing.T) {
 	mk(r1, runkind.Issue, "claude", "completed", "", 3)
 	mk(r1, runkind.Issue, "codex", "failed", "agent_failure", 4)
 	n := mk(r2, runkind.Task, "claude", "failed", "workflow_scope_missing", 5)
-	f.patch(n)
+	f.preservePatch(n)
 	mk(r2, runkind.Issue, "claude", "completed", "", 6)
 
 	if d := f.rel(relCall{Owner: o.User, Now: spendNow}).Doc; d.Totals.Current.Finished != 4 || d.NeedsLanding != 1 {

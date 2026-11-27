@@ -3965,6 +3965,7 @@ export function RunHeading({ run }: { run: Run }) {
       <h1 className="truncate text-xl font-semibold tracking-tight text-fg">{stripUnsafeChars(run.issue_title)}</h1>
       <RunIssueRef
         issueIid={run.issue_iid}
+        issueKey={run.issue_key}
         issueWebUrl={run.issue_web_url}
         kind={run.kind}
         forgeType={run.forge_type}

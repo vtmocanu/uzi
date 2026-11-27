@@ -23,12 +23,12 @@ const (
 	JudgeSkipNoUsableCredential   = "no_usable_credential" //nolint:gosec // G101: fixed skip reason code, not a credential
 	JudgeSkipCredentialDisabled   = "credential_disabled"  //nolint:gosec // G101: fixed skip reason code, not a credential
 	JudgeSkipCodexPoolUnavailable = "codex_pool_unavailable"
-	// JudgeSkipProviderLaneUnsupported (PRD #4320, #4322 M1a): recorded only for a Codex judge whose
-	// owner has a Codex model-provider source (not served until PRD #4322 #4574). Historical rows also
-	// exist for a Claude judge, from before a Claude source could bind a judge.
+	// JudgeSkipProviderLaneUnsupported (PRD #4320): no longer recorded. Historical rows exist for a
+	// Claude judge (from before a Claude source could bind a judge, PRD #4322 M1a) and for a Codex
+	// judge (from before a Codex source could bind one, PRD #4574 M1).
 	JudgeSkipProviderLaneUnsupported = "provider_lane_unsupported"
-	// JudgeSkipProviderSourceUnusable (PRD #4322 M1a): the owner's Claude source is cleared, unusable,
-	// invisible or retired at the judge's locked read.
+	// JudgeSkipProviderSourceUnusable (PRD #4322 M1a): the owner's Claude or Codex source (the judge's
+	// own harness) is cleared, unusable, invisible or retired at the judge's locked read.
 	JudgeSkipProviderSourceUnusable = "provider_source_unusable"
 	// JudgeSkipProviderModelUnmapped (PRD #4322 M1a): the judge model has no mapping on the source.
 	JudgeSkipProviderModelUnmapped = "provider_model_unmapped"
@@ -92,9 +92,9 @@ func judgeSkipReasonFor(err error) (string, bool) {
 }
 
 // judgeProviderSkipReasonFor maps a provider-lane refusal from the judge's create to its skip
-// reason: an unusable (cleared, invisible, retired, keyless) Claude source, a judge model the
-// source does not map, or no provider lane for the judge's harness (a Codex judge with a Codex
-// source). ErrJudgePolicyChanged maps to no reason on purpose.
+// reason: an unusable (cleared, invisible, retired, keyless) Claude or Codex source, a judge model
+// the source does not map, or no provider lane for the judge's harness (reachable only for a
+// harness other than Claude or Codex). ErrJudgePolicyChanged maps to no reason on purpose.
 func judgeProviderSkipReasonFor(err error) (string, bool) {
 	switch {
 	case errors.Is(err, ErrProviderSourceUnusable):

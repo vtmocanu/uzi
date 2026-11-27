@@ -291,7 +291,7 @@ func (h *Handler) FileFindingGroup(w http.ResponseWriter, r *http.Request) {
 			phase = "in_flight"
 		}
 	}
-	httpx.JSON(w, http.StatusCreated, apitypes.FindingGroupFileResultDTO{OperationID: op.ID.String(), DispositionIDs: dispositionIDs, Phase: phase, Issue: &apitypes.IncidentalFindingFiledIssueDTO{IID: created.IID, WebURL: created.WebURL, Title: created.Title}, Warning: warning})
+	httpx.JSON(w, http.StatusCreated, apitypes.FindingGroupFileResultDTO{OperationID: op.ID.String(), DispositionIDs: dispositionIDs, Phase: phase, Issue: &apitypes.IncidentalFindingFiledIssueDTO{IID: created.IID, IssueKey: linkedIssueKey(repo, created.IID), WebURL: created.WebURL, Title: created.Title}, Warning: warning})
 }
 
 func writeStoppedFindingGroup(w http.ResponseWriter, operation uuid.UUID, ids []string, phase string) {

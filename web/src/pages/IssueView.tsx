@@ -25,6 +25,7 @@ import { ClockIcon } from "../components/icons";
 import { ScheduleModal } from "../components/ScheduleModal";
 import { useAuth } from "../auth/AuthContext";
 import { stripUnsafeChars } from "../lib/safeText";
+import { issueRef } from "../lib/issueRef";
 import { useDemoMode } from "../lib/demoMode";
 import { maskUsername } from "../lib/demoMask";
 
@@ -207,8 +208,16 @@ export function IssueView() {
   // cannot disagree: an issue is runnable if it carries `uzi` OR is assigned to the
   // repo's bot. The bot id rides the issue-detail payload (per-connection), not the
   // session. A runnable issue offers Start run; a non-runnable one offers Promote.
-  const isEligible = !!issue && isUziCard(issue, uziLabel, issue.bot_forge_user_id);
-  const promotable = !!issue && canPromote(issue, uziLabel, issue.bot_forge_user_id);
+  //
+  // On a repo linked to an issue tracker the payload carries `eligibility_label` and the
+  // same two predicates decide by that tag alone (PRD 4173 M6): `linked` is also what
+  // hides the autopilot badge (autopilot never acts there) and renames the forge link.
+  const eligibilityLabel = issue?.eligibility_label;
+  const linked = !!eligibilityLabel;
+  const runLabel = eligibilityLabel || uziLabel; // the label or tag that makes an issue uzi's
+  const ref = issueRef(issue?.iid ?? iidNum, issue?.issue_key);
+  const isEligible = !!issue && isUziCard(issue, uziLabel, issue.bot_forge_user_id, eligibilityLabel);
+  const promotable = !!issue && canPromote(issue, uziLabel, issue.bot_forge_user_id, eligibilityLabel);
 
   // Promote (Decision 15; PRD #764): add the `uzi` label forge-first, then adopt the
   // returned card's labels — no optimistic update. Both outcomes are dropped when the
@@ -261,7 +270,7 @@ export function IssueView() {
           Board
         </Link>
         <span>/</span>
-        <span className="text-muted">#{iid}</span>
+        <span className="text-muted">{issue ? ref : `#${iid}`}</span>
       </nav>
 
       {(loadError || actionError) && <Alert message={loadError || actionError} />}
@@ -274,7 +283,7 @@ export function IssueView() {
               <div className="flex flex-wrap items-center gap-2">
                 {/* Issue #124: forge-supplied, untrusted (see Board). */}
                 <h1 className="truncate text-2xl font-semibold">{stripUnsafeChars(issue.title)}</h1>
-                <span className="text-sm text-faint">#{issue.iid}</span>
+                <span className="text-sm text-faint">{ref}</span>
               </div>
               <div className="mt-2 flex flex-wrap items-center gap-2 text-sm">
                 {/* S3: `wrap` plus a bounded width, because a column name is
@@ -313,7 +322,7 @@ export function IssueView() {
                   autopilotLabel,
                   columnLabels: [issue.column],
                 })
-                  .filter((l) => l !== uziLabel)
+                  .filter((l) => l !== runLabel)
                   .map((l) => (
                   <span
                     key={l}
@@ -330,7 +339,7 @@ export function IssueView() {
                     never did, which is that the issue is armed for an unattended run.
                     Mirrors RunView's autopilot badge so one fact reads one way. Without
                     it, an armed issue shows nothing at all until a run exists. */}
-                {issue.labels.includes(autopilotLabel) && (
+                {!linked && issue.labels.includes(autopilotLabel) && (
                   <Badge tone="brand" title="Autopilot: a run starts automatically, with the plan auto-approved">
                     {autopilotLabel}
                   </Badge>
@@ -343,12 +352,12 @@ export function IssueView() {
                     assignment-only issue does not carry. An issue with neither offers
                     Promote instead (below). */}
                 {isEligible &&
-                  (issue.labels.includes(uziLabel) ? (
+                  (issue.labels.includes(runLabel) ? (
                     <Badge
                       tone="brand"
-                      title={`This issue carries the ${uziLabel} label, so uzi will run it.`}
+                      title={`This issue carries the ${stripUnsafeChars(runLabel)} ${linked ? "tag" : "label"}, so uzi will run it.`}
                     >
-                      {uziLabel}
+                      {stripUnsafeChars(runLabel)}
                     </Badge>
                   ) : (
                     <Badge
@@ -383,10 +392,10 @@ export function IssueView() {
                 <Button
                   variant="secondary"
                   disabled={promoting}
-                  title={`Add the ${uziLabel} label so uzi can work this issue`}
+                  title={`Add the ${stripUnsafeChars(runLabel)} ${linked ? "tag" : "label"} so uzi can work this issue`}
                   onClick={promote}
                 >
-                  {promoting ? "…" : `Promote to ${uziLabel}`}
+                  {promoting ? "…" : `Promote to ${stripUnsafeChars(runLabel)}`}
                 </Button>
               )}
               {/* Schedule… (PRD #241 M5, mock §3): opens the schedule modal
@@ -399,7 +408,7 @@ export function IssueView() {
               )}
               {isHttpsUrl(issue.web_url) && (
                 <a href={issue.web_url} target="_blank" rel="noreferrer">
-                  <Button variant="ghost">Open on {forgePlatform(issue.forge_type)}</Button>
+                  <Button variant="ghost">{linked ? "Open in issue tracker" : `Open on ${forgePlatform(issue.forge_type)}`}</Button>
                 </a>
               )}
             </div>
@@ -445,7 +454,7 @@ export function IssueView() {
                 <Button
                   variant="secondary"
                   disabled={!gate.enabled || starting}
-                  aria-label={`Run options for #${issue.iid}`}
+                  aria-label={`Run options for ${ref}`}
                   title={gate.enabled ? "Choose the harness, token, model or effort for this run" : gate.reason}
                   onClick={() => setOptionsOpen(true)}
                 >
@@ -465,6 +474,7 @@ export function IssueView() {
             <RunOptionsDialog
               key={issue.iid}
               issueIid={issue.iid}
+              issueKey={issue.issue_key}
               issueTitle={issue.title}
               facts={startFacts}
               gate={(harness) => gateFor(harness) ?? { enabled: false, reason: "" }}

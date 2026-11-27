@@ -24,13 +24,19 @@ import {
   mockBlockedRepoMeta,
   mockConnection,
   mockForgeConfig,
+  issueTrackerScenario,
+  mockLinkableRepo,
+  mockForgeBoard,
+  mockLinkedBoard,
+  mockLinkedRepo,
   mockRepoToolProfiles,
+  seedsLinkedRepo,
   mockRepos,
   mockToolAllowlist,
 } from "../data";
 import { isTerminalRun } from "../../lib/runStatus";
 import { state } from "../store";
-import { delay, requireAdmin, requireSession } from "./shared";
+import { delay, mockScenario, requireAdmin, requireSession } from "./shared";
 // settings → workers → secrets has no runtime edge back to forge. Read settings
 // only inside the method, after module initialization, to use the current value.
 import { settingsApi } from "./settings";
@@ -108,6 +114,29 @@ repos = [
     guardrail_blocked: false,
   },
 ];
+// PRD #4173 M6: one never-enabled repo on the default connection, so "Link to an issue
+// tracker" shows on the Repos page (mockApi/issueTrackers.ts serves the link). The
+// issue-tracker-linked, issue-tracker-unmapped and issue-tracker-state-machine scenarios (M8) add an enabled linked repo.
+repos = [...repos, { ...mockLinkableRepo }];
+if (seedsLinkedRepo(issueTrackerScenario(mockScenario()))) repos = [...repos, structuredClone(mockLinkedRepo)];
+// The repos awaiting their first enable (the server's awaiting_first_enable): the board
+// refuses them until then, as GET board's refuseNeverEnabled does, and the first enable
+// opens a linked repo's board.
+export const awaitingFirstEnable = new Set<string>([mockLinkableRepo.id]);
+// Whether the issue tracker link control is offered to this user at all (the server's
+// issueTrackerLinkOffered: a non-empty allowlist or at least one issue tracker connection).
+// mockApi/issueTrackers.ts owns both facts and registers the predicate; until it does, the
+// control is not offered (fail closed, as the server does).
+let issueTrackerLinkOffered: () => boolean = () => false;
+export function setIssueTrackerLinkOffered(fn: () => boolean) {
+  issueTrackerLinkOffered = fn;
+}
+// A repo as listed: issue_tracker_linkable is derived on every read, with the server's rule
+// (never enabled AND not linked AND the link control is offered), never read from a stored flag.
+function listed(r: (typeof repos)[number]) {
+  const linkable = awaitingFirstEnable.has(r.id) && !r.issue_tracker_link && issueTrackerLinkOffered();
+  return { ...r, issue_tracker_linkable: linkable };
+}
 // Cross-user admin-only fixtures leave the existing owner-list demo intact.
 // UUID IDs can round-trip through the settings validator.
 
@@ -308,9 +337,9 @@ export const forgeApi = {
     connections = connections.filter((x) => x.id !== id);
     return delay(null);
   },
-  listProjects: async (_connectionId: string) => delay({ repos: repos.map((r) => ({ ...r })) }, 350),
+  listProjects: async (_connectionId: string) => delay({ repos: repos.map(listed) }, 350),
 
-  listRepos: async () => delay({ repos: repos.filter((r) => r.enabled).map((r) => ({ ...r })) }),
+  listRepos: async () => delay({ repos: repos.filter((r) => r.enabled).map(listed) }),
   adminListDockerAllowlistRepos: async (): Promise<AdminDockerAllowlistRepos> => {
     requireAdmin();
     const { settings } = await settingsApi.getSettings();
@@ -360,7 +389,14 @@ export const forgeApi = {
       });
     }
     r.enabled = enabled;
-    return delay({ repo: { ...r } });
+    // The first enable ends the window in which a repo can be linked (PRD #4173 D13) and
+    // opens the board: a linked repo's board gets its three columns, an unlinked one a
+    // plain forge board.
+    if (enabled) {
+      awaitingFirstEnable.delete(r.id);
+      if (!state.boards.has(r.id)) state.boards.set(r.id, r.issue_tracker_link ? mockLinkedBoard(r) : mockForgeBoard(r));
+    }
+    return delay({ repo: listed(r) });
   },
   // Explicit per-repo remove (PRD #357). Mirrors deleteConnection: drops the repo
   // from the in-memory list so demo/browser mode reflects the deletion. Enforces
@@ -377,13 +413,13 @@ export const forgeApi = {
     const r = repos.find((x) => x.id === id);
     if (!r) throw new ApiError(404, "repo not found");
     r.repo_skills_enabled = enabled;
-    return delay({ repo: { ...r } });
+    return delay({ repo: listed(r) });
   },
   setRepoClaudemdEnabled: async (id: string, enabled: boolean) => {
     const r = repos.find((x) => x.id === id);
     if (!r) throw new ApiError(404, "repo not found");
     r.repo_claudemd_enabled = enabled;
-    return delay({ repo: { ...r } });
+    return delay({ repo: listed(r) });
   },
   // Trusted-repo master control (PRD #246): sets whichever of the two trust flags
   // are present in one call, mirroring the server's atomic both-flags path.
@@ -395,7 +431,7 @@ export const forgeApi = {
     if (!r) throw new ApiError(404, "repo not found");
     if (flags.repo_skills_enabled !== undefined) r.repo_skills_enabled = flags.repo_skills_enabled;
     if (flags.repo_claudemd_enabled !== undefined) r.repo_claudemd_enabled = flags.repo_claudemd_enabled;
-    return delay({ repo: { ...r } });
+    return delay({ repo: listed(r) });
   },
   // PRD #2170 M3: the code cross-check owner inputs, its own exclusive PATCH group.
   // Mirrors PatchRepo: a key from another group is a 400, an empty request is a 400,
@@ -428,13 +464,13 @@ export const forgeApi = {
     if (inputs.cross_check_repo_instructions_enabled !== undefined) {
       r.cross_check_repo_instructions_enabled = inputs.cross_check_repo_instructions_enabled;
     }
-    return delay({ repo: { ...r } });
+    return delay({ repo: listed(r) });
   },
   setRepoDevboxOptIn: async (id: string, enabled: boolean) => {
     const r = repos.find((x) => x.id === id);
     if (!r) throw new ApiError(404, "repo not found");
     r.repo_devbox_opt_in = enabled;
-    return delay({ repo: { ...r } });
+    return delay({ repo: listed(r) });
   },
   // PRD #686: per-repo self-improve dogfooding capability. Owner-or-admin on the
   // server; the mock just flips the flag and echoes the repo.
@@ -442,13 +478,13 @@ export const forgeApi = {
     const r = repos.find((x) => x.id === id);
     if (!r) throw new ApiError(404, "repo not found");
     r.repo_fold_improve_uzi_backlog = enabled;
-    return delay({ repo: { ...r } });
+    return delay({ repo: listed(r) });
   },
   setRepoAgentSourceDefault: async (id: string, value: AgentSource | null) => {
     const r = repos.find((x) => x.id === id);
     if (!r) throw new ApiError(404, "repo not found");
     r.agent_source_default = value;
-    return delay({ repo: { ...r } });
+    return delay({ repo: listed(r) });
   },
   // PRD #84 M2: static per-repo capability hint. Mirrors the server's
   // capability.Filter to the {docker, jvm} vocabulary so only valid names persist.
@@ -456,14 +492,14 @@ export const forgeApi = {
     const r = repos.find((x) => x.id === id);
     if (!r) throw new ApiError(404, "repo not found");
     r.ignored_inferred_capabilities = CAPABILITY_VOCABULARY.filter((cap) => caps.includes(cap));
-    return delay({ repo: { ...r } });
+    return delay({ repo: listed(r) });
   },
   setRepoRequiredCapabilities: async (id: string, caps: string[]) => {
     const r = repos.find((x) => x.id === id);
     if (!r) throw new ApiError(404, "repo not found");
     const vocab = new Set<string>(CAPABILITY_VOCABULARY);
     r.required_capabilities = caps.filter((c) => vocab.has(c));
-    return delay({ repo: { ...r } });
+    return delay({ repo: listed(r) });
   },
   // PRD #66 M9 (D8): admin per-repo guardrail override. Requires a non-empty reason
   // (mirrors the server 400). Setting it clears guardrail_blocked in the demo (the
@@ -474,7 +510,7 @@ export const forgeApi = {
     if (reason.trim() === "") throw new ApiError(400, "a non-empty reason is required to override the guardrail");
     r.guardrail_override = { reason: reason.trim(), by: "you@example.com", at: new Date().toISOString() };
     r.guardrail_blocked = false;
-    return delay({ repo: { ...r } });
+    return delay({ repo: listed(r) });
   },
   clearRepoGuardrailOverride: async (id: string) => {
     const r = repos.find((x) => x.id === id);
@@ -484,7 +520,7 @@ export const forgeApi = {
     // underlying findings are still waivable blocks (mock stand-in: seeded block
     // messages). This is what makes Revoke round-trip back to "runs blocked".
     r.guardrail_blocked = (mockBlockedRepoMeta[id]?.block_messages.length ?? 0) > 0;
-    return delay({ repo: { ...r } });
+    return delay({ repo: listed(r) });
   },
 
   // ── GitHub Projects v2 sync (PRD #534) ───────────────────────────────────────

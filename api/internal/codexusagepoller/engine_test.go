@@ -31,6 +31,7 @@ type fakeStore struct {
 	forUser       map[uuid.UUID][]store.ListLinkedCodexAccountsForUserRow
 
 	upsertRows  int64
+	upsertErr   error // when set, UpsertCodexAccountRateLimits fails with it (not ErrNoRows)
 	failureRows int64
 
 	upserts  []store.UpsertCodexAccountRateLimitsParams
@@ -67,6 +68,9 @@ func (s *fakeStore) UpsertCodexAccountRateLimits(_ context.Context, arg store.Up
 	defer s.mu.Unlock()
 	s.upserts = append(s.upserts, arg)
 	s.order = append(s.order, "poll:"+arg.ProviderAccountID.String())
+	if s.upsertErr != nil {
+		return pgtype.Timestamptz{}, s.upsertErr
+	}
 	// The real query returns the written last_success_at; a fence refusal returns no row.
 	if s.upsertRows == 0 {
 		return pgtype.Timestamptz{}, pgx.ErrNoRows

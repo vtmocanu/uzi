@@ -44,7 +44,8 @@ func toIssueTrackerStateMappingDTO(m issuetrackersvc.StateMapping) issueTrackerS
 // until one is saved) and the States of its project, each with whether uzi may write it as
 // the closed state (closable) or as the open or a column state (openable)
 // (GET /api/repos/{id}/issue-tracker-link/states). 404 for a repo that is not the user's,
-// 409 for one that is not linked.
+// 409 for one that is not linked or whose project's State field is a state machine or
+// cannot be read as a plain one.
 func (h *Handler) GetIssueTrackerStateMapping(w http.ResponseWriter, r *http.Request) {
 	userID, svc, ok := h.issueTrackerRequest(w, r)
 	if !ok {
@@ -76,7 +77,8 @@ func (h *Handler) GetIssueTrackerStateMapping(w http.ResponseWriter, r *http.Req
 
 // PutIssueTrackerStateMapping replaces the whole state mapping of a linked repo
 // (PUT /api/repos/{id}/issue-tracker-link/states) and returns what it saved. Refusals: 404
-// for a repo that is not the user's, 409 for one that is not linked, 400 for a name that is
+// for a repo that is not the user's, 409 for one that is not linked or whose project's State
+// field is a state machine or cannot be read as a plain one, 400 for a name that is
 // out of bounds, not a State of the linked project, or not allowed in its role (a closed
 // state must mean done, never "Won't fix"), for a column label that is not a board column
 // and for a State that is mapped twice.

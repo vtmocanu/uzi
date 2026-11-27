@@ -1527,7 +1527,7 @@ WITH checker_template_pins AS MATERIALIZED (
       -- unknown claim key and start the run with no model credential. Same @worker_protocol_caps.
       AND (r.model_provider_key_mode IS NULL
            OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY($29::text[]) AND (r.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY($29::text[])))
-           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY($29::text[])))
+           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY($29::text[]) AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY($29::text[]))))
       AND (NOT (r.plan_cross_check_required OR (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan')))
            OR 'cross_check_v1' = ANY($29::text[]))
       AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
@@ -1615,6 +1615,10 @@ WITH checker_template_pins AS MATERIALIZED (
       AND (r.kind <> 'job'
            OR (NOT $11::boolean AND 'job_runner_v1' = ANY($29::text[])
                AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY($29::text[]))
+               -- PRD #4322 M1b (the claude_provider_job_v1 ROLLOUT GATE): a provider-bound job (every one
+               -- stamps model_provider_key_mode) additionally needs 'claude_provider_job_v1'; the generic
+               -- provider clause above already requires 'claude_provider_v1'. Vendor jobs are unchanged.
+               AND (r.model_provider_key_mode IS NULL OR 'claude_provider_job_v1' = ANY($29::text[]))
                -- PRD #1976 M1 (the isolated_job_v1 ROLLOUT GATE): a profile-bound job (runs.egress_profile_id)
                -- additionally needs 'isolated_job_v1', so a lane worker released before profile-bound jobs
                -- (isolated_fetch_v1 + job_runner_v1 only) never claims one. Same OUTSIDE-the-bypasses rule;
@@ -1840,7 +1844,7 @@ WITH checker_template_pins AS MATERIALIZED (
                 -- provider-bound run to a peer that lacks its engine's provider capability and could never claim it.
                 AND (r.model_provider_key_mode IS NULL
            OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(p.protocol_capabilities) AND (r.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY(p.protocol_capabilities)))
-           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(p.protocol_capabilities)))
+           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(p.protocol_capabilities) AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(p.protocol_capabilities))))
       AND (NOT (r.plan_cross_check_required OR (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan')))
            OR 'cross_check_v1' = ANY(p.protocol_capabilities))
       AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
@@ -1911,6 +1915,8 @@ WITH checker_template_pins AS MATERIALIZED (
                 AND (r.kind <> 'job'
                      OR (NOT COALESCE(p.docker_enabled, false) AND 'job_runner_v1' = ANY(p.protocol_capabilities)
                          AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(p.protocol_capabilities))
+                         -- PRD #4322 M1b: and the claude_provider_job_v1 arm for a provider-bound job.
+                         AND (r.model_provider_key_mode IS NULL OR 'claude_provider_job_v1' = ANY(p.protocol_capabilities))
                          -- PRD #1976 M1: and the isolated_job_v1 arm for a profile-bound job.
                          AND (r.egress_profile_id IS NULL OR 'isolated_job_v1' = ANY(p.protocol_capabilities))))
                 AND COALESCE(codex_admission_run_eligible_at(r.id) <= now(), true)
@@ -3253,7 +3259,7 @@ WHERE run.id = $1
   -- PRD #4320 module 5: the provider claim clause, mirrored (see ClaimRun).
   AND (run.model_provider_key_mode IS NULL
            OR (run.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities) AND (run.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities)))
-           OR (run.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities)))
+           OR (run.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities) AND (run.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities))))
       AND (NOT (run.plan_cross_check_required OR (run.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = run.id AND pc.stage = 'plan')))
            OR 'cross_check_v1' = ANY(w.protocol_capabilities))
       AND (NOT (run.kind = 'cross_check' AND run.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = run.id AND pc.stage = 'plan'))
@@ -3326,6 +3332,8 @@ WHERE run.id = $1
   AND (run.kind <> 'job'
        OR (NOT COALESCE(w.docker_enabled, false) AND 'job_runner_v1' = ANY(w.protocol_capabilities)
            AND (run.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))
+           -- PRD #4322 M1b: and the claude_provider_job_v1 arm for a provider-bound job.
+           AND (run.model_provider_key_mode IS NULL OR 'claude_provider_job_v1' = ANY(w.protocol_capabilities))
            -- PRD #1976 M1: and the isolated_job_v1 arm for a profile-bound job.
            AND (run.egress_profile_id IS NULL OR 'isolated_job_v1' = ANY(w.protocol_capabilities))))
   AND (run.released_worker_id IS NULL
@@ -3729,11 +3737,16 @@ WHERE w.user_id = $1
   -- PRD #1909 M1: a job stamped with runs.job_protocol (@requires_job_files) also needs the
   -- 'job_files_v1' protocol capability; the caller passes runs.job_protocol IS NOT NULL.
   AND (NOT $2::boolean OR 'job_files_v1' = ANY(w.protocol_capabilities))
+  -- PRD #4322 M1b: a provider-bound job (@requires_provider_job: runs.model_provider_key_mode IS NOT
+  -- NULL) also needs 'claude_provider_v1' AND 'claude_provider_job_v1' (the claim clauses' conjunction).
+  AND (NOT $3::boolean
+       OR ('claude_provider_v1' = ANY(w.protocol_capabilities) AND 'claude_provider_job_v1' = ANY(w.protocol_capabilities)))
 `
 
 type CountOnlineWorkersSatisfyingJobRunnerParams struct {
-	UserID           uuid.UUID `json:"user_id"`
-	RequiresJobFiles bool      `json:"requires_job_files"`
+	UserID              uuid.UUID `json:"user_id"`
+	RequiresJobFiles    bool      `json:"requires_job_files"`
+	RequiresProviderJob bool      `json:"requires_provider_job"`
 }
 
 // PRD #1908 (D-A): how many of a user's ONLINE, non-draining, non-ephemeral, NON-docker workers
@@ -3743,7 +3756,7 @@ type CountOnlineWorkersSatisfyingJobRunnerParams struct {
 // job-runner clause can never be satisfied). Reads workers.protocol_capabilities DIRECTLY and
 // excludes docker workers, exactly the set ClaimRun's clause admits.
 func (q *Queries) CountOnlineWorkersSatisfyingJobRunner(ctx context.Context, arg CountOnlineWorkersSatisfyingJobRunnerParams) (int64, error) {
-	row := q.db.QueryRow(ctx, countOnlineWorkersSatisfyingJobRunner, arg.UserID, arg.RequiresJobFiles)
+	row := q.db.QueryRow(ctx, countOnlineWorkersSatisfyingJobRunner, arg.UserID, arg.RequiresJobFiles, arg.RequiresProviderJob)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
@@ -3830,12 +3843,13 @@ WHERE w.user_id = $1
   -- lane worker never claims an unbound run, so it is never a satisfier here.
   AND NOT w.isolated_lane
   AND (
-    ($2::text = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities) AND ($3::text <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities)))
+    ($2::text = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities) AND ($3::text <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities)) AND ($3::text <> 'job' OR 'claude_provider_job_v1' = ANY(w.protocol_capabilities)))
     OR ($2::text = 'codex'
         AND 'codex_provider_v1' = ANY(w.protocol_capabilities)
         AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
         AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)
-        AND 'codex_runtime_v3' = ANY(w.protocol_capabilities))
+        AND 'codex_runtime_v3' = ANY(w.protocol_capabilities)
+        AND ($3::text <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities)))
   )
 `
 
@@ -12569,6 +12583,9 @@ const listActiveRunsAll = `-- name: ListActiveRunsAll :many
 SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, r.mr_web_url, r.prd_done_path, r.prd_patch_settled_at, r.anthropic_secret_id, r.anthropic_secret_label, r.anthropic_select_reason, r.anthropic_headroom_pct, r.wait_on_limit, r.limit_resets_at, r.retry_not_before, r.limit_wait_count, r.rate_limit_type, r.open_question_id, r.revise_count, r.plan_source, r.planned_base_commit, r.require_base_match, r.milestones_candidate, r.milestones_frozen, r.milestones_completed, r.milestones_in_progress, r.budget_max_iterations, r.budget_wall_seconds, r.schedule_id, r.limit_dead_secret_id, r.report_only, r.report_md, r.ci_config_paths, r.model, r.override_subagent_model, r.fail_origin, r.priority, r.summary_intent, r.summary_plan, r.summary_deltas, r.issue_comments, r.base_branch, r.open_mr, r.dispatched_at, r.review_target_run_id, r.review_requested, r.then_fix_requested, r.then_fix_of_run_id, r.preserved_patch, r.required_capabilities, r.stop_reason, r.required_tools, r.size_class, r.interactive, r.open_followup_id, r.plan_changed_files, r.scope_ceiling, r.status_since, r.review_comments, r.budget_paused_seconds, r.mr_rework_enabled, r.trigger_source, r.checkpoint_tip, r.usage_refolded, r.codex_secret_id, r.codex_auth_mode, r.codex_secret_label, r.codex_account_key, r.codex_material_revision, r.codex_account_revision, r.codex_claim_epoch, r.codex_cap_hash, r.pause_requested_at, r.pause_mode, r.pause_after_count, r.checkpoint_tip_at, r.recovery_wait_count, r.recovery_retry_not_before, r.completion_contract_version, r.contract_revision, r.completion_contract, r.completion_attempts, r.latest_completion_attempt, r.milestones_agents, r.hold_reason, r.hold_captured_head, r.completion_budget_exhausted_at, r.completion_question_at, r.budget_extension_seconds, r.claim_generation, r.harness, r.recovery_wait_cause, r.forge_park_count, r.credential_override_mode, r.credential_override_secret_id, r.claim_released_at, r.credential_switch_requested_at, r.credential_switch_generation, r.stale_requeue_generation, r.budget_finalize_seconds, r.released_worker_id, r.released_worker_nonce, r.gate_revision, r.gate_presentation_id, r.gate_presented_payload, r.gate_payload_digest, r.gate_refusal_count, r.gate_refusal_generation, r.disk_park_count, r.checkpoint_contains_latest, r.egress_profile_id, r.egress_snapshot, r.job_type, r.finalize_resume_generation, r.job_protocol, r.first_started_at, r.plan_cross_check_required, r.plan_cross_check_gate_reason, r.issue_raw_digest, r.issue_saved_body, r.issue_input_reason, r.auto_approve_blocked_reasons, r.plan_cross_check_diff_refusal, r.worker_recovery_episode, r.requeue_episode_baseline, r.worker_recovery_evidence, r.cross_check_lane, r.cross_check_lane_generation, r.completion_final_head, r.code_cross_check_required, r.provider_park_count, r.provider_park_streak_started_at, r.ci_config_guard, r.memory_episode, r.memory_intervention_count, r.memory_policy, r.completion_non_closing_reason, r.ci_artifact_manifest, r.checkpoint_attested_source, r.source_publication_intent, r.continued_issue_iid, r.checkpoint_coordinates, r.retained_park_count, r.ignored_inferred_capabilities, r.reserve_hold_reason, r.reserve_exempt_until, r.reserve_exempt_granted_at, r.reserve_exempt_credential_id, r.reserve_exempt_window_reset, r.reserve_exempt_prior_pct, r.hinted_capabilities, r.capability_inference_evidence, r.idle_stall_park_count, r.forge_admission, r.codex_select_reason, r.recovery_wait_phase, r.plan_cross_check_gated, r.policy_preserve_required, r.policy_pending_fresh, r.policy_outcome_id, r.policy_continuation_mode, r.policy_resolved_at, r.policy_applying_worker_id, r.policy_applying_generation, r.policy_source_generation, r.policy_refusal_count, r.policy_refusal_tag, r.policy_refusal_phase, r.policy_refusal_correlation_id, r.policy_hold_published, r.harness_preferred, r.harness_decision_reason, r.harness_preferred_score, r.harness_other_score, r.harness_preferred_measured, r.harness_other_measured, r.harness_preferred_held, r.harness_other_held, r.harness_preferred_weekly_reset_at, r.harness_other_weekly_reset_at, r.registration_evidence_generation, r.registration_evidence_nonce, r.registration_evidence_epoch, r.snapshot_departed_generation, r.snapshot_departed_nonce, r.snapshot_departed_epoch, r.repo_agent_source_commit, r.repo_agent_source_required, r.agent_source_requested, r.agent_source_requested_basis, r.plan_agent_source, r.ci_fix_mr_iid, r.policy_required_head, r.policy_recovery_verified_generation, r.policy_recovery_verified_head, r.policy_hold_cause, r.policy_fresh_consumed_generation, r.policy_fresh_confirmed_generation, r.recovery_wait_detail, r.credential_switch_op_id, r.credential_switch_hold_op_id, r.credential_switch_hold_generation, r.credential_switch_hold_worker_id, r.credential_switch_hold_register_nonce, r.effort, r.model_source, r.effort_source, r.checkpoint_withheld_since, r.checkpoint_withheld_status_since, r.checkpoint_withheld_worker_id, r.checkpoint_withheld_generation, r.checkpoint_withheld_nonce, r.checkpoint_withheld_report_seq, r.model_provider_id, r.model_provider_revision, r.model_provider_key_mode, r.model_provider_key_secret_id, r.model_provider_key_rev, r.model_provider_limit_streak, r.claim_provenance_worker_id, r.claim_provenance_generation, r.health_owner_hold_since, r.followup_park_seq, r.followup_finalize_generation, r.codex_switch_target_secret_id, r.codex_switch_target_generation, r.codex_switch_target_op_id, r.codex_switch_target_auth_mode, r.codex_switch_target_material_revision, r.codex_switch_target_account_key, r.codex_switch_target_account_revision, r.ci_autofix_enabled, r.fresh_hold_version, r.checkpoint_tip_generation, r.checkpoint_tip_generation_tip, rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email,
        c.forge_type,
        i.web_url                 AS issue_web_url,   -- PRD #411: the forge issue's web URL for the run's clickable #<iid> link
+       -- PRD #4173 M6: the issue tracker project short name of a LINKED repo (empty for an unlinked or repo-less run),
+       -- so the handler derives the run's issue_key without a per-row repo read.
+       COALESCE(CASE WHEN rp.issue_tracker_connection_id IS NOT NULL AND rp.issue_tracker_project_short <> '' THEN rp.issue_tracker_project_short END, '')::text AS issue_tracker_project_short,
        -- PRD #320 D8: the DISPLAY priority class from the ONE SQL function (same as
        -- ListRunsForUser), so the admin overview pill and the claim order agree.
        -- @background_grace_cutoff (now − RUN_BACKGROUND_GRACE) is the D4 fail-open flag.
@@ -12619,15 +12636,16 @@ LIMIT 500
 `
 
 type ListActiveRunsAllRow struct {
-	Run                   Run         `json:"run"`
-	RepoPath              pgtype.Text `json:"repo_path"`
-	WorkerName            pgtype.Text `json:"worker_name"`
-	OwnerEmail            string      `json:"owner_email"`
-	ForgeType             pgtype.Text `json:"forge_type"`
-	IssueWebUrl           pgtype.Text `json:"issue_web_url"`
-	PriorityClass         string      `json:"priority_class"`
-	HasLivePlanCrossCheck bool        `json:"has_live_plan_cross_check"`
-	HasLiveCodeCrossCheck bool        `json:"has_live_code_cross_check"`
+	Run                      Run         `json:"run"`
+	RepoPath                 pgtype.Text `json:"repo_path"`
+	WorkerName               pgtype.Text `json:"worker_name"`
+	OwnerEmail               string      `json:"owner_email"`
+	ForgeType                pgtype.Text `json:"forge_type"`
+	IssueWebUrl              pgtype.Text `json:"issue_web_url"`
+	IssueTrackerProjectShort string      `json:"issue_tracker_project_short"`
+	PriorityClass            string      `json:"priority_class"`
+	HasLivePlanCrossCheck    bool        `json:"has_live_plan_cross_check"`
+	HasLiveCodeCrossCheck    bool        `json:"has_live_code_cross_check"`
 }
 
 // Admin Agents-status: the newest 500 non-terminal runs across all users, excluding
@@ -12924,6 +12942,7 @@ func (q *Queries) ListActiveRunsAll(ctx context.Context, backgroundGraceCutoff p
 			&i.OwnerEmail,
 			&i.ForgeType,
 			&i.IssueWebUrl,
+			&i.IssueTrackerProjectShort,
 			&i.PriorityClass,
 			&i.HasLivePlanCrossCheck,
 			&i.HasLiveCodeCrossCheck,
@@ -15000,6 +15019,9 @@ const listRunsAdminDebug = `-- name: ListRunsAdminDebug :many
 SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, r.mr_web_url, r.prd_done_path, r.prd_patch_settled_at, r.anthropic_secret_id, r.anthropic_secret_label, r.anthropic_select_reason, r.anthropic_headroom_pct, r.wait_on_limit, r.limit_resets_at, r.retry_not_before, r.limit_wait_count, r.rate_limit_type, r.open_question_id, r.revise_count, r.plan_source, r.planned_base_commit, r.require_base_match, r.milestones_candidate, r.milestones_frozen, r.milestones_completed, r.milestones_in_progress, r.budget_max_iterations, r.budget_wall_seconds, r.schedule_id, r.limit_dead_secret_id, r.report_only, r.report_md, r.ci_config_paths, r.model, r.override_subagent_model, r.fail_origin, r.priority, r.summary_intent, r.summary_plan, r.summary_deltas, r.issue_comments, r.base_branch, r.open_mr, r.dispatched_at, r.review_target_run_id, r.review_requested, r.then_fix_requested, r.then_fix_of_run_id, r.preserved_patch, r.required_capabilities, r.stop_reason, r.required_tools, r.size_class, r.interactive, r.open_followup_id, r.plan_changed_files, r.scope_ceiling, r.status_since, r.review_comments, r.budget_paused_seconds, r.mr_rework_enabled, r.trigger_source, r.checkpoint_tip, r.usage_refolded, r.codex_secret_id, r.codex_auth_mode, r.codex_secret_label, r.codex_account_key, r.codex_material_revision, r.codex_account_revision, r.codex_claim_epoch, r.codex_cap_hash, r.pause_requested_at, r.pause_mode, r.pause_after_count, r.checkpoint_tip_at, r.recovery_wait_count, r.recovery_retry_not_before, r.completion_contract_version, r.contract_revision, r.completion_contract, r.completion_attempts, r.latest_completion_attempt, r.milestones_agents, r.hold_reason, r.hold_captured_head, r.completion_budget_exhausted_at, r.completion_question_at, r.budget_extension_seconds, r.claim_generation, r.harness, r.recovery_wait_cause, r.forge_park_count, r.credential_override_mode, r.credential_override_secret_id, r.claim_released_at, r.credential_switch_requested_at, r.credential_switch_generation, r.stale_requeue_generation, r.budget_finalize_seconds, r.released_worker_id, r.released_worker_nonce, r.gate_revision, r.gate_presentation_id, r.gate_presented_payload, r.gate_payload_digest, r.gate_refusal_count, r.gate_refusal_generation, r.disk_park_count, r.checkpoint_contains_latest, r.egress_profile_id, r.egress_snapshot, r.job_type, r.finalize_resume_generation, r.job_protocol, r.first_started_at, r.plan_cross_check_required, r.plan_cross_check_gate_reason, r.issue_raw_digest, r.issue_saved_body, r.issue_input_reason, r.auto_approve_blocked_reasons, r.plan_cross_check_diff_refusal, r.worker_recovery_episode, r.requeue_episode_baseline, r.worker_recovery_evidence, r.cross_check_lane, r.cross_check_lane_generation, r.completion_final_head, r.code_cross_check_required, r.provider_park_count, r.provider_park_streak_started_at, r.ci_config_guard, r.memory_episode, r.memory_intervention_count, r.memory_policy, r.completion_non_closing_reason, r.ci_artifact_manifest, r.checkpoint_attested_source, r.source_publication_intent, r.continued_issue_iid, r.checkpoint_coordinates, r.retained_park_count, r.ignored_inferred_capabilities, r.reserve_hold_reason, r.reserve_exempt_until, r.reserve_exempt_granted_at, r.reserve_exempt_credential_id, r.reserve_exempt_window_reset, r.reserve_exempt_prior_pct, r.hinted_capabilities, r.capability_inference_evidence, r.idle_stall_park_count, r.forge_admission, r.codex_select_reason, r.recovery_wait_phase, r.plan_cross_check_gated, r.policy_preserve_required, r.policy_pending_fresh, r.policy_outcome_id, r.policy_continuation_mode, r.policy_resolved_at, r.policy_applying_worker_id, r.policy_applying_generation, r.policy_source_generation, r.policy_refusal_count, r.policy_refusal_tag, r.policy_refusal_phase, r.policy_refusal_correlation_id, r.policy_hold_published, r.harness_preferred, r.harness_decision_reason, r.harness_preferred_score, r.harness_other_score, r.harness_preferred_measured, r.harness_other_measured, r.harness_preferred_held, r.harness_other_held, r.harness_preferred_weekly_reset_at, r.harness_other_weekly_reset_at, r.registration_evidence_generation, r.registration_evidence_nonce, r.registration_evidence_epoch, r.snapshot_departed_generation, r.snapshot_departed_nonce, r.snapshot_departed_epoch, r.repo_agent_source_commit, r.repo_agent_source_required, r.agent_source_requested, r.agent_source_requested_basis, r.plan_agent_source, r.ci_fix_mr_iid, r.policy_required_head, r.policy_recovery_verified_generation, r.policy_recovery_verified_head, r.policy_hold_cause, r.policy_fresh_consumed_generation, r.policy_fresh_confirmed_generation, r.recovery_wait_detail, r.credential_switch_op_id, r.credential_switch_hold_op_id, r.credential_switch_hold_generation, r.credential_switch_hold_worker_id, r.credential_switch_hold_register_nonce, r.effort, r.model_source, r.effort_source, r.checkpoint_withheld_since, r.checkpoint_withheld_status_since, r.checkpoint_withheld_worker_id, r.checkpoint_withheld_generation, r.checkpoint_withheld_nonce, r.checkpoint_withheld_report_seq, r.model_provider_id, r.model_provider_revision, r.model_provider_key_mode, r.model_provider_key_secret_id, r.model_provider_key_rev, r.model_provider_limit_streak, r.claim_provenance_worker_id, r.claim_provenance_generation, r.health_owner_hold_since, r.followup_park_seq, r.followup_finalize_generation, r.codex_switch_target_secret_id, r.codex_switch_target_generation, r.codex_switch_target_op_id, r.codex_switch_target_auth_mode, r.codex_switch_target_material_revision, r.codex_switch_target_account_key, r.codex_switch_target_account_revision, r.ci_autofix_enabled, r.fresh_hold_version, r.checkpoint_tip_generation, r.checkpoint_tip_generation_tip, rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email,
        c.forge_type,
        i.web_url                 AS issue_web_url,   -- PRD #411: the forge issue's web URL for the run's clickable #<iid> link
+       -- PRD #4173 M6: the issue tracker project short name of a LINKED repo (empty for an unlinked or repo-less run),
+       -- so the handler derives the run's issue_key without a per-row repo read.
+       COALESCE(CASE WHEN rp.issue_tracker_connection_id IS NOT NULL AND rp.issue_tracker_project_short <> '' THEN rp.issue_tracker_project_short END, '')::text AS issue_tracker_project_short,
        -- PRD #320 D8: the DISPLAY priority class from the ONE SQL function (same as
        -- ListRunsForUser), so the admin overview pill and the claim order agree.
        -- @background_grace_cutoff (now − RUN_BACKGROUND_GRACE) is the D4 fail-open flag.
@@ -15061,16 +15083,17 @@ type ListRunsAdminDebugParams struct {
 }
 
 type ListRunsAdminDebugRow struct {
-	Run                   Run         `json:"run"`
-	RepoPath              pgtype.Text `json:"repo_path"`
-	WorkerName            pgtype.Text `json:"worker_name"`
-	OwnerEmail            string      `json:"owner_email"`
-	ForgeType             pgtype.Text `json:"forge_type"`
-	IssueWebUrl           pgtype.Text `json:"issue_web_url"`
-	PriorityClass         string      `json:"priority_class"`
-	HasAvailableCapture   bool        `json:"has_available_capture"`
-	HasLivePlanCrossCheck bool        `json:"has_live_plan_cross_check"`
-	HasLiveCodeCrossCheck bool        `json:"has_live_code_cross_check"`
+	Run                      Run         `json:"run"`
+	RepoPath                 pgtype.Text `json:"repo_path"`
+	WorkerName               pgtype.Text `json:"worker_name"`
+	OwnerEmail               string      `json:"owner_email"`
+	ForgeType                pgtype.Text `json:"forge_type"`
+	IssueWebUrl              pgtype.Text `json:"issue_web_url"`
+	IssueTrackerProjectShort string      `json:"issue_tracker_project_short"`
+	PriorityClass            string      `json:"priority_class"`
+	HasAvailableCapture      bool        `json:"has_available_capture"`
+	HasLivePlanCrossCheck    bool        `json:"has_live_plan_cross_check"`
+	HasLiveCodeCrossCheck    bool        `json:"has_live_code_cross_check"`
 }
 
 // Issue #4198: the admin run debug listing. Runs in EVERY status (terminal included),
@@ -15378,6 +15401,7 @@ func (q *Queries) ListRunsAdminDebug(ctx context.Context, arg ListRunsAdminDebug
 			&i.OwnerEmail,
 			&i.ForgeType,
 			&i.IssueWebUrl,
+			&i.IssueTrackerProjectShort,
 			&i.PriorityClass,
 			&i.HasAvailableCapture,
 			&i.HasLivePlanCrossCheck,
@@ -15397,6 +15421,9 @@ const listRunsForUser = `-- name: ListRunsForUser :many
 SELECT r.id, r.user_id, r.repo_id, r.issue_iid, r.issue_title, r.issue_description, r.status, r.requeue_count, r.worker_id, r.session_id, r.last_seq, r.branch, r.mr_iid, r.failure_reason, r.plan_md, r.iteration_count, r.claimed_at, r.started_at, r.finished_at, r.created_at, r.updated_at, r.origin_column, r.board_column, r.move_pending_since, r.mr_state, r.auto_approve, r.autopilot_commented_at, r.kind, r.pipeline_id, r.pipeline_ref, r.failure_snapshot, r.fix_verdict, r.stop_kind, r.agent_source, r.agent_exclusions, r.repo_agents, r.title, r.resume_of_run_id, r.last_activity_at, r.health, r.health_reason, r.health_since, r.health_notified_at, r.target_run_id, r.mr_web_url, r.prd_done_path, r.prd_patch_settled_at, r.anthropic_secret_id, r.anthropic_secret_label, r.anthropic_select_reason, r.anthropic_headroom_pct, r.wait_on_limit, r.limit_resets_at, r.retry_not_before, r.limit_wait_count, r.rate_limit_type, r.open_question_id, r.revise_count, r.plan_source, r.planned_base_commit, r.require_base_match, r.milestones_candidate, r.milestones_frozen, r.milestones_completed, r.milestones_in_progress, r.budget_max_iterations, r.budget_wall_seconds, r.schedule_id, r.limit_dead_secret_id, r.report_only, r.report_md, r.ci_config_paths, r.model, r.override_subagent_model, r.fail_origin, r.priority, r.summary_intent, r.summary_plan, r.summary_deltas, r.issue_comments, r.base_branch, r.open_mr, r.dispatched_at, r.review_target_run_id, r.review_requested, r.then_fix_requested, r.then_fix_of_run_id, r.preserved_patch, r.required_capabilities, r.stop_reason, r.required_tools, r.size_class, r.interactive, r.open_followup_id, r.plan_changed_files, r.scope_ceiling, r.status_since, r.review_comments, r.budget_paused_seconds, r.mr_rework_enabled, r.trigger_source, r.checkpoint_tip, r.usage_refolded, r.codex_secret_id, r.codex_auth_mode, r.codex_secret_label, r.codex_account_key, r.codex_material_revision, r.codex_account_revision, r.codex_claim_epoch, r.codex_cap_hash, r.pause_requested_at, r.pause_mode, r.pause_after_count, r.checkpoint_tip_at, r.recovery_wait_count, r.recovery_retry_not_before, r.completion_contract_version, r.contract_revision, r.completion_contract, r.completion_attempts, r.latest_completion_attempt, r.milestones_agents, r.hold_reason, r.hold_captured_head, r.completion_budget_exhausted_at, r.completion_question_at, r.budget_extension_seconds, r.claim_generation, r.harness, r.recovery_wait_cause, r.forge_park_count, r.credential_override_mode, r.credential_override_secret_id, r.claim_released_at, r.credential_switch_requested_at, r.credential_switch_generation, r.stale_requeue_generation, r.budget_finalize_seconds, r.released_worker_id, r.released_worker_nonce, r.gate_revision, r.gate_presentation_id, r.gate_presented_payload, r.gate_payload_digest, r.gate_refusal_count, r.gate_refusal_generation, r.disk_park_count, r.checkpoint_contains_latest, r.egress_profile_id, r.egress_snapshot, r.job_type, r.finalize_resume_generation, r.job_protocol, r.first_started_at, r.plan_cross_check_required, r.plan_cross_check_gate_reason, r.issue_raw_digest, r.issue_saved_body, r.issue_input_reason, r.auto_approve_blocked_reasons, r.plan_cross_check_diff_refusal, r.worker_recovery_episode, r.requeue_episode_baseline, r.worker_recovery_evidence, r.cross_check_lane, r.cross_check_lane_generation, r.completion_final_head, r.code_cross_check_required, r.provider_park_count, r.provider_park_streak_started_at, r.ci_config_guard, r.memory_episode, r.memory_intervention_count, r.memory_policy, r.completion_non_closing_reason, r.ci_artifact_manifest, r.checkpoint_attested_source, r.source_publication_intent, r.continued_issue_iid, r.checkpoint_coordinates, r.retained_park_count, r.ignored_inferred_capabilities, r.reserve_hold_reason, r.reserve_exempt_until, r.reserve_exempt_granted_at, r.reserve_exempt_credential_id, r.reserve_exempt_window_reset, r.reserve_exempt_prior_pct, r.hinted_capabilities, r.capability_inference_evidence, r.idle_stall_park_count, r.forge_admission, r.codex_select_reason, r.recovery_wait_phase, r.plan_cross_check_gated, r.policy_preserve_required, r.policy_pending_fresh, r.policy_outcome_id, r.policy_continuation_mode, r.policy_resolved_at, r.policy_applying_worker_id, r.policy_applying_generation, r.policy_source_generation, r.policy_refusal_count, r.policy_refusal_tag, r.policy_refusal_phase, r.policy_refusal_correlation_id, r.policy_hold_published, r.harness_preferred, r.harness_decision_reason, r.harness_preferred_score, r.harness_other_score, r.harness_preferred_measured, r.harness_other_measured, r.harness_preferred_held, r.harness_other_held, r.harness_preferred_weekly_reset_at, r.harness_other_weekly_reset_at, r.registration_evidence_generation, r.registration_evidence_nonce, r.registration_evidence_epoch, r.snapshot_departed_generation, r.snapshot_departed_nonce, r.snapshot_departed_epoch, r.repo_agent_source_commit, r.repo_agent_source_required, r.agent_source_requested, r.agent_source_requested_basis, r.plan_agent_source, r.ci_fix_mr_iid, r.policy_required_head, r.policy_recovery_verified_generation, r.policy_recovery_verified_head, r.policy_hold_cause, r.policy_fresh_consumed_generation, r.policy_fresh_confirmed_generation, r.recovery_wait_detail, r.credential_switch_op_id, r.credential_switch_hold_op_id, r.credential_switch_hold_generation, r.credential_switch_hold_worker_id, r.credential_switch_hold_register_nonce, r.effort, r.model_source, r.effort_source, r.checkpoint_withheld_since, r.checkpoint_withheld_status_since, r.checkpoint_withheld_worker_id, r.checkpoint_withheld_generation, r.checkpoint_withheld_nonce, r.checkpoint_withheld_report_seq, r.model_provider_id, r.model_provider_revision, r.model_provider_key_mode, r.model_provider_key_secret_id, r.model_provider_key_rev, r.model_provider_limit_streak, r.claim_provenance_worker_id, r.claim_provenance_generation, r.health_owner_hold_since, r.followup_park_seq, r.followup_finalize_generation, r.codex_switch_target_secret_id, r.codex_switch_target_generation, r.codex_switch_target_op_id, r.codex_switch_target_auth_mode, r.codex_switch_target_material_revision, r.codex_switch_target_account_key, r.codex_switch_target_account_revision, r.ci_autofix_enabled, r.fresh_hold_version, r.checkpoint_tip_generation, r.checkpoint_tip_generation_tip, rp.path_with_namespace AS repo_path, w.name AS worker_name,
        c.forge_type,
        i.web_url                 AS issue_web_url,   -- PRD #411: the forge issue's web URL for the run's clickable #<iid> link
+       -- PRD #4173 M6: the issue tracker project short name of a LINKED repo (empty for an unlinked or repo-less run),
+       -- so the handler derives the run's issue_key without a per-row repo read.
+       COALESCE(CASE WHEN rp.issue_tracker_connection_id IS NOT NULL AND rp.issue_tracker_project_short <> '' THEN rp.issue_tracker_project_short END, '')::text AS issue_tracker_project_short,
        -- PRD #320 D8: the DISPLAY priority class from the ONE SQL function, so the
        -- Runs-list pill and ClaimRun's ORDER BY are the same decision. @background_grace_cutoff
        -- (now − RUN_BACKGROUND_GRACE) is the D4 fail-open flag: a demoted run created
@@ -15474,16 +15501,17 @@ type ListRunsForUserParams struct {
 }
 
 type ListRunsForUserRow struct {
-	Run                   Run         `json:"run"`
-	RepoPath              pgtype.Text `json:"repo_path"`
-	WorkerName            pgtype.Text `json:"worker_name"`
-	ForgeType             pgtype.Text `json:"forge_type"`
-	IssueWebUrl           pgtype.Text `json:"issue_web_url"`
-	PriorityClass         string      `json:"priority_class"`
-	JudgeVerdict          pgtype.Text `json:"judge_verdict"`
-	HasAvailableCapture   bool        `json:"has_available_capture"`
-	HasLivePlanCrossCheck bool        `json:"has_live_plan_cross_check"`
-	HasLiveCodeCrossCheck bool        `json:"has_live_code_cross_check"`
+	Run                      Run         `json:"run"`
+	RepoPath                 pgtype.Text `json:"repo_path"`
+	WorkerName               pgtype.Text `json:"worker_name"`
+	ForgeType                pgtype.Text `json:"forge_type"`
+	IssueWebUrl              pgtype.Text `json:"issue_web_url"`
+	IssueTrackerProjectShort string      `json:"issue_tracker_project_short"`
+	PriorityClass            string      `json:"priority_class"`
+	JudgeVerdict             pgtype.Text `json:"judge_verdict"`
+	HasAvailableCapture      bool        `json:"has_available_capture"`
+	HasLivePlanCrossCheck    bool        `json:"has_live_plan_cross_check"`
+	HasLiveCodeCrossCheck    bool        `json:"has_live_code_cross_check"`
 }
 
 // The user's runs, newest first (Runs index + Agents-status "your runs"), joined
@@ -15819,6 +15847,7 @@ func (q *Queries) ListRunsForUser(ctx context.Context, arg ListRunsForUserParams
 			&i.WorkerName,
 			&i.ForgeType,
 			&i.IssueWebUrl,
+			&i.IssueTrackerProjectShort,
 			&i.PriorityClass,
 			&i.JudgeVerdict,
 			&i.HasAvailableCapture,
@@ -16359,7 +16388,7 @@ WHERE r.status = 'queued'
   -- PRD #4320 module 5: the provider claim clause, mirrored (see ClaimRun).
   AND (r.model_provider_key_mode IS NULL
            OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities) AND (r.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities)))
-           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities)))
+           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities) AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities))))
                  AND (
                      NOT (
                          r.harness = 'codex'
@@ -16423,6 +16452,7 @@ WHERE r.status = 'queued'
         -- 'job_runner_v1'), ClaimRun's non-bypassable clause; the same arm sits in the free-slot test.
         AND (r.kind <> 'job' OR (NOT COALESCE(w.docker_enabled, false) AND 'job_runner_v1' = ANY(w.protocol_capabilities)
                                  AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))
+                                 AND (r.model_provider_key_mode IS NULL OR 'claude_provider_job_v1' = ANY(w.protocol_capabilities))
                                  AND (r.egress_profile_id IS NULL OR 'isolated_job_v1' = ANY(w.protocol_capabilities))))
   )
   AND NOT EXISTS (
@@ -16479,7 +16509,7 @@ WHERE r.status = 'queued'
   -- PRD #4320 module 5: the provider claim clause, mirrored (see ClaimRun).
   AND (r.model_provider_key_mode IS NULL
            OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities) AND (r.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities)))
-           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities)))
+           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities) AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities))))
                  AND (
                      NOT (
                          r.harness = 'codex'
@@ -16541,6 +16571,7 @@ WHERE r.status = 'queued'
         AND r.required_capabilities <@ fn_effective_worker_caps(w.capabilities, COALESCE(w.docker_enabled, false))
         AND (r.kind <> 'job' OR (NOT COALESCE(w.docker_enabled, false) AND 'job_runner_v1' = ANY(w.protocol_capabilities)
                                  AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))
+                                 AND (r.model_provider_key_mode IS NULL OR 'claude_provider_job_v1' = ANY(w.protocol_capabilities))
                                  AND (r.egress_profile_id IS NULL OR 'isolated_job_v1' = ANY(w.protocol_capabilities))))
         AND (r.kind = 'cross_check' OR w.max_concurrent_runs IS NULL
              OR (SELECT count(*) FROM runs r2
@@ -16782,6 +16813,11 @@ WHERE r.status = 'queued'
   -- original leading AND something to attach to.
   AND (
       TRUE
+  -- PRD #4322 M1b: the generic arm never decides a job. A provider-bound job would satisfy this
+  -- arm's model_provider_key_mode demand disjunct, so the job arm below (which carries the
+  -- job-runner and provider-job capabilities) is the only decider for kind 'job'. The conjunct
+  -- sits INSIDE this first AND chain, before the OR, so it cannot gate the job arm.
+  AND r.kind <> 'job'
   -- Orphan PLAN children retain the legacy capability-gap provisioning path;
   -- the CODE exclusion above keeps known CODE children on their own worker.
   -- PRD #2865: a GUARDED run (ci_config_guard) is demand too: with no worker reporting
@@ -16838,6 +16874,9 @@ WHERE r.status = 'queued'
         AND 'job_runner_v1' = ANY(wj.protocol_capabilities)
         -- PRD #1909 M1: and 'job_files_v1' for a stamped job (runs.job_protocol).
         AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(wj.protocol_capabilities))
+        -- PRD #4322 M1b: and both provider capabilities for a provider-bound job.
+        AND (r.model_provider_key_mode IS NULL
+             OR ('claude_provider_v1' = ANY(wj.protocol_capabilities) AND 'claude_provider_job_v1' = ANY(wj.protocol_capabilities)))
         -- PRD #1976 M1: and 'isolated_job_v1' for a profile-bound job (runs.egress_profile_id).
         AND (r.egress_profile_id IS NULL OR 'isolated_job_v1' = ANY(wj.protocol_capabilities))
   ))
@@ -29108,15 +29147,72 @@ func (q *Queries) SetRunLimitWait(ctx context.Context, arg SetRunLimitWaitParams
 	return result.RowsAffected(), nil
 }
 
-const setRunMRState = `-- name: SetRunMRState :execrows
+const setRunMRState = `-- name: SetRunMRState :one
 
-UPDATE runs SET mr_state = $1, updated_at = now()
-WHERE id = $2
+WITH prev AS (
+  SELECT r.id, r.repo_id, r.mr_iid,
+         CASE WHEN r.mr_state IN ('opened','closed','merged','locked') THEN r.mr_state END AS prev_state,
+         (r.user_id = fc.user_id) AS owner_match
+  FROM runs r
+  JOIN repos rp ON rp.id = r.repo_id
+  JOIN forge_connections fc ON fc.id = rp.connection_id
+  WHERE r.id = $1 AND $2::text IN ('opened','closed','merged','locked')
+  FOR NO KEY UPDATE OF r
+), upd AS (
+  UPDATE runs SET mr_state = $2::text, updated_at = now()
+  FROM prev
+  WHERE runs.id = prev.id
+  RETURNING runs.id, runs.repo_id, runs.mr_iid, prev.prev_state, prev.owner_match
+), head AS (
+  INSERT INTO pr_history_heads AS h (repo_id, mr_iid, state, observed_at, last_provider_at, first_merged_at, first_merged_source,
+      last_changed, last_from_state, last_to_state, last_event_provider_at, last_time_source, last_bootstrap, last_first_merge)
+  SELECT u.repo_id, u.mr_iid, $2::text, $3::timestamptz, n.p,
+      CASE WHEN $2::text = 'merged' THEN COALESCE(n.p, $3::timestamptz) END,
+      CASE WHEN $2::text = 'merged' THEN CASE WHEN n.p IS NULL THEN 'observation_fallback' ELSE 'provider' END END,
+      true, u.prev_state, $2::text, n.p,
+      CASE WHEN n.p IS NULL THEN 'observation_fallback' ELSE 'provider' END,
+      true, $2::text = 'merged'
+  FROM upd u
+  CROSS JOIN LATERAL (SELECT CASE WHEN $4::timestamptz <= $3::timestamptz
+                                  THEN $4::timestamptz END AS p) n
+  WHERE u.owner_match AND u.mr_iid IS NOT NULL
+  ON CONFLICT (repo_id, mr_iid) DO UPDATE SET
+    state = EXCLUDED.state,
+    last_to_state = EXCLUDED.state,
+    last_from_state = h.state,
+    last_changed = (h.state IS DISTINCT FROM EXCLUDED.state),
+    observed_at = EXCLUDED.observed_at,
+    last_bootstrap = false,
+    last_event_provider_at = CASE WHEN EXCLUDED.last_provider_at < h.last_provider_at THEN NULL ELSE EXCLUDED.last_provider_at END,
+    last_time_source = CASE WHEN (CASE WHEN EXCLUDED.last_provider_at < h.last_provider_at THEN NULL ELSE EXCLUDED.last_provider_at END) IS NULL
+                            THEN 'observation_fallback' ELSE 'provider' END,
+    last_provider_at = GREATEST(h.last_provider_at, EXCLUDED.last_provider_at),
+    last_first_merge = (h.state IS DISTINCT FROM EXCLUDED.state) AND EXCLUDED.state = 'merged' AND h.first_merged_at IS NULL,
+    first_merged_at = CASE WHEN (h.state IS DISTINCT FROM EXCLUDED.state) AND EXCLUDED.state = 'merged' AND h.first_merged_at IS NULL
+                           THEN COALESCE(CASE WHEN EXCLUDED.last_provider_at < h.last_provider_at THEN NULL ELSE EXCLUDED.last_provider_at END, EXCLUDED.observed_at)
+                           ELSE h.first_merged_at END,
+    first_merged_source = CASE WHEN (h.state IS DISTINCT FROM EXCLUDED.state) AND EXCLUDED.state = 'merged' AND h.first_merged_at IS NULL
+                               THEN CASE WHEN (CASE WHEN EXCLUDED.last_provider_at < h.last_provider_at THEN NULL ELSE EXCLUDED.last_provider_at END) IS NULL
+                                         THEN 'observation_fallback' ELSE 'provider' END
+                               ELSE h.first_merged_source END,
+    updated_at = now()
+  WHERE EXCLUDED.observed_at > h.observed_at
+  RETURNING h.repo_id, h.mr_iid, h.last_changed, h.last_from_state, h.last_to_state, h.last_event_provider_at,
+            h.last_time_source, h.observed_at, h.last_bootstrap, h.last_first_merge
+), ev AS (
+  INSERT INTO pr_history_events (repo_id, mr_iid, from_state, to_state, provider_at, time_source, observed_at, bootstrap, first_merge)
+  SELECT repo_id, mr_iid, last_from_state, last_to_state, last_event_provider_at, last_time_source, observed_at, last_bootstrap, last_first_merge
+  FROM head WHERE last_changed
+  RETURNING 1
+)
+SELECT count(*)::bigint AS updated FROM upd
 `
 
 type SetRunMRStateParams struct {
-	MrState pgtype.Text `json:"mr_state"`
-	ID      uuid.UUID   `json:"id"`
+	ID         uuid.UUID          `json:"id"`
+	MrState    string             `json:"mr_state"`
+	ObservedAt pgtype.Timestamptz `json:"observed_at"`
+	ProviderAt pgtype.Timestamptz `json:"provider_at"`
 }
 
 // MR-close watcher (PRD #24) --------------------------------------------------
@@ -29130,12 +29226,39 @@ type SetRunMRStateParams struct {
 // prompt/self_improve are excluded by its CTE (see recordMRState). The run itself
 // stays terminal — closing an MR is review feedback, not a run-status event — so
 // this touches mr_state (and updated_at) only.
+//
+// PRD #4691: the same statement also records PR history, atomically, with
+// data-modifying CTEs. CTE order: prev (lock the run row, read its previous state and
+// whether the run's owner owns the repo's forge connection) -> upd (write mr_state) ->
+// head (upsert pr_history_heads) -> ev (append the transition event). PG16 has no
+// RETURNING OLD, so the head upsert carries the latest transition through the head's
+// transport-only last_* columns and RETURNING; ev reads them from that.
+//   - Unknown state: the prev CTE yields no row, so NOTHING is written (not even mr_state).
+//   - Owner filter: history is recorded only when the run's user owns the repo's forge
+//     connection; mr_state is still written for any owner.
+//   - Watermark: a head advances only when the observation is strictly newer than
+//     head.observed_at (WHERE on the DO UPDATE). An older or tied observation updates
+//     runs.mr_state only, and writes no head change and no event.
+//   - Bootstrap: the first head insert for a run that already carried a pre-tracking
+//     mr_state records that state as from_state (provenance), with bootstrap = true.
+//   - First merge: first_merged_* is set once, on the first change to merged; the unique
+//     partial index pr_history_events_first_merge_uq backs it.
+//   - provider_at is dropped (NULL) when it is after observed_at or older than the newest
+//     provider time already on the head (never moves backwards): the event is then an
+//     observation_fallback. Every SET right-hand side reads only h or EXCLUDED, never a
+//     stored transport column of h.
+//
+// Returns the number of runs updated (0 or 1).
 func (q *Queries) SetRunMRState(ctx context.Context, arg SetRunMRStateParams) (int64, error) {
-	result, err := q.db.Exec(ctx, setRunMRState, arg.MrState, arg.ID)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
+	row := q.db.QueryRow(ctx, setRunMRState,
+		arg.ID,
+		arg.MrState,
+		arg.ObservedAt,
+		arg.ProviderAt,
+	)
+	var updated int64
+	err := row.Scan(&updated)
+	return updated, err
 }
 
 const setRunMrReworkEnabled = `-- name: SetRunMrReworkEnabled :execrows

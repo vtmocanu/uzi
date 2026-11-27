@@ -611,7 +611,9 @@ CROSS JOIN LATERAL (
            -- ClaimRun's job-runner clause.
            AND (r.kind <> 'job'
                 OR (NOT COALESCE(w.docker_enabled, false) AND 'job_runner_v1' = ANY(w.protocol_capabilities)
-                    AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))))
+                    AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))
+                    -- PRD #4322 M1b: ClaimRun's claude_provider_job_v1 arm for a provider-bound job.
+                    AND (r.model_provider_key_mode IS NULL OR 'claude_provider_job_v1' = ANY(w.protocol_capabilities))))
            -- Issue #4476: ClaimRun's Codex claim-provenance clause.
            AND fn_codex_claim_provenance_admits(r, w.id)
            -- ClaimRun's affinity pin: the run's own worker, a released pin, or the ceiling.
@@ -742,10 +744,12 @@ WHERE r.status <> 'queued' OR w.hibernation_state IN ('hibernated', 'preparing')
    OR (r.model_provider_key_mode IS NOT NULL AND NOT CASE r.harness
        WHEN 'claude' THEN 'claude_provider_v1' = ANY(w.protocol_capabilities)
                         AND (r.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities))
+                        AND (r.kind <> 'job' OR 'claude_provider_job_v1' = ANY(w.protocol_capabilities))
        WHEN 'codex' THEN 'codex_provider_v1' = ANY(w.protocol_capabilities)
                         AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
                         AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)
                         AND 'codex_runtime_v3' = ANY(w.protocol_capabilities)
+                        AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities))
        ELSE false
    END)
 ORDER BY hw.worker_id, hw.run_id

@@ -673,9 +673,11 @@ func toLabelEvent(e *gitlab.LabelEvent) LabelEvent {
 // State field is one of the MRState* constants (opened|closed|merged|locked).
 func toMergeRequest(mr *gitlab.MergeRequest) MergeRequest {
 	return MergeRequest{
-		IID:    mr.IID,
-		State:  mr.State,
-		WebURL: mr.WebURL,
+		IID:      mr.IID,
+		State:    mr.State,
+		WebURL:   mr.WebURL,
+		MergedAt: copyTime(mr.MergedAt),
+		ClosedAt: copyTime(mr.ClosedAt),
 	}
 }
 

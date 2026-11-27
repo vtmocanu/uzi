@@ -365,3 +365,26 @@ func TestForgeConnForRunCarriesTheRunsIssueBinding(t *testing.T) {
 		t.Fatalf("conn = %+v", conn)
 	}
 }
+
+// PRD #4173 M6: a confirmed proposal on a linked repo reports the issue tracker key; on an
+// unlinked repo it reports none.
+func TestConfirmProposalReportsTheLinkedIssueKey(t *testing.T) {
+	svc, fs, _ := confirmFixture(t)
+	fs.repoRow.IssueTrackerConnectionID = pgtype.UUID{Bytes: uuid.New(), Valid: true}
+	fs.repoRow.IssueTrackerProjectShort = pgtype.Text{String: "UZI", Valid: true}
+	svc.SetIssueSources(&fakeSources{tr: &createRecorder{created: forge.Issue{IID: 9}}})
+
+	created, err := svc.ConfirmProposalForUser(context.Background(), uuid.New(), uuid.New(), uuid.New())
+	if err != nil || created.IssueKey != "UZI-9" {
+		t.Fatalf("created = %+v, err = %v, want issue key UZI-9", created, err)
+	}
+}
+
+func TestConfirmProposalOnAnUnlinkedRepoHasNoIssueKey(t *testing.T) {
+	svc, _, _ := confirmFixture(t)
+
+	created, err := svc.ConfirmProposalForUser(context.Background(), uuid.New(), uuid.New(), uuid.New())
+	if err != nil || created.IssueKey != "" {
+		t.Fatalf("created = %+v, err = %v, want no issue key", created, err)
+	}
+}

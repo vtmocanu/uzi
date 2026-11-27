@@ -175,7 +175,7 @@ These extend the core table above; `UZI_SECRET_KEY` (which also encrypts forge b
 
 | Var | Default | Notes |
 |---|---|---|
-| `FORGE_ALLOWED_BASE_URLS` | `https://github.com` | Comma-separated SSRF allowlist: the only forge base URLs a connection may target. Every entry must be a bare `https://host[:port]` (an optional trailing `/` is fine); boot fails if the list is empty or any entry is malformed, non-`https`, or carries userinfo, a path, a query or a fragment (these were previously reduced silently to the host). `ISSUE_TRACKER_ALLOWED_BASE_URLS` applies the same entry rule, but an empty list is allowed (no issue tracker connection can be created). The Helm values `forge.allowedBaseURLs` and `issueTracker.allowedBaseURLs` fail the render for entries with userinfo, a path, a query or a fragment, and for other shapes the chart does not accept (the chart is stricter: ASCII host only, IDNs in `xn--` form; forge entries used with FQDN worker egress must be DNS hostnames, not IP literals). A bracketed IPv6 literal such as `https://[2001:db8::1]` is only shape-checked by the chart, so an invalid one (for example `https://[:::]`) renders and is refused by the api at boot instead; values set via `api.config.*` also fail at api boot. The Forge tab (under Settings) offers exactly this set in its base-URL dropdown. |
+| `FORGE_ALLOWED_BASE_URLS` | `https://github.com` | Comma-separated SSRF allowlist: the only forge base URLs a connection may target. Every entry must be a bare `https://host[:port]` (an optional trailing `/` is fine); boot fails if the list is empty or any entry is malformed, non-`https`, or carries userinfo, a path, a query or a fragment (these were previously reduced silently to the host). `ISSUE_TRACKER_ALLOWED_BASE_URLS` (Helm `issueTracker.allowedBaseURLs`) applies the same entry rule, but an empty list is allowed, and is the default: no issue tracker connection can be created. It is https host only, so a YouTrack under a context path is not supported, and it is not fed to the worker egress list because the worker never calls an issue tracker. See [Issue trackers](./issue-trackers.md). The Helm values `forge.allowedBaseURLs` and `issueTracker.allowedBaseURLs` fail the render for entries with userinfo, a path, a query or a fragment, and for other shapes the chart does not accept (the chart is stricter: ASCII host only, IDNs in `xn--` form; forge entries used with FQDN worker egress must be DNS hostnames, not IP literals). A bracketed IPv6 literal such as `https://[2001:db8::1]` is only shape-checked by the chart, so an invalid one (for example `https://[:::]`) renders and is refused by the api at boot instead; values set via `api.config.*` also fail at api boot. The Forge tab (under Settings) offers exactly this set in its base-URL dropdown. |
 | `FORGE_POLL_INTERVAL` | `60s` (`1m`) | Per-enabled-repo incremental sync cadence (Go duration). An invalid or non-positive value falls back to the default. See "Freshness contract" below. |
 | `FORGE_RECONCILE_EVERY` | `10` | Every Nth incremental poll is a full reconcile instead (fetches the complete `uzi`-labeled issue set with no `updated_after` bound, diffs, and evicts cache rows the forge no longer returns). A non-positive or unparseable value falls back to the default, same as the other numeric/duration vars here (the poller itself additionally clamps any value `< 1` to `1` — every poll becomes a full reconcile — as defense in depth, but that path isn't reachable through this env var). The very first poll after a repo is enabled is always a full reconcile regardless of this setting, since it has to seed the cache. |
 | `FORGE_HTTP_TIMEOUT` | `15s` | Hard per-call timeout on every outbound HTTP request to the forge (connect, projects, labels, issues, label updates). Closes the untimeouted-`http.DefaultClient` wart entirely. |
@@ -258,6 +258,22 @@ so does every Test, right before it connects) and the claims of runs already bou
 run is paused as `provider_destination_not_allowed` and never starts on an Anthropic token. A
 run's frozen URL is not re-read from the list while its claim is held; cancel is the immediate stop.
 
+That pause applies to bound runs only. A provider-bound **job** or **judge** never pauses: if the key,
+its revision or the allowlist entry is gone when it is claimed, it fails terminally with
+`fail_origin` `credential_unavailable` and a fixed reason, and never falls back to a vendor credential.
+
+**Rolling out provider jobs.** A provider-bound job is claimed only by a non-Docker worker advertising
+both `claude_provider_job_v1` and `claude_provider_v1`, which means a worker image from a release that
+includes provider jobs. Upgrade worker images before owners rely on provider jobs. Until a capable
+worker is online the job stays `queued` and its health reads "no worker that supports provider jobs
+(claude_provider_job_v1) is online"; this covers a fleet of only older workers and a fleet of only
+isolated (Docker) ephemeral workers. A job already bound to an ephemeral worker that registered
+without the capabilities is failed by the sweeper as `no_job_capable_worker` with the reason "the
+worker provisioned for this job lacks the job_runner_v1 capability (or, for a job created with files
+support, job_files_v1, for a site-list job, isolated_job_v1, or for a provider job, claude_provider_v1
+and claude_provider_job_v1); update the worker image". Persistent older workers never claim a provider
+job and are not swept, so update them yourself.
+
 **Activated, with an accepted redirect risk.** Workers advertise the capability `claude_provider_v1`
 by default (no switch), so a run bound to a provider starts on a current worker. The pinned Claude
 CLI follows gateway redirects, so the allowlist is the only control on where provider traffic
@@ -286,6 +302,11 @@ wake and the old-image reap of an ephemeral worker. Consequences to plan for:
   transaction's locks until it notices the dead client; no server-side `idle_in_transaction_session_timeout` or
   PostgreSQL keepalive is configured for this transaction, so the owner's credential writes (token, provider and key changes) can stall in
   the meantime. Codex pool credential creates already have the same exposure.
+- **Codex provider judges (#4574).** A Codex judge for an owner whose Codex source is a provider needs the
+  worker capability `codex_provider_judge_v1` on top of the Codex provider capabilities, advertised by
+  workers that run the Codex harness. Without one the judge stays queued and health reads "no worker that
+  supports Codex provider judges (codex_provider_judge_v1) is online"; the same gates (claim, placement, wake, reap) and rollout notes apply, and
+  [A Codex judge on a model provider](./judge.md#a-codex-judge-on-a-model-provider) covers the rolling-deploy caveat.
 - **Weekly reserve exempt.** Provider-bound runs, provider judges included, are exempt from the vendor
   [weekly usage reserve](./rate-limits.md#weekly-usage-reserve): it protects vendor allowances only, and
   these runs spend their own gateway key. A run explicitly bound to a vendor credential stays subject to it.

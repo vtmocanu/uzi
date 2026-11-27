@@ -32,7 +32,14 @@ func (g *github) GetMergeRequest(ctx context.Context, projectID, mrIID int64) (M
 // toGitHubMergeRequest maps a go-github PullRequest onto the neutral MergeRequest.
 // GitHub's PR number is GitLab's iid — see githubMRState for the state fold.
 func toGitHubMergeRequest(pr *gh.PullRequest) MergeRequest {
-	return MergeRequest{IID: int64(pr.GetNumber()), State: githubMRState(pr), WebURL: pr.GetHTMLURL()}
+	mr := MergeRequest{IID: int64(pr.GetNumber()), State: githubMRState(pr), WebURL: pr.GetHTMLURL()}
+	if pr.MergedAt != nil {
+		mr.MergedAt = copyTime(&pr.MergedAt.Time)
+	}
+	if pr.ClosedAt != nil {
+		mr.ClosedAt = copyTime(&pr.ClosedAt.Time)
+	}
+	return mr
 }
 
 // githubMRState folds GitHub's PR lifecycle onto the neutral MRState* vocabulary.

@@ -293,7 +293,7 @@ func (h *Handler) AdminFileJudgeIssue(w http.ResponseWriter, r *http.Request) {
 	warning := h.settleFiledIssue(ctx, claimID, occ.Category, occ.Target, repo, created, description)
 
 	httpx.JSON(w, http.StatusCreated, fileIssueResponse{
-		Issue:   createdIssueDTO{IID: created.IID, WebURL: created.WebURL, Title: created.Title},
+		Issue:   createdIssueDTO{IID: created.IID, IssueKey: linkedIssueKey(repo, created.IID), WebURL: created.WebURL, Title: created.Title},
 		Warning: warning,
 	})
 }

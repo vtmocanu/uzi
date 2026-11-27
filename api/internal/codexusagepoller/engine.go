@@ -132,6 +132,7 @@ type Engine struct {
 	reconciler Reconciler
 	notifier   EarlyResetNotifier
 	warner     WeeklyWarner
+	history    HistoryRecorder
 	interval   time.Duration
 	maxConc    int
 	now        func() time.Time
@@ -156,6 +157,10 @@ func (e *Engine) SetNotifier(n EarlyResetNotifier) { e.notifier = n }
 
 // SetWeeklyWarner sets the optional weekly-limit warning collaborator before the engine runs.
 func (e *Engine) SetWeeklyWarner(w WeeklyWarner) { e.warner = w }
+
+// SetHistory sets the optional usage-history recorder before the engine runs (issue #4692).
+// A nil recorder (the default) records nothing.
+func (e *Engine) SetHistory(h HistoryRecorder) { e.history = h }
 
 // New builds an Engine. interval is the poll cadence; the caller starts the engine only when
 // interval > 0 (0 disables it). logger may be nil.
@@ -390,8 +395,11 @@ func (e *Engine) pollAccount(ctx context.Context, t pollTarget, ignoreBackoff bo
 		e.recordFailure(ctx, t, err)
 		return
 	}
-	e.writeReading(ctx, t, reading)
+	written, params, lastSuccess := e.writeReading(ctx, t, reading)
 	e.clearPollBackoff(t.accountID)
+	if written && lastSuccess.Valid {
+		e.copyHistory(ctx, params, lastSuccess)
+	}
 }
 
 // targetPollable reports whether the listing row names a poll target: a linked account that is
@@ -412,14 +420,17 @@ func targetPollable(t pollTarget) bool {
 
 // writeReading marshals the reading's buckets to JSONB and installs it under the observed
 // (generation, credential_revision) fence. 0 rows means authority moved between the poll and
-// the write — a discard, not an error.
-func (e *Engine) writeReading(ctx context.Context, t pollTarget, reading workersvc.CodexUsageReading) {
+// the write — a discard, not an error. It reports whether the reading was written, the exact
+// parameters it passed to the upsert (including the same marshalled buckets bytes) and the
+// last_success_at the write returned, so the caller can copy the accepted reading into the
+// usage history (issue #4692).
+func (e *Engine) writeReading(ctx context.Context, t pollTarget, reading workersvc.CodexUsageReading) (bool, store.UpsertCodexAccountRateLimitsParams, pgtype.Timestamptz) {
 	raw, err := json.Marshal(reading.Buckets)
 	if err != nil {
 		// Buckets are our own sanitized DTOs, so this is effectively unreachable; log and skip
 		// rather than write a broken snapshot.
 		e.logger.Error("codex usage poller: marshal buckets", "account", t.accountID.String(), "error", err)
-		return
+		return false, store.UpsertCodexAccountRateLimitsParams{}, pgtype.Timestamptz{}
 	}
 	prior, readErr := e.store.GetCodexEarlyResetBaseline(ctx, store.GetCodexEarlyResetBaselineParams{
 		UserID: t.userID, ProviderAccountID: t.accountID, EnablementSig: t.enablementSig,
@@ -430,7 +441,7 @@ func (e *Engine) writeReading(ctx context.Context, t pollTarget, reading workers
 	if readErr == nil && baselineMatches(prior, t) {
 		expected, detected = codexEarlyReset(prior, reading.Buckets, observed)
 	}
-	lastSuccess, err := e.store.UpsertCodexAccountRateLimits(ctx, store.UpsertCodexAccountRateLimitsParams{
+	params := store.UpsertCodexAccountRateLimitsParams{
 		UserID:                     t.userID,
 		ProviderAccountID:          t.accountID,
 		Buckets:                    raw,
@@ -438,7 +449,8 @@ func (e *Engine) writeReading(ctx context.Context, t pollTarget, reading workers
 		ObservedCredentialRevision: reading.ObservedCredentialRevision,
 		AttemptStatus:              attemptStatusOK,
 		EnablementSig:              t.enablementSig,
-	})
+	}
+	lastSuccess, err := e.store.UpsertCodexAccountRateLimits(ctx, params)
 	// The fence refusing the write returns no row: "not written", not an error.
 	written := err == nil
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -446,13 +458,14 @@ func (e *Engine) writeReading(ctx context.Context, t pollTarget, reading workers
 	}
 	if err != nil {
 		e.logger.Error("codex usage poller: upsert reading", "account", t.accountID.String(), "error", err)
-		return
+		return false, params, pgtype.Timestamptz{}
 	}
 	if !written {
 		// Fence rejected the write (generation/credential_revision moved, the last linked
 		// alias vanished, no linked alias is enabled any more, or an alias's enablement moved
 		// since the listing) — the reading is discarded, the prior good row untouched.
 		e.logger.Info("codex usage poller: reading discarded (authority moved)", "account", t.accountID.String())
+		return false, params, lastSuccess
 	}
 	if written && e.warner != nil && lastSuccess.Valid {
 		// lastSuccess is the exact persisted last_success_at (microsecond precision): the warning's
@@ -475,6 +488,7 @@ func (e *Engine) writeReading(ctx context.Context, t pollTarget, reading workers
 			e.logger.Info("codex usage poller: early-reset notification declined", "account", t.accountID.String(), "error", notifyErr)
 		}
 	}
+	return true, params, lastSuccess
 }
 
 // recordFailure classifies a typed failure, records the health-only failure (fenced on the

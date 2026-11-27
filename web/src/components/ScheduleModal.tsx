@@ -1182,7 +1182,12 @@ export function ScheduleModal({
                       mode checks the single repoint target; create mode checks EACH selected
                       repo (PRD #636 Decision 8), since the fan-out lands one schedule per repo. */}
                   {isEdit ? (
-                    <SweepLabelWarn repoId={repoId} repoPath={repoPath} labels={labels} />
+                    <SweepLabelWarn
+                      repoId={repoId}
+                      repoPath={repoPath}
+                      labels={labels}
+                      linked={!!repos.find((r) => r.id === repoId)?.issue_tracker_link}
+                    />
                   ) : (
                     selectedRepoIds.map((rid) => (
                       <SweepLabelWarn
@@ -1190,6 +1195,7 @@ export function ScheduleModal({
                         repoId={rid}
                         repoPath={maskRepoPath(repos.find((r) => r.id === rid)?.path_with_namespace, demo)}
                         labels={labels}
+                        linked={!!repos.find((r) => r.id === rid)?.issue_tracker_link}
                       />
                     ))
                   )}

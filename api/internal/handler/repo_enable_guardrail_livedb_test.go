@@ -72,6 +72,9 @@ type fakeGuardForge struct {
 	// issuesHook, when set, serves GET .../issues instead of the default single
 	// issue; it reports whether it handled the request.
 	issuesHook func(w http.ResponseWriter, r *http.Request) bool
+	// emptyProjects makes GET /projects answer an empty list, so a discovery
+	// (ListProjects) succeeds and upserts nothing.
+	emptyProjects bool
 }
 
 func newFakeGuardForge(t *testing.T) *fakeGuardForge {
@@ -82,8 +85,13 @@ func newFakeGuardForge(t *testing.T) *fakeGuardForge {
 		fg.mu.Lock()
 		labelsRefused := fg.labelsRefused
 		issuesHook := fg.issuesHook
+		emptyProjects := fg.emptyProjects
 		fg.mu.Unlock()
 		switch {
+		case emptyProjects && r.Method == http.MethodGet && strings.HasSuffix(path, "/api/v4/projects"):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte("[]"))
+			return
 		case labelsRefused && strings.HasSuffix(path, "/labels"):
 			w.WriteHeader(http.StatusForbidden)
 			_, _ = w.Write([]byte(`{"message":"403 Forbidden"}`))

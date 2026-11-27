@@ -435,7 +435,10 @@ var wantRouteMounts = []routeMount{
 	// snapshot deadline (no forge call, no token spend) → noLimiter, like /usage beside them.
 	{"GET", "/api/admin/analytics/options", noLimiter},
 	{"GET", "/api/admin/analytics/spend", noLimiter},
+	{"GET", "/api/admin/analytics/capacity", noLimiter},
 	{"GET", "/api/admin/analytics/reliability", noLimiter},
+	{"GET", "/api/admin/analytics/quality", noLimiter},
+	{"GET", "/api/admin/analytics/flow", noLimiter},
 	{"GET", "/api/admin/users", noLimiter},
 	{"GET", "/api/admin/vault-migration", noLimiter},
 	{"GET", "/api/admin/workers", noLimiter},
@@ -490,6 +493,7 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/forge/connections/{id}/projects", limForge},
 	// PRD #4173 M4: the issue tracker connection list reads only the store; projects and tags
 	// call the issue tracker, so they ride the per-user forge budget.
+	{"GET", "/api/issue-trackers/config", noLimiter},
 	{"GET", "/api/issue-trackers/connections/", noLimiter},
 	{"GET", "/api/issue-trackers/connections/{id}/projects", limForge},
 	{"GET", "/api/issue-trackers/connections/{id}/tags", limForge},
@@ -614,7 +618,10 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/usage", noLimiter},
 	{"GET", "/api/analytics/options", noLimiter},
 	{"GET", "/api/analytics/spend", noLimiter},
+	{"GET", "/api/analytics/capacity", noLimiter},
 	{"GET", "/api/analytics/reliability", noLimiter},
+	{"GET", "/api/analytics/quality", noLimiter},
+	{"GET", "/api/analytics/flow", noLimiter},
 	// PRD #1907 M3 (D15): the stable external API's whoami. The per-user limiter (v1Limiter
 	// since PRD #1908 D-B) is mounted on the whole /api/v1 subtree after RequireV1Caller
 	// (routes_v1.go), so it keys on the caller's user, not the token: minting more tokens

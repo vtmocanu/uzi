@@ -93,7 +93,9 @@ func v1LiveDBMax(t *testing.T, maxConns int32) (*Handler, *pgxpool.Pool) {
 		ControllerTokenSHA256: controllerHash,
 		WorkerHeartbeatStale:  time.Minute,
 	}
-	wsvc := workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit(), RunTimeout: 6 * time.Hour, RunWallCeiling: 24 * time.Hour})
+	// ProviderAllowedBaseURLs names the one gateway the usable-provider job tests seed (PRD #4322 M1b);
+	// it only matters to an owner who selected a provider.
+	wsvc := workersvc.New(q, box, workersvc.Params{CustodyHoldLimit: defaultCustodyLimit(), RunTimeout: 6 * time.Hour, RunWallCeiling: 24 * time.Hour, ProviderAllowedBaseURLs: []string{v1ProviderBase}})
 	// As cmd/server wires it: a job create needs the transaction beginner (its cap check and
 	// inserts are one atomic unit), so the /api/v1/jobs tests run through the same service.
 	wsvc.SetTxBeginner(pool)

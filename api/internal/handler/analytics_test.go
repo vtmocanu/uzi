@@ -61,16 +61,24 @@ type analyticsRoute struct {
 
 func (h *Handler) analyticsServe(rt analyticsRoute, rec http.ResponseWriter, req *http.Request) {
 	switch {
+	case !rt.admin && rt.section == analytics.SectionCapacity:
+		h.AnalyticsCapacity(rec, req)
+	case rt.admin && rt.section == analytics.SectionCapacity:
+		h.AdminAnalyticsCapacity(rec, req)
 	case !rt.admin && rt.section == analytics.SectionOptions:
 		h.AnalyticsOptions(rec, req)
 	case !rt.admin && rt.section == analytics.SectionReliability:
 		h.AnalyticsReliability(rec, req)
+	case !rt.admin && rt.section == analytics.SectionFlow:
+		h.AnalyticsFlow(rec, req)
 	case !rt.admin:
 		h.AnalyticsSpend(rec, req)
 	case rt.section == analytics.SectionOptions:
 		h.AdminAnalyticsOptions(rec, req)
 	case rt.section == analytics.SectionReliability:
 		h.AdminAnalyticsReliability(rec, req)
+	case rt.section == analytics.SectionFlow:
+		h.AdminAnalyticsFlow(rec, req)
 	default:
 		h.AdminAnalyticsSpend(rec, req)
 	}
@@ -85,11 +93,22 @@ var analyticsRoutes = []analyticsRoute{
 	{"admin spend", "/api/admin/analytics/spend", true, analytics.SectionSpend},
 	{"owner reliability", "/api/analytics/reliability", false, analytics.SectionReliability},
 	{"admin reliability", "/api/admin/analytics/reliability", true, analytics.SectionReliability},
+	// Issue #4731. Appended, so the indexes above keep their meaning.
+	{"owner capacity", "/api/analytics/capacity", false, analytics.SectionCapacity},
+	{"admin capacity", "/api/admin/analytics/capacity", true, analytics.SectionCapacity},
+	// Issue #4729: appended so the positional indexes above stay valid. The route-wide tests
+	// that range over this table (busy, timeout, sanitized 500, unset deps) cover flow too.
+	{"owner flow", "/api/analytics/flow", false, analytics.SectionFlow},
+	{"admin flow", "/api/admin/analytics/flow", true, analytics.SectionFlow},
 }
 
 const (
 	analyticsOwnerReliabilityRoute = 4
 	analyticsAdminReliabilityRoute = 5
+	analyticsOwnerCapacityRoute    = 6
+	analyticsAdminCapacityRoute    = 7
+	analyticsOwnerFlowRoute        = 8
+	analyticsAdminFlowRoute        = 9
 )
 
 func TestAnalyticsSyntaxRejectionsBeginNoTransaction(t *testing.T) {
@@ -137,6 +156,18 @@ func TestAnalyticsSyntaxRejectionsBeginNoTransaction(t *testing.T) {
 		{"admin empty user", analyticsRoutes[3], "user=", "invalid user"},
 		{"semicolon pair", analyticsRoutes[1], "window=7d;x=1", "invalid query"},
 		{"bad percent-encoding", analyticsRoutes[1], "window=%zz", "invalid query"},
+		{"capacity owner user", analyticsRoutes[analyticsOwnerCapacityRoute], "user=" + someUUID, "user not allowed"},
+		{"capacity owner split", analyticsRoutes[analyticsOwnerCapacityRoute], "split=repo", "invalid split"},
+		{"capacity admin split", analyticsRoutes[analyticsAdminCapacityRoute], "split=repo", "invalid split"},
+		{"capacity owner breakdown", analyticsRoutes[analyticsOwnerCapacityRoute], "breakdown=repo", "invalid breakdown"},
+		{"capacity owner foo", analyticsRoutes[analyticsOwnerCapacityRoute], "foo=1", "unknown parameter"},
+		{"capacity admin foo", analyticsRoutes[analyticsAdminCapacityRoute], "foo=1", "unknown parameter"},
+		{"capacity admin window=all omitted user", analyticsRoutes[analyticsAdminCapacityRoute], "window=all", msgAnalyticsWindowAllAllUsers},
+		{"capacity admin window=all user=all", analyticsRoutes[analyticsAdminCapacityRoute], "window=all&user=all", msgAnalyticsWindowAllAllUsers},
+		{"capacity bad harness", analyticsRoutes[analyticsOwnerCapacityRoute], "harness=gemini", "invalid harness"},
+		{"capacity bad kind", analyticsRoutes[analyticsAdminCapacityRoute], "kind=reliability", "invalid kind"},
+		{"capacity bad repo", analyticsRoutes[analyticsOwnerCapacityRoute], "repo=nope", "invalid repo"},
+		{"capacity bad tz", analyticsRoutes[analyticsOwnerCapacityRoute], "tz=Local", "invalid tz"},
 		{"admin options bad user", analyticsRoutes[2], "user=nobody", "invalid user"},
 		// Issue #4685: Reliability has a breakdown but no split.
 		{"owner reliability split", analyticsRoutes[analyticsOwnerReliabilityRoute], "split=harness", "invalid split"},
@@ -204,7 +235,13 @@ func TestAnalyticsFirstBadParameterIsDeterministic(t *testing.T) {
 
 // The all-users window=all refusal is the same response whether user is omitted or user=all.
 func TestAnalyticsAdminAllUsersWindowAllRefusalIsIdentical(t *testing.T) {
-	rt := analyticsRoutes[3]
+	for _, rt := range []analyticsRoute{analyticsRoutes[3], analyticsRoutes[5]} {
+		t.Run(rt.name, func(t *testing.T) { checkWindowAllRefusalIsIdentical(t, rt) })
+	}
+}
+
+func checkWindowAllRefusalIsIdentical(t *testing.T, rt analyticsRoute) {
+	t.Helper()
 	var bodies []string
 	for _, q := range []string{"window=all", "window=all&user=all"} {
 		b := &countingBeginner{err: errors.New("must not begin")}
@@ -266,6 +303,10 @@ func TestAnalyticsAcceptedQueriesReachTheSnapshot(t *testing.T) {
 		{analyticsRoutes[analyticsAdminReliabilityRoute], "breakdown=user"},
 		{analyticsRoutes[analyticsAdminReliabilityRoute], "user=" + someUUID + "&window=all&breakdown=harness"},
 		{analyticsRoutes[analyticsAdminReliabilityRoute], "window=7d&user=all&kind=chat"},
+		{analyticsRoutes[analyticsOwnerCapacityRoute], ""},
+		{analyticsRoutes[analyticsOwnerCapacityRoute], "window=all&tz=America/New_York&harness=codex&kind=chat&repo=" + someUUID},
+		{analyticsRoutes[analyticsAdminCapacityRoute], "window=7d&user=all"},
+		{analyticsRoutes[analyticsAdminCapacityRoute], "window=all&user=" + someUUID},
 	}
 	for _, tc := range cases {
 		b := &countingBeginner{err: errors.New("stop here")}

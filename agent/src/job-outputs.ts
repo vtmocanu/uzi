@@ -21,10 +21,13 @@
 // Linux descriptor-relative no-follow walk of every directory component: the
 // handle is fstat-ed (a regular file, one link, within the ceiling, all before any byte is read),
 // hashed by a bounded loop that checks the deadline and the abort signal, and then uploaded from the
-// SAME handle, so the path cannot be swapped between the hash pass and the upload.
+// SAME handle, so the path cannot be swapped between the hash pass and the upload. A claim that
+// carries provider key forms (PRD #4322 M1b) instead copies each file into a worker-only capture
+// while hashing and scanning it for those forms, and every upload attempt streams the capture.
 
-import { createHash } from "node:crypto";
-import { lstatSync, realpathSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import { constants as fsc, lstatSync, realpathSync } from "node:fs";
+import fsp from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
 import type { Readable } from "node:stream";
@@ -34,6 +37,8 @@ import { screenToolPath } from "./guardrails.js";
 import { openJobOutputFile } from "./job-workspace.js";
 import type { Logger } from "./log.js";
 import type { JobFileUploadMeta, JobRefusedOutput } from "./protocol.js";
+import type { TextRedactor } from "./redact.js";
+import { literalMatcher } from "./secret-scan-guard.js";
 import { errMessage, sleep } from "./util.js";
 
 /** The directories an output file may come from, relative to the workspace `work` dir. */
@@ -77,6 +82,19 @@ export function logSafe(s: string, max = 300): string {
       // keeps the fixed four-digit \uXXXX form.
       return cp > 0xffff ? `\\u{${cp.toString(16)}}` : `\\u${cp.toString(16).padStart(4, "0")}`;
     });
+}
+
+/** A bounded log diagnostic for an upload or read failure that never carries free-form error text:
+ *  that text (a response body, a message) can echo a credential, and clipping it before a redactor
+ *  runs can leave a prefix of a key straddling the cut. Names the request and status, or the
+ *  error class and system code. */
+function failureDiagnostic(err: unknown): string {
+  if (err instanceof RequestError) return logSafe(`${err.method} ${err.path} returned ${err.status}`, 200);
+  if (err instanceof Error) {
+    const code = (err as NodeJS.ErrnoException).code;
+    return logSafe(`${err.name}${typeof code === "string" ? ` ${code}` : ""}`, 100);
+  }
+  return "failed";
 }
 
 const byteLen = (s: string): number => Buffer.byteLength(s, "utf8");
@@ -123,6 +141,48 @@ export function validateOutputFilePaths(raw: unknown): { ok: true; value: string
     out.push(p);
   }
   return { ok: true, value: out };
+}
+
+/** The result of {@link partitionOutputFiles}. */
+type OutputPartition =
+  | { ok: true; clean: string[]; keyed: string[] }
+  | { ok: false; error: string };
+
+/** The provider-key partition of a raw `output_files` value (PRD #4322 M1b), run BEFORE
+ *  validateOutputFilePaths on a claim that carries provider key forms. Every message here is a
+ *  constant or carries only an index: nothing the model sent is echoed.
+ *
+ *  1. undefined or null is an empty list; 2. a non-array is refused; 3. the RAW length is capped at
+ *  OUTPUT_FILES_MAX (so keyed entries cannot be used to smuggle more than the cap past the check);
+ *  4. every entry is type-checked before any string helper runs on it; 5. an entry whose raw path,
+ *  display name or lowercased display name `redactText` changes carries key material: it is withheld
+ *  (`keyed`, never echoed, never opened) and reported under its scrubbed display name; the rest is
+ *  `clean` and goes through validateOutputFilePaths. */
+export function partitionOutputFiles(raw: unknown, redactText: TextRedactor): OutputPartition {
+  if (raw === undefined || raw === null) return { ok: true, clean: [], keyed: [] };
+  if (!Array.isArray(raw)) return { ok: false, error: "output_files must be an array of workspace-relative paths" };
+  if (raw.length > OUTPUT_FILES_MAX) return { ok: false, error: `output_files lists at most ${OUTPUT_FILES_MAX} files` };
+  for (const [i, p] of raw.entries()) {
+    if (typeof p !== "string" || p === "") return { ok: false, error: `output_files[${i}] must be a non-empty string` };
+  }
+  const clean: string[] = [];
+  const keyed: string[] = [];
+  for (const p of raw as string[]) {
+    if (outputNameCarriesKey(p, redactText)) keyed.push(p);
+    else clean.push(p);
+  }
+  return { ok: true, clean, keyed };
+}
+
+/** True when the raw path, its UNCAPPED basename, or the capped display name (each also lowercased)
+ *  is changed by `redactText`. The uncapped basename is checked before the display cut: a case
+ *  variant of a key near the end of a long name can be cut in two by the display cap, which no
+ *  check of the capped name alone would see; the capped name is still checked because the cut can
+ *  also join text that was separate in the original. */
+export function outputNameCarriesKey(rel: string, redactText: TextRedactor): boolean {
+  const base = rel.slice(rel.lastIndexOf("/") + 1).replace(/[\p{C}\p{Zl}\p{Zp}]/gu, "").trim();
+  const display = outputDisplayName(rel);
+  return [rel, base, display].some((t) => redactText(t) !== t || redactText(t.toLowerCase()) !== t.toLowerCase());
 }
 
 /** A workspace file resolved for upload. */
@@ -228,6 +288,7 @@ async function openAndHash(
   ceilings: { files: number; totalBytes: number },
   deadlineAt: number,
   signal: AbortSignal | undefined,
+  stage?: CaptureStage,
 ): Promise<OpenedOutput> {
   let fh: FileHandle;
   try {
@@ -250,6 +311,7 @@ async function openAndHash(
     if (ceilings.totalBytes + size > JOB_OUTPUT_CEILINGS.totalBytes) {
       throw new OutputRefusal("worker_too_large", `the worker uploads at most ${JOB_OUTPUT_CEILINGS.totalBytes} bytes per job`);
     }
+    if (stage) return await captureAndHash(fh, st, stage, deadlineAt, signal);
     const hash = createHash("sha256");
     const buf = Buffer.allocUnsafe(HASH_STEP_BYTES);
     let pos = 0;
@@ -268,6 +330,90 @@ async function openAndHash(
   } catch (err) {
     await fh.close().catch(() => undefined);
     throw err;
+  }
+}
+
+/** Where the staged captures of one upload phase live (PRD #4322 M1b "Exact-key redaction and
+ *  output publication"): a claim carrying provider key forms hashes, scans and copies each output
+ *  into a worker-only scratch file under the job workspace root (outside `work`, so the agent and
+ *  its path guard never reach it), and every upload attempt streams that capture, never the source
+ *  handle. `dir` is created lazily, once. */
+interface CaptureStage {
+  /** The job workspace root (`JobWorkspace.root`): the capture directory is created under it. */
+  root: string;
+  /** Every encoded form of the bound provider key (providerKeyForms). */
+  forms: readonly string[];
+  dir?: string;
+}
+
+const CAPTURE_DIR_MODE = 0o700;
+const CAPTURE_FILE_MODE = 0o600;
+
+/** Copy the source handle into a fresh capture while hashing and scanning it, one bounded chunk at a
+ *  time. The capture is created O_EXCL, mode 0600, and unlinked BEFORE its first write, so no named
+ *  capture file holds bytes at any moment (a hard kill leaves nothing but the empty directory, which
+ *  the workspace reaper removes). Any hit, scanner failure, short or failed write, size mismatch or
+ *  I/O error is an OutputRefusal("worker_unreadable"), so a staged file is either wholly scanned and
+ *  intact or never uploaded; a deadline or abort is OutputPhaseStop. No message here carries a key
+ *  form or a byte of content. The source handle is closed here on success; the caller closes it on
+ *  failure. Returns the CAPTURE handle with the source's size and digest. */
+async function captureAndHash(
+  src: FileHandle,
+  st: { size: number; mtimeMs: number },
+  stage: CaptureStage,
+  deadlineAt: number,
+  signal: AbortSignal | undefined,
+): Promise<OpenedOutput> {
+  const size = st.size;
+  let cap: FileHandle | undefined;
+  let capPath: string | undefined;
+  let unlinked = false;
+  try {
+    if (!stage.dir) {
+      const dir = path.join(stage.root, `.capture-${randomBytes(8).toString("hex")}`);
+      await fsp.mkdir(dir, { mode: CAPTURE_DIR_MODE });
+      stage.dir = dir;
+    }
+    capPath = path.join(stage.dir, randomBytes(8).toString("hex"));
+    cap = await fsp.open(capPath, fsc.O_CREAT | fsc.O_EXCL | fsc.O_RDWR | fsc.O_NOFOLLOW, CAPTURE_FILE_MODE);
+    await fsp.unlink(capPath);
+    unlinked = true;
+    const matcher = literalMatcher(stage.forms);
+    const hash = createHash("sha256");
+    const buf = Buffer.allocUnsafe(HASH_STEP_BYTES);
+    const stop = (): void => {
+      if (signal?.aborted || Date.now() >= deadlineAt) throw new OutputPhaseStop();
+    };
+    let pos = 0;
+    while (pos < size) {
+      stop();
+      const { bytesRead } = await src.read(buf, 0, Math.min(buf.length, size - pos), pos);
+      if (bytesRead === 0) break;
+      const chunk = buf.subarray(0, bytesRead);
+      if (matcher.push(chunk)) throw new OutputRefusal("worker_unreadable", "its content matched the bound provider key");
+      hash.update(chunk);
+      let off = 0;
+      while (off < bytesRead) {
+        stop();
+        const { bytesWritten } = await cap.write(chunk, off, bytesRead - off, pos + off);
+        if (!(bytesWritten > 0)) throw new OutputRefusal("worker_unreadable", "its capture made no write progress");
+        off += bytesWritten;
+      }
+      pos += bytesRead;
+    }
+    const capStat = await cap.stat();
+    const after = await src.stat();
+    if (pos !== size || capStat.size !== size || after.size !== size || after.mtimeMs !== st.mtimeMs) {
+      throw new OutputRefusal("worker_unreadable", "changed while it was being captured");
+    }
+    await src.close();
+    return { fh: cap, size, sha256: hash.digest("hex") };
+  } catch (err) {
+    await cap?.close().catch(() => undefined);
+    if (capPath !== undefined && !unlinked) await fsp.unlink(capPath).catch(() => undefined);
+    if (err instanceof OutputRefusal || err instanceof OutputPhaseStop) throw err;
+    // Never echo the underlying error: it may carry a path or, for a scanner fault, nothing safe.
+    throw new OutputRefusal("worker_unreadable", "could not be captured for the key scan");
   }
 }
 
@@ -331,6 +477,9 @@ export interface UploadJobOutputsArgs {
   /** Aborts the phase (checked while hashing and passed to every upload). */
   signal?: AbortSignal;
   retryDelaysMs?: readonly number[];
+  /** PRD #4322 M1b: set only for a claim carrying provider key forms. Each file is then scanned
+   *  and uploaded from a staged capture (see CaptureStage); unset keeps the same-handle upload. */
+  capture?: { root: string; forms: readonly string[] };
   /** The retry wait; defaults to util's sleep. Injected by tests to model a timer that fires
    *  before the wall clock reaches the deadline. */
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
@@ -370,68 +519,74 @@ export async function uploadJobOutputs(args: UploadJobOutputsArgs): Promise<Uplo
     candidates.push({ label: rel, displayName: outputDisplayName(rel) });
   }
 
+  const stage: CaptureStage | undefined = args.capture && args.capture.forms.length > 0 ? { ...args.capture } : undefined;
   let files = 0;
   let totalBytes = 0;
-  for (const [index, c] of candidates.entries()) {
-    // The phase is over. Out of time or aborted, this file and every later one are dropped and
-    // reported; on a stale claim or an api that takes no files nothing is (the result post is
-    // refused the same way, or there is nowhere to record it).
-    const stopPhase = (reason: string, report: boolean): void => {
-      summary.stopped = reason;
-      if (report) for (const rest of candidates.slice(index)) drop(rest.displayName, "worker_upload_failed");
-    };
-    if (args.signal?.aborted) {
-      stopPhase("the upload phase was aborted", true);
-      break;
-    }
-    if (Date.now() >= args.deadlineAt) {
-      stopPhase("the upload phase's time is spent", true);
-      break;
-    }
-    // Validate and open THIS candidate now. A resolve-all-first pass leaves later
-    // candidates exposed to ancestor swaps while earlier uploads are in flight.
-    const resolved = resolveOutputFile(args.workDir, c.label, args.secretPaths);
-    if (!resolved.ok) {
-      drop(c.displayName, "worker_unreadable");
-      log.warn("job output file skipped", { error: logSafe(resolved.error) });
-      continue;
-    }
-    let opened: OpenedOutput | undefined;
-    try {
-      opened = await openAndHash(args.workDir, c.label, { files, totalBytes }, args.deadlineAt, args.signal);
-      const meta: JobFileUploadMeta = { claim_generation: args.generation, display_name: c.displayName, size: opened.size, sha256: opened.sha256 };
-      const { fh, size } = opened;
-      // The upload reads the handle the hash pass read: bounded to the hashed size, from offset 0
-      // on every attempt, never closing the handle (closed below).
-      const body = (): Readable => fh.createReadStream({ start: 0, end: size - 1, autoClose: false });
-      const outcome = await uploadWithRetry(args, meta, body, c.label);
-      if (outcome.kind === "stored") {
-        summary.stored++;
-        files++;
-        totalBytes += size;
-      } else if (outcome.kind === "refused") {
-        summary.refused++;
-        if (outcome.report) drop(c.displayName, outcome.report);
-      } else {
-        stopPhase(outcome.reason, outcome.deadline);
+  try {
+    for (const [index, c] of candidates.entries()) {
+      // The phase is over. Out of time or aborted, this file and every later one are dropped and
+      // reported; on a stale claim or an api that takes no files nothing is (the result post is
+      // refused the same way, or there is nowhere to record it).
+      const stopPhase = (reason: string, report: boolean): void => {
+        summary.stopped = reason;
+        if (report) for (const rest of candidates.slice(index)) drop(rest.displayName, "worker_upload_failed");
+      };
+      if (args.signal?.aborted) {
+        stopPhase("the upload phase was aborted", true);
         break;
       }
-    } catch (err) {
-      if (err instanceof OutputPhaseStop) {
-        stopPhase(args.signal?.aborted ? "the upload phase was aborted" : "the upload phase's time is spent", true);
+      if (Date.now() >= args.deadlineAt) {
+        stopPhase("the upload phase's time is spent", true);
         break;
       }
-      if (err instanceof OutputRefusal) {
-        drop(c.displayName, err.reason);
-        log.warn("job output file skipped", { file: logSafe(c.displayName), reason: err.message });
+      // Validate and open THIS candidate now. A resolve-all-first pass leaves later
+      // candidates exposed to ancestor swaps while earlier uploads are in flight.
+      const resolved = resolveOutputFile(args.workDir, c.label, args.secretPaths);
+      if (!resolved.ok) {
+        drop(c.displayName, "worker_unreadable");
+        log.warn("job output file skipped", { error: logSafe(resolved.error) });
         continue;
       }
-      // A local read failure (the file vanished, unreadable): this file only.
-      drop(c.displayName, "worker_unreadable");
-      log.warn("job output file could not be read; skipped", { file: logSafe(c.displayName), error: logSafe(errMessage(err)) });
-    } finally {
-      await opened?.fh.close().catch(() => undefined);
+      let opened: OpenedOutput | undefined;
+      try {
+        opened = await openAndHash(args.workDir, c.label, { files, totalBytes }, args.deadlineAt, args.signal, stage);
+        const meta: JobFileUploadMeta = { claim_generation: args.generation, display_name: c.displayName, size: opened.size, sha256: opened.sha256 };
+        const { fh, size } = opened;
+        // The upload reads the handle the hash pass read: bounded to the hashed size, from offset 0
+        // on every attempt, never closing the handle (closed below).
+        const body = (): Readable => fh.createReadStream({ start: 0, end: size - 1, autoClose: false });
+        const outcome = await uploadWithRetry(args, meta, body, c.label);
+        if (outcome.kind === "stored") {
+          summary.stored++;
+          files++;
+          totalBytes += size;
+        } else if (outcome.kind === "refused") {
+          summary.refused++;
+          if (outcome.report) drop(c.displayName, outcome.report);
+        } else {
+          stopPhase(outcome.reason, outcome.deadline);
+          break;
+        }
+      } catch (err) {
+        if (err instanceof OutputPhaseStop) {
+          stopPhase(args.signal?.aborted ? "the upload phase was aborted" : "the upload phase's time is spent", true);
+          break;
+        }
+        if (err instanceof OutputRefusal) {
+          drop(c.displayName, err.reason);
+          log.warn("job output file skipped", { file: logSafe(c.displayName), reason: err.message });
+          continue;
+        }
+        // A local read failure (the file vanished, unreadable): this file only.
+        drop(c.displayName, "worker_unreadable");
+        log.warn("job output file could not be read; skipped", { file: logSafe(c.displayName), error: failureDiagnostic(err) });
+      } finally {
+        await opened?.fh.close().catch(() => undefined);
+      }
     }
+  } finally {
+    // Every capture is already unlinked; the directory is empty. The workspace removal is the backstop.
+    if (stage?.dir) await fsp.rmdir(stage.dir).catch(() => undefined);
   }
   if (summary.stopped) log.warn("job output uploads stopped early", { reason: summary.stopped });
   log.info("job output uploads done", { stored: summary.stored, refused: summary.refused });
@@ -490,7 +645,7 @@ async function uploadWithRetry(
           retryAfterMs = err.retryAfterHeaderMs;
         }
       }
-      log.warn("job output upload failed", { file: logSafe(meta.display_name), attempt: attempt + 1, error: logSafe(errMessage(err)) });
+      log.warn("job output upload failed", { file: logSafe(meta.display_name), attempt: attempt + 1, error: failureDiagnostic(err) });
       if (attempt + 1 >= OUTPUT_UPLOAD_ATTEMPTS) break;
       const wait = retryAfterMs ?? delays[attempt] ?? delays[delays.length - 1] ?? 0;
       const left = Math.max(0, args.deadlineAt - Date.now());

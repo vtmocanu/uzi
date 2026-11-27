@@ -46,22 +46,24 @@ import "time"
 // All four are omitempty: a resolved/dismissed coordinate may carry no evidence, and an open one
 // no reason/provenance.
 type IncidentalFindingDTO struct {
-	DispositionID    string                 `json:"disposition_id"`
-	GroupOperationID *string                `json:"group_operation_id,omitempty"`
-	FindingID        *string                `json:"finding_id,omitempty"`
-	Location         string                 `json:"location"`
-	RepoID           string                 `json:"repo_id"`
-	RepoPath         string                 `json:"repo_path"`
-	Status           string                 `json:"status"`
-	LastTitle        string                 `json:"last_title"`
-	SeenInRuns       int                    `json:"seen_in_runs"`
-	DismissReason    string                 `json:"dismiss_reason,omitempty"`
-	SetVia           string                 `json:"set_via,omitempty"`
-	FiledIssueIID    *int64                 `json:"filed_issue_iid,omitempty"`
-	FiledIssueURL    string                 `json:"filed_issue_url,omitempty"`
-	ResolvedAt       *time.Time             `json:"resolved_at,omitempty"`
-	EvidencePreview  string                 `json:"evidence_preview,omitempty"`
-	Occurrences      []FindingOccurrenceDTO `json:"occurrences,omitempty"`
+	DispositionID    string  `json:"disposition_id"`
+	GroupOperationID *string `json:"group_operation_id,omitempty"`
+	FindingID        *string `json:"finding_id,omitempty"`
+	Location         string  `json:"location"`
+	RepoID           string  `json:"repo_id"`
+	RepoPath         string  `json:"repo_path"`
+	Status           string  `json:"status"`
+	LastTitle        string  `json:"last_title"`
+	SeenInRuns       int     `json:"seen_in_runs"`
+	DismissReason    string  `json:"dismiss_reason,omitempty"`
+	SetVia           string  `json:"set_via,omitempty"`
+	FiledIssueIID    *int64  `json:"filed_issue_iid,omitempty"`
+	// FiledIssueKey is the issue tracker key of FiledIssueIID on a linked repo, omitted otherwise (PRD #4173 M6).
+	FiledIssueKey   string                 `json:"filed_issue_key,omitempty"`
+	FiledIssueURL   string                 `json:"filed_issue_url,omitempty"`
+	ResolvedAt      *time.Time             `json:"resolved_at,omitempty"`
+	EvidencePreview string                 `json:"evidence_preview,omitempty"`
+	Occurrences     []FindingOccurrenceDTO `json:"occurrences,omitempty"`
 }
 
 // FindingOccurrenceDTO is one run's report of a finding coordinate (PRD #1183 M3): the finding
@@ -168,9 +170,11 @@ type IncidentalFindingBacklogDTO struct {
 // (PRD #333 M5/M6): the iid and web_url `uzi findings file` prints so a user can open it. It
 // carries no forge project id or other coordinates — only what the click produced.
 type IncidentalFindingFiledIssueDTO struct {
-	IID    int64  `json:"iid"`
-	WebURL string `json:"web_url"`
-	Title  string `json:"title"`
+	IID int64 `json:"iid"`
+	// IssueKey is the issue tracker key of IID on a linked repo, omitted otherwise (PRD #4173 M6).
+	IssueKey string `json:"issue_key,omitempty"`
+	WebURL   string `json:"web_url"`
+	Title    string `json:"title"`
 }
 
 // IncidentalFindingFileResultDTO is the POST /api/findings/{id}/issue response (PRD #333 M5):

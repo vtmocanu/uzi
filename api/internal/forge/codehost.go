@@ -168,10 +168,28 @@ const (
 // MergeRequest is a forge merge request as the MR-close watcher observes it
 // (PRD #24). Only the fields the watcher needs are carried; add more as callers
 // require. State is one of the MRState* constants.
+//
+// MergedAt and ClosedAt carry the provider's merge/close timestamps. nil means
+// the provider sent no value. A non-nil pointer carries exactly the SDK value,
+// including an explicit zero time: absent and zero are deliberately distinct,
+// and the consumer (the forgesvc history write) normalises zero to unknown. For
+// a merged PR, ClosedAt is not an unmerged close.
 type MergeRequest struct {
-	IID    int64
-	State  string
-	WebURL string
+	IID      int64
+	State    string
+	WebURL   string
+	MergedAt *time.Time
+	ClosedAt *time.Time
+}
+
+// copyTime returns a pointer to a fresh copy of t, or nil for nil, so a driver
+// never shares SDK memory and never normalises a zero value.
+func copyTime(t *time.Time) *time.Time {
+	if t == nil {
+		return nil
+	}
+	c := *t
+	return &c
 }
 
 // ReviewComment states classify an MRComment as either an inline diff comment

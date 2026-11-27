@@ -202,7 +202,7 @@ func (h *Handler) CreateRun(w http.ResponseWriter, r *http.Request) {
 		h.writeStartRunError(w, r, err)
 		return
 	}
-	httpx.JSON(w, http.StatusCreated, h.createdRunBody(r.Context(), runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)))
+	httpx.JSON(w, http.StatusCreated, h.createdRunBody(r.Context(), h.runDTO(r.Context(), run)))
 }
 
 // validateRunStartOptions is the pure shape step for the start-time model and effort (PRD #3250).
@@ -348,7 +348,7 @@ func (h *Handler) CreateTaskRun(w http.ResponseWriter, r *http.Request) {
 		h.writeStartRunError(w, r, err)
 		return
 	}
-	httpx.JSON(w, http.StatusCreated, h.createdRunBody(r.Context(), runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)))
+	httpx.JSON(w, http.StatusCreated, h.createdRunBody(r.Context(), h.runDTO(r.Context(), run)))
 }
 
 // DispatchTaskRun stamps a task run's dispatch gate (PRD #400 Decision 6): the CLI
@@ -377,7 +377,7 @@ func (h *Handler) DispatchTaskRun(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"run": runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)})
+	httpx.JSON(w, http.StatusOK, map[string]any{"run": h.runDTO(r.Context(), run)})
 }
 
 // writeStartRunError maps the StartRunForUser* sentinels to an HTTP status + message.
@@ -576,7 +576,7 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	dto := runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)
+	dto := h.runDTO(r.Context(), run)
 	dto.HarnessDecision = harnessDecisionForViewer(run, user)
 	dto.WeeklyLimit = h.weeklyLimitForViewer(r.Context(), user, []store.Run{run})[run.ID]
 	h.overlayCreatedIssues(r.Context(), run, &dto)

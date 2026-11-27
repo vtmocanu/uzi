@@ -74,8 +74,8 @@ func assertRecorded(t *testing.T, st *fakeStore, runID uuid.UUID, want string) {
 		t.Fatalf("expected exactly one mr_state write, got %d: %+v", len(st.mrStateWrites), st.mrStateWrites)
 	}
 	w := st.mrStateWrites[0]
-	if w.ID != runID || w.MrState.String != want || !w.MrState.Valid {
-		t.Fatalf("mr_state write = {%v %q}, want {%v %q}", w.ID, w.MrState.String, runID, want)
+	if w.ID != runID || w.MrState != want {
+		t.Fatalf("mr_state write = {%v %q}, want {%v %q}", w.ID, w.MrState, runID, want)
 	}
 }
 
@@ -450,7 +450,7 @@ func TestMRMultiCandidateIsolation(t *testing.T) {
 		t.Fatalf("only candidate B moves; A failed its read, got %+v", f.updateCalls)
 	}
 	// The single mr_state write belongs to B (A wrote nothing — its edge is left).
-	if len(st.mrStateWrites) != 1 || st.mrStateWrites[0].ID != runB || st.mrStateWrites[0].MrState.String != "closed" {
+	if len(st.mrStateWrites) != 1 || st.mrStateWrites[0].ID != runB || st.mrStateWrites[0].MrState != "closed" {
 		t.Fatalf("expected exactly B's 'closed' write, got %+v", st.mrStateWrites)
 	}
 }
