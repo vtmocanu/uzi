@@ -138,6 +138,7 @@ describe("parseModuleList", () => {
       const merged = mergeModuleNav(NAV_SECTIONS, out);
       const own = merged.filter((s) => s.id.startsWith("modules"));
       expect(own.map((s) => s.id)).toEqual(["modules:Tools"]);
+      expect(own[0].group).toBe("Tools");
       expect(own[0].items.map((i) => i.key)).toEqual(["module:a", "module:b"]);
     });
 
@@ -186,9 +187,13 @@ describe("parseModuleList", () => {
       expect("navSection" in out[0]).toBe(false);
       expect(errors).toHaveBeenCalledTimes(1);
       expect(logged()[0]).toContain("navGroup");
-      const ids = mergeModuleNav(NAV_SECTIONS, out).map((s) => s.id);
+      const merged = mergeModuleNav(NAV_SECTIONS, out);
+      const ids = merged.map((s) => s.id);
       expect(ids).toContain("modules");
       expect(ids.some((id) => id.startsWith("modules:"))).toBe(false);
+      const def = merged.find((s) => s.id === "modules")!;
+      expect(def.group).toBe("Modules");
+      expect(def.items.map((i) => i.key)).toEqual([`module:${out[0].id}`]);
     });
   });
 });
