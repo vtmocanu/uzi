@@ -580,7 +580,25 @@ func TestUsageFolderDeadlineBatchRetriedRunByRunLiveDB(t *testing.T) {
 func TestUsageFolderRetriesChargeLaneAllowanceLiveDB(t *testing.T) {
 	e := newFolderEnv(t)
 	const limit = 3
+	var base time.Time
+	if err := e.pool.QueryRow(e.ctx, `SELECT GREATEST(now(), max(created_at)) FROM runs
+		WHERE status IN ('completed','failed','cancelled') AND kind <> 'chat' AND usage_refolded
+		  AND created_at < TIMESTAMPTZ '9999-12-31 00:00:00+00'`).Scan(&base); err != nil {
+		t.Fatalf("find newest eligible run: %v", err)
+	}
+	seed := func(count int, offset int64) []uuid.UUID {
+		t.Helper()
+		ids := make([]uuid.UUID, count)
+		for i := range ids {
+			ids[i] = e.missingRun(t)
+		}
+		mustExec(e.ctx, t, e.pool, `UPDATE runs r SET created_at = $1::timestamptz + (x.ord + $2::bigint) * interval '1 second'
+			FROM unnest($3::uuid[]) WITH ORDINALITY AS x(id, ord) WHERE r.id = x.id`, base, offset, ids)
+		return ids
+	}
+
 	var attempts []uuid.UUID
+	var completed uuid.UUID
 	firstPass, cancelFirstPass := context.WithCancel(context.Background())
 	defer cancelFirstPass()
 	interruptBatch := true
@@ -590,48 +608,59 @@ func TestUsageFolderRetriesChargeLaneAllowanceLiveDB(t *testing.T) {
 		LaneLimit:     limit,
 		Materialize: func(ctx context.Context, ids []uuid.UUID) (int64, error) {
 			attempts = append(attempts, ids...)
-			if interruptBatch && len(ids) > 1 {
-				// Interrupt only after the missing lane selects its batch. This exercises the
-				// same retry path as a deadline without making Pass 2 race a short timer.
-				cancelFirstPass()
-				return 0, ctx.Err()
+			if interruptBatch {
+				if len(ids) > 1 {
+					return 0, errors.New("force run-by-run retry")
+				}
+				if completed != uuid.Nil {
+					cancelFirstPass()
+					return 0, ctx.Err()
+				}
 			}
-			return e.realMaterialize(ctx, ids)
+			n, err := e.realMaterialize(ctx, ids)
+			if interruptBatch && err == nil && n == 1 {
+				completed = ids[0]
+			}
+			return n, err
 		},
 	})
 
-	// Pass 1: the interrupted batch becomes the missing lane's pending retries.
-	old := []uuid.UUID{e.missingRun(t), e.missingRun(t)}
+	// A full batch advances the cursor to its oldest candidate even if the database's
+	// 2,000-row window is full. Complete one retry, then interrupt with two still pending.
+	old := seed(limit, 2)
 	if _, err := f.Pass(firstPass); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Pass 1: got %v, want context cancellation", err)
 	}
 	interruptBatch = false
-	if len(attempts) != len(old) || !containsID(attempts, old[0]) || !containsID(attempts, old[1]) {
-		t.Fatalf("Pass 1 attempted %v, want the interrupted batch %v", attempts, old)
+	if len(attempts) != len(old)+2 || !containsID(old, completed) {
+		t.Fatalf("Pass 1 attempted %v and completed %s, want a batch of %v and one completed retry", attempts, completed, old)
 	}
+	var pending []uuid.UUID
 	for _, r := range old {
-		if e.isFresh(t, r) {
-			t.Fatalf("Pass 1 unexpectedly folded %s", r)
+		if r == completed {
+			e.wantFresh(t, "first retry", r)
+		} else {
+			if e.isFresh(t, r) {
+				t.Fatalf("Pass 1 unexpectedly folded %s", r)
+			}
+			pending = append(pending, r)
 		}
 	}
 
-	// Pass 2: two new missing runs exist, but two retries leave room for only the newest.
-	fresh := []uuid.UUID{e.missingRun(t), e.missingRun(t)}
-	mustExec(e.ctx, t, e.pool, `UPDATE runs SET created_at = CASE WHEN id = $1 THEN TIMESTAMPTZ '2090-01-01 00:00:00+00'
-		ELSE TIMESTAMPTZ '2090-01-02 00:00:00+00' END WHERE id IN ($1, $2)`, fresh[0], fresh[1])
+	// Both new runs are just below the cursor and ahead of pre-existing runs. Pass 2
+	// must spend two slots on pending retries and the last slot on the newer new run.
+	fresh := seed(2, 0)
 	attempts = nil
 	if _, err := f.Pass(context.Background()); err != nil {
 		t.Fatalf("Pass 2: %v", err)
 	}
-	if len(attempts) != limit || !containsID(attempts, old[0]) || !containsID(attempts, old[1]) || !containsID(attempts, fresh[1]) {
-		t.Fatalf("Pass 2 attempted %v, want retries %v and newest run %s within LaneLimit=%d", attempts, old, fresh[1], limit)
+	if len(attempts) != limit || !containsID(attempts, pending[0]) || !containsID(attempts, pending[1]) || !containsID(attempts, fresh[1]) {
+		t.Fatalf("Pass 2 attempted %v, want retries %v and newest run %s within LaneLimit=%d", attempts, pending, fresh[1], limit)
 	}
-	for _, r := range old {
+	for _, r := range pending {
 		e.wantFresh(t, "retried run", r)
 	}
-	if !e.isFresh(t, fresh[1]) {
-		t.Fatal("the lane did not use the allowance the retries left over")
-	}
+	e.wantFresh(t, "remaining allowance", fresh[1])
 	if e.isFresh(t, fresh[0]) {
 		t.Fatal("the lane took a second new run: retries were not charged against its allowance")
 	}
