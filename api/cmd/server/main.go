@@ -33,6 +33,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/forgesvc"
 	"github.com/vtmocanu/uzi/api/internal/handler"
 	"github.com/vtmocanu/uzi/api/internal/healthsvc"
+	"github.com/vtmocanu/uzi/api/internal/historyretention"
 	"github.com/vtmocanu/uzi/api/internal/hostedsvc"
 	"github.com/vtmocanu/uzi/api/internal/hub"
 	"github.com/vtmocanu/uzi/api/internal/issuesource"
@@ -884,6 +885,9 @@ func run() error {
 		return err
 	}
 
+	// History retention (issue #4695): off unless UZI_HISTORY_RETENTION is set (24h or more).
+	historyRetention := historyretention.New(pool, cfg.HistoryRetention)
+
 	sweep := sweeper.New(wsvc, cfg.SweepInterval,
 		sweeper.Pass{
 			Name: "vault_browser_slots_expired",
@@ -1107,6 +1111,15 @@ func run() error {
 		sweeper.Pass{
 			Name: "worker_capacity_samples",
 			Run:  capacitySampler.Pass,
+		},
+		// History retention (issue #4695): opt-in age-based deletion of recorded history under
+		// a cross-replica session lock and a 2 s client budget. Registered but inert while
+		// UZI_HISTORY_RETENTION is unset (the pass returns before touching the database). A
+		// usage fold pass, if one is added, must stay the LAST registered
+		// pass, so any such pass goes after this one.
+		sweeper.Pass{
+			Name: "history_retention",
+			Run:  historyRetention.Pass,
 		},
 	)
 	// Admin-health loop-beat: the run-liveness sweeper is one of the four loops (PRD #1484
