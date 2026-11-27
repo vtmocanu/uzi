@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -377,8 +376,9 @@ type starveFn = func(int, int32, context.Context) (int64, error)
 // the real time at the start of every tick, so the contexts are live; a shape can advance it to
 // consume the work budget without a real sleep. It returns, per instance, the set of tables
 // attempted in each tick that instance won, in order.
-func starvationRun(t *testing.T, shapes map[store.HistoryRetentionTable]func(clock *time.Time) starveFn, counters []uint64, schedule []int) [][]map[store.HistoryRetentionTable]bool {
+func starvationRun(t *testing.T, shapes map[store.HistoryRetentionTable]func(clock *time.Time) starveFn, counters []uint64, schedule []int) ([][]map[store.HistoryRetentionTable]bool, [][]store.HistoryRetentionTable) {
 	t.Helper()
+	var order [][]store.HistoryRetentionTable // the tables attempted in each tick, in call order
 	var clock time.Time
 	var sessions []*fakeSession
 	opener := func(context.Context, context.Context) (session, bool, error) {
@@ -406,8 +406,9 @@ func starvationRun(t *testing.T, shapes map[store.HistoryRetentionTable]func(clo
 			got[c.table] = true
 		}
 		wins[inst] = append(wins[inst], got)
+		order = append(order, sessions[before].tables())
 	}
-	return wins
+	return wins, order
 }
 
 // assertEveryTableWithinFour fails when, in any four consecutive ticks won by one instance, a
@@ -460,20 +461,21 @@ func TestPassStarvationOverManyTicks(t *testing.T) {
 			return func(int, int32, context.Context) (int64, error) { return 0, errors.New("connection reset") }
 		},
 	}
-	wins := starvationRun(t, shapes, []uint64{1, 3}, unevenSchedule(24))
+	wins, _ := starvationRun(t, shapes, []uint64{1, 3}, unevenSchedule(24))
 	assertEveryTableWithinFour(t, wins, baseOrder)
 }
 
 func TestPassStarvationDeadlineTable(t *testing.T) {
-	// pr_history_events consumes the whole work budget whenever it is reached (the fake clock
-	// jumps past the work deadline, as a statement that ran to the client deadline would). Every
-	// other table must still get an attempt within four ticks, alone and with two instances
-	// alternating, whatever position the blocking table has in a rotation.
+	// pr_history_events consumes the whole work budget whenever it is reached: the fake clock jumps
+	// past the work deadline and the delete then succeeds, so the deadline check is the only thing
+	// that can end the tick (no error does). Nothing after it in that tick's rotation may be
+	// attempted, and every other table must still get an attempt within four ticks, alone and with
+	// two instances alternating, whatever position the blocking table has in a rotation.
 	blocking := map[store.HistoryRetentionTable]func(*time.Time) starveFn{
 		tPR: func(clock *time.Time) starveFn {
 			return func(int, int32, context.Context) (int64, error) {
 				*clock = clock.Add(totalBudget)
-				return 0, fmt.Errorf("delete %s: %w", tPR, context.DeadlineExceeded)
+				return 3, nil
 			}
 		},
 	}
@@ -484,18 +486,24 @@ func TestPassStarvationDeadlineTable(t *testing.T) {
 		schedule []int
 	}{
 		{"one instance", []uint64{0}, make([]int, 12)},
-		{"one instance, random start", []uint64{6}, make([]int, 12)},
+		{"one instance, start 2 mod 4", []uint64{6}, make([]int, 12)},
 		{"two instances", []uint64{1, 3}, unevenSchedule(24)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			wins := starvationRun(t, blocking, tc.counters, tc.schedule)
+			wins, order := starvationRun(t, blocking, tc.counters, tc.schedule)
 			assertEveryTableWithinFour(t, wins, others)
 			// The blocking table must itself be reached (it is what exhausts the budget), or the
-			// scenario never exercised the deadline.
+			// scenario never exercised the deadline. Where it is, it is the last table attempted.
 			reached := false
-			for _, ticks := range wins {
-				for _, tick := range ticks {
-					reached = reached || tick[tPR]
+			for i, tables := range order {
+				for j, tb := range tables {
+					if tb != tPR {
+						continue
+					}
+					reached = true
+					if j != len(tables)-1 {
+						t.Errorf("tick %d attempted %v: tables followed the deadline table", i, tables)
+					}
 				}
 			}
 			if !reached {

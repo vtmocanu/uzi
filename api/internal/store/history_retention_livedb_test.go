@@ -91,7 +91,9 @@ func (f *hrFx) seedFirstMerge(n int, at time.Time) {
 }
 
 // sub returns a view of the fixture bound to the subtest t, so fixture failures and cleanups
-// belong to that subtest while the database, pool and rows stay shared.
+// belong to that subtest while the database, pool and rows stay shared. The per-subtest copies of
+// iid and wcsFx.n are safe because the history tables are truncated per subtest and no HR subtest
+// calls wcsFx.run.
 func (f *hrFx) sub(t *testing.T) *hrFx {
 	g := *f
 	w := *f.wcsFx
@@ -525,7 +527,8 @@ func TestHistoryRetentionFailedOpenLiveDB(t *testing.T) {
 
 	// The work context ends between the settings statement and the try-lock. pgx refuses to send
 	// on a context that is already done, so the try-lock never reaches the server: this pins the
-	// close under a separate, still-live cleanup context, not a lost reply (the next case).
+	// close under a separate, still-live cleanup context. Like the next case, it is a connection
+	// lost before the try-lock is sent.
 	root.run(t, "deadline before try-lock", func(t *testing.T, f *hrFx) {
 		p := f.probePool(t)
 		workCtx, cancelWork := context.WithCancel(f.ctx)
@@ -543,11 +546,11 @@ func TestHistoryRetentionFailedOpenLiveDB(t *testing.T) {
 		hrWaitLockFree(t, f)
 	})
 
-	// The connection is lost at the try-lock round trip while both contexts are still live: the
-	// client socket is closed from the TraceQueryStart hook the moment the try-lock statement
-	// starts, so the open returns a try-lock error with the lock state unknown to the client. The
-	// session code must close what it holds; nothing may be left behind.
-	root.run(t, "connection lost at try-lock", func(t *testing.T, f *hrFx) {
+	// The connection is lost before the try-lock is sent, while both contexts are still live: the
+	// client socket is closed from the TraceQueryStart hook, which pgx calls before any network I/O,
+	// so pg_try_advisory_lock never reaches the server. The open returns a try-lock error; the case
+	// asserts that no session and no lock remain afterwards.
+	root.run(t, "connection lost before try-lock", func(t *testing.T, f *hrFx) {
 		p := f.probePool(t)
 		cleanupCtx, cancelCleanup := context.WithTimeout(f.ctx, 6*time.Second)
 		defer cancelCleanup()

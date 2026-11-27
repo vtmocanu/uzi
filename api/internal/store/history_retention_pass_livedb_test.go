@@ -129,12 +129,18 @@ func hrCapacitySamplerBucket(t *testing.T, f *hrFx) {
 		StaleAfter: pgtype.Interval{Microseconds: wcsStaleAfter.Microseconds(), Valid: true},
 		BatchSize:  10,
 	})
-	if err != nil || row.Inserted != 1 {
-		t.Fatalf("sampler = (%+v, %v), want 1 inserted", row, err)
+	// Workers outlive the per-subtest truncate, so other fresh workers may be sampled in the same
+	// batch: assert on this subtest's own worker only.
+	if err != nil || row.Inserted < 1 {
+		t.Fatalf("sampler = (%+v, %v), want at least 1 inserted", row, err)
 	}
+	var n int
 	var micros int64
-	if err := f.pool.QueryRow(f.ctx, `SELECT (extract(epoch FROM (now() - bucket_start)) * 1000000)::bigint FROM worker_capacity_samples WHERE worker_id = $1`, w).Scan(&micros); err != nil {
+	if err := f.pool.QueryRow(f.ctx, `SELECT count(*), coalesce(max((extract(epoch FROM (now() - bucket_start)) * 1000000)::bigint), 0) FROM worker_capacity_samples WHERE worker_id = $1`, w).Scan(&n, &micros); err != nil {
 		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("%d samples for the subtest's worker, want 1", n)
 	}
 	age := time.Duration(micros) * time.Microsecond
 	if age < 0 || age > 5*time.Minute+time.Minute {
