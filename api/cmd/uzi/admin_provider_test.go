@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
@@ -48,14 +49,14 @@ func TestAdminProviderListTable(t *testing.T) {
 		t.Fatalf("exit = %d, stderr %q", code, errOut)
 	}
 	header := strings.SplitN(out, "\n", 2)[0]
-	if got, want := strings.Fields(header), []string{"NAME", "ENGINE", "URL", "AUTH", "RETIRED", "REVISION", "SELECTED", "KEYS"}; !equalStringSlices(got, want) {
+	if got, want := strings.Fields(header), []string{"NAME", "ENGINE", "MODE", "URL", "AUTH", "RETIRED", "REVISION", "SELECTED", "KEYS", "ORG", "KEY"}; !equalStringSlices(got, want) {
 		t.Fatalf("header = %v, want %v", got, want)
 	}
 	for _, line := range strings.Split(out, "\n") {
 		if strings.HasPrefix(line, "Corp Shared") {
 			f := strings.Fields(line)
-			// NAME is two words: Corp Shared claude <url> bearer false 3 7 5
-			if len(f) != 9 || f[2] != "claude" || f[5] != "false" || f[6] != "3" || f[7] != "7" || f[8] != "5" {
+			// NAME is two words: Corp Shared claude per_user_key <url> bearer false 3 7 5 -
+			if len(f) != 11 || f[2] != "claude" || f[3] != "per_user_key" || f[6] != "false" || f[7] != "3" || f[8] != "7" || f[9] != "5" || f[10] != "-" {
 				t.Errorf("Corp Shared row = %q", line)
 			}
 		}
@@ -385,5 +386,102 @@ func TestProviderEditAndRetireResolveOwnedWhenNameIsShared(t *testing.T) {
 	}
 	if _, errOut, code := runCLI(t, fakeEnv(fc), "provider", "edit", "corp", "--name", "Renamed"); code != uzicli.ExitOK || fc.LastProviderID != providerTestID {
 		t.Fatalf("edit: code %d, stderr %q, id %q", code, errOut, fc.LastProviderID)
+	}
+}
+
+func operatorAdminFixture(id, name string, key *apitypes.AdminOperatorKeyDTO) apitypes.AdminSharedProviderDTO {
+	d := sharedAdminFixture(id, name)
+	d.CredentialMode = "operator_key"
+	d.OperatorKey = key
+	return d
+}
+
+// getRows renders `admin provider get` and returns its FIELD/VALUE rows as field -> value.
+func getRows(t *testing.T, d apitypes.AdminSharedProviderDTO) map[string]string {
+	t.Helper()
+	fc := &uzicli.FakeClient{SharedProviders: []apitypes.AdminSharedProviderDTO{d}}
+	out, errOut, code := runCLI(t, fakeEnv(fc), "admin", "provider", "get", d.ID)
+	if code != uzicli.ExitOK {
+		t.Fatalf("get: exit %d, stderr %q", code, errOut)
+	}
+	rows := map[string]string{}
+	for _, line := range strings.Split(out, "\n")[1:] {
+		if field, value, ok := strings.Cut(strings.TrimRight(line, " "), " "); ok {
+			rows[field] = strings.TrimSpace(value)
+		}
+	}
+	return rows
+}
+
+// PRD #4540: the credential mode and the organization key state render for every kind of definition.
+func TestAdminProviderRendersOrganizationKeyState(t *testing.T) {
+	probedAt := time.Date(2026, 11, 27, 9, 30, 0, 0, time.UTC)
+	cases := []struct {
+		name                                 string
+		d                                    apitypes.AdminSharedProviderDTO
+		mode, orgKey, orgKeyTest, listOrgKey string
+	}{
+		{"per-user key", sharedAdminFixture(sharedTestID, "peruser"), "per_user_key", "-", "-", "-"},
+		{"operator keyless", operatorAdminFixture(sharedTestID, "keyless", &apitypes.AdminOperatorKeyDTO{}),
+			"operator_key", "none", "not tested", "none"},
+		{"operator enabled with a probe", operatorAdminFixture(sharedTestID, "probed", &apitypes.AdminOperatorKeyDTO{
+			Present: true, Enabled: true, Probe: &apitypes.ProviderProbeDTO{AuthResult: "ok", ToolResult: "passed", ProbedAt: probedAt}}),
+			"operator_key", "enabled", "ok/passed at 2026-11-27T09:30:00Z", "enabled"},
+		{"operator enabled, tool result absent", operatorAdminFixture(sharedTestID, "notool", &apitypes.AdminOperatorKeyDTO{
+			Present: true, Enabled: true, Probe: &apitypes.ProviderProbeDTO{AuthResult: "rejected", ProbedAt: probedAt}}),
+			"operator_key", "enabled", "rejected/- at 2026-11-27T09:30:00Z", "enabled"},
+		{"operator disabled", operatorAdminFixture(sharedTestID, "off", &apitypes.AdminOperatorKeyDTO{Present: true}),
+			"operator_key", "disabled", "not tested", "disabled"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rows := getRows(t, tc.d)
+			if rows["credential_mode"] != tc.mode || rows["org_key"] != tc.orgKey || rows["org_key_test"] != tc.orgKeyTest {
+				t.Errorf("get rows = mode %q org_key %q org_key_test %q, want %q %q %q",
+					rows["credential_mode"], rows["org_key"], rows["org_key_test"], tc.mode, tc.orgKey, tc.orgKeyTest)
+			}
+			fc := &uzicli.FakeClient{SharedProviders: []apitypes.AdminSharedProviderDTO{tc.d}}
+			out, _, code := runCLI(t, fakeEnv(fc), "admin", "provider", "list")
+			if code != uzicli.ExitOK {
+				t.Fatalf("list: exit %d", code)
+			}
+			lines := strings.Split(strings.TrimSpace(out), "\n")
+			f := strings.Fields(lines[1])
+			if len(f) != 10 || f[2] != tc.mode || f[9] != tc.listOrgKey {
+				t.Errorf("list row = %q, want MODE %q and ORG KEY %q", lines[1], tc.mode, tc.listOrgKey)
+			}
+		})
+	}
+}
+
+// The probe cells go through cellText like every other server string.
+func TestAdminProviderOrganizationKeyCellsAreInert(t *testing.T) {
+	d := operatorAdminFixture(sharedTestID, "hostile", &apitypes.AdminOperatorKeyDTO{
+		Present: true, Enabled: true,
+		Probe: &apitypes.ProviderProbeDTO{AuthResult: "ok" + hostileSegment, ToolResult: "tool" + hostileSegment, ProbedAt: time.Unix(0, 0)}})
+	d.CredentialMode = "operator_key" + hostileSegment
+	fc := &uzicli.FakeClient{SharedProviders: []apitypes.AdminSharedProviderDTO{d}}
+	for _, args := range [][]string{{"admin", "provider", "list"}, {"admin", "provider", "get", sharedTestID}} {
+		out, _, code := runCLI(t, fakeEnv(fc), args...)
+		if code != uzicli.ExitOK {
+			t.Fatalf("%v: exit %d", args, code)
+		}
+		for _, bad := range []string{"\x1b", "\u202e", "\x07"} {
+			if strings.Contains(out, bad) {
+				t.Errorf("%v output carries control %q:\n%q", args, bad, out)
+			}
+		}
+	}
+}
+
+// JSON output carries the DTO unchanged, the organization key state included and nothing else.
+func TestAdminProviderJSONCarriesOrganizationKeyState(t *testing.T) {
+	d := operatorAdminFixture(sharedTestID, "j", &apitypes.AdminOperatorKeyDTO{Present: true, Enabled: true})
+	fc := &uzicli.FakeClient{SharedProviders: []apitypes.AdminSharedProviderDTO{d}}
+	out, _, code := runCLI(t, fakeEnv(fc), "--json", "admin", "provider", "get", sharedTestID)
+	var got apitypes.AdminSharedProviderDTO
+	if code != uzicli.ExitOK || json.Unmarshal([]byte(out), &got) != nil || got.CredentialMode != "operator_key" ||
+		got.OperatorKey == nil || !got.OperatorKey.Present || !got.OperatorKey.Enabled {
+		t.Fatalf("json get: code %d, out %q", code, out)
 	}
 }

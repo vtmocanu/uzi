@@ -76,6 +76,12 @@ const (
 	adminRead   = "admin list/get (cookie, or the admin-read token)"
 	adminKey    = "admin key write or Test (cookie + CSRF)"
 
+	// The production files that may call a shared-admin or custody statement (PRD #4540 M2): the admin
+	// definition routes, the organization key routes and the admin Test.
+	handlerAdmin = "handler/providers_admin.go"
+	handlerKey   = "handler/providers_admin_key.go"
+	handlerProbe = "handler/providers_admin_probe.go"
+
 	// sharedBothModes is the credential-mode predicate of every admin statement: a shared definition is
 	// per-user-key or organization-funded, and the admin catalogue, cap and edits cover both.
 	sharedBothModes = "credential_mode IN ('per_user_key', 'operator_key')"
@@ -144,10 +150,10 @@ var visibilityTable = map[string]visEntry{
 		callers: []string{"handler/providers_admin.go"}},
 	"InsertSharedModelProvider": {class: classShared, caller: adminCreate, exact: exactSQL["InsertSharedModelProvider"], must: []string{
 		"VALUES (NULL, @name, @engine, 1, 'per_user_key', " + nilScopeSQL + ")"}, callers: []string{"handler/providers_admin.go"}},
-	// No production caller in M1: PRD #4540 M2 wires the create route.
 	"InsertSharedOperatorModelProvider": {class: classShared, caller: adminCreate, exact: exactSQL["InsertSharedOperatorModelProvider"], must: []string{
-		"VALUES (NULL, @name, 'claude', 1, 'operator_key', " + nilScopeSQL + ")"}},
-	"LockSharedModelProviderForEdit":    {class: classShared, caller: adminEdit, exact: exactSQL["LockSharedModelProviderForEdit"], callers: []string{"handler/providers_admin.go"}},
+		"VALUES (NULL, @name, 'claude', 1, 'operator_key', " + nilScopeSQL + ")"}, callers: []string{handlerAdmin}},
+	// The edit lock is the first statement of every definition write: the edit, retire and key routes.
+	"LockSharedModelProviderForEdit":    {class: classShared, caller: adminEdit, exact: exactSQL["LockSharedModelProviderForEdit"], callers: []string{handlerAdmin, handlerKey}},
 	"BumpSharedModelProviderRevision":   {class: classShared, caller: adminEdit, exact: exactSQL["BumpSharedModelProviderRevision"], callers: []string{"handler/providers_admin.go"}},
 	"RenameSharedModelProvider":         {class: classShared, caller: adminEdit, exact: exactSQL["RenameSharedModelProvider"], callers: []string{"handler/providers_admin.go"}},
 	"RetireSharedModelProvider":         {class: classShared, caller: adminEdit, exact: exactSQL["RetireSharedModelProvider"], callers: []string{"handler/providers_admin.go"}},
@@ -160,34 +166,36 @@ var visibilityTable = map[string]visEntry{
 		must: bothSelectionArms, callers: []string{"handler/providers_admin.go"}},
 	"ListSharedModelProvidersAdmin": {class: classShared, caller: adminRead, exact: exactSQL["ListSharedModelProvidersAdmin"],
 		must: adminCountMust, callers: []string{"handler/providers_admin.go"}},
+	// The read-back of every definition write: the key routes and the admin Test return the admin view.
 	"GetSharedModelProviderAdmin": {class: classShared, caller: adminRead, exact: exactSQL["GetSharedModelProviderAdmin"],
-		must: adminCountMust, callers: []string{"handler/providers_admin.go"}},
+		must: adminCountMust, callers: []string{handlerAdmin, handlerKey, handlerProbe}},
 
-	// organization key custody and the admin Test evidence (PRD #4540). None has a production caller in
-	// M1; M2's key routes and Test probe set the callers below, and the key and probe files are the only
-	// ones that may ever call them. Each must name the operator scope or its own key identity.
+	// organization key custody and the admin Test evidence (PRD #4540). The key routes (handlerKey) write
+	// custody, the admin Test (handlerProbe) reads the sink and records evidence, and the admin delete
+	// (handlerAdmin) takes the ciphertext-free custody lock. Each must name the operator scope or its own
+	// key identity.
 	"LockOperatorProviderKeyForWrite": {class: classOperatorCustody, caller: adminKey, exact: exactSQL["LockOperatorProviderKeyForWrite"],
-		must: []string{"WHERE provider_id = @provider_id FOR UPDATE"}},
+		must: []string{"WHERE provider_id = @provider_id FOR UPDATE"}, callers: []string{handlerKey, handlerAdmin}},
 	"InsertOperatorProviderKey": {class: classOperatorCustody, caller: adminKey, exact: exactSQL["InsertOperatorProviderKey"], ciphertext: true,
-		must: []string{"INSERT INTO model_provider_operator_keys (provider_id, ciphertext, set_by)"}},
+		must: []string{"INSERT INTO model_provider_operator_keys (provider_id, ciphertext, set_by)"}, callers: []string{handlerKey}},
 	"ReplaceOperatorProviderKey": {class: classOperatorCustody, caller: adminKey, exact: exactSQL["ReplaceOperatorProviderKey"], ciphertext: true,
-		must: []string{"WHERE provider_id = @provider_id"}},
+		must: []string{"WHERE provider_id = @provider_id"}, callers: []string{handlerKey}},
 	"DisableOperatorProviderKey": {class: classOperatorCustody, caller: adminKey, exact: exactSQL["DisableOperatorProviderKey"],
-		must: []string{"WHERE provider_id = @provider_id AND disabled_at IS NULL"}},
+		must: []string{"WHERE provider_id = @provider_id AND disabled_at IS NULL"}, callers: []string{handlerKey}},
 	"EnableOperatorProviderKey": {class: classOperatorCustody, caller: adminKey, exact: exactSQL["EnableOperatorProviderKey"],
-		must: []string{"WHERE provider_id = @provider_id AND disabled_at IS NOT NULL"}},
+		must: []string{"WHERE provider_id = @provider_id AND disabled_at IS NOT NULL"}, callers: []string{handlerKey}},
 	"DeleteOperatorProviderKey": {class: classOperatorCustody, caller: adminKey, exact: exactSQL["DeleteOperatorProviderKey"],
-		must: []string{"WHERE provider_id = @provider_id"}},
+		must: []string{"WHERE provider_id = @provider_id"}, callers: []string{handlerKey}},
 	"GetOperatorProviderKeyForTest": {class: classOperatorCustody, caller: adminKey, exact: exactSQL["GetOperatorProviderKeyForTest"], ciphertext: true,
-		must: []string{"WHERE id = @id AND provider_id = @provider_id AND key_rev = @key_rev AND disabled_at IS NULL"}},
+		must: []string{"WHERE id = @id AND provider_id = @provider_id AND key_rev = @key_rev AND disabled_at IS NULL"}, callers: []string{handlerProbe}},
 	"GetOperatorProviderForTest": {class: classOperatorCustody, caller: adminKey, exact: exactSQL["GetOperatorProviderForTest"],
-		must: []string{operatorScopeSQL}},
+		must: []string{operatorScopeSQL}, callers: []string{handlerProbe}},
 	"LockOperatorProviderForEvidence": {class: classOperatorCustody, caller: adminKey, exact: exactSQL["LockOperatorProviderForEvidence"],
-		must: []string{operatorScopeSQL, "p.retired_at IS NULL", "FOR SHARE OF p"}},
+		must: []string{operatorScopeSQL, "p.retired_at IS NULL", "FOR SHARE OF p"}, callers: []string{handlerProbe}},
 	"LockOperatorProviderKeyForEvidence": {class: classOperatorCustody, caller: adminKey, exact: exactSQL["LockOperatorProviderKeyForEvidence"],
-		must: []string{"k.id = @key_id", "k.provider_id = @provider_id", "k.key_rev = @key_rev", "k.disabled_at IS NULL", "FOR SHARE"}},
+		must: []string{"k.id = @key_id", "k.provider_id = @provider_id", "k.key_rev = @key_rev", "k.disabled_at IS NULL", "FOR SHARE"}, callers: []string{handlerProbe}},
 	"UpsertOperatorProviderKeyTestResult": {class: classOperatorCustody, caller: adminKey, exact: exactSQL["UpsertOperatorProviderKeyTestResult"],
-		must: []string{"ON CONFLICT (provider_id)"}},
+		must: []string{"ON CONFLICT (provider_id)"}, callers: []string{handlerProbe}},
 
 	// identity-only: keyed by an id the caller already holds under a prior visibility check
 	"InsertModelProviderRevision": {class: classIdentity, must: []string{"WHERE p.id = @provider_id"},
@@ -554,31 +562,40 @@ func TestIdentityQueryCallersArePinned(t *testing.T) {
 			t.Errorf("%s: callers = %v, recorded %v (review the new caller's authorization, then record it)", name, got, want)
 		}
 	}
-	// operatorkey.Seal and Open are the only way the sealed organization key is made or read; M1 has no
-	// production caller (the key routes and the Test probe, in M2, are the only files that may).
-	for _, fn := range []string{"Seal", "Open"} {
-		if got := callersOf(files, "operatorkey."+fn+"("); len(got) != len(operatorKeySealOpenCallers) ||
-			(len(got) > 0 && strings.Join(got, ",") != strings.Join(operatorKeySealOpenCallers, ",")) {
-			t.Errorf("operatorkey.%s callers = %v, recorded %v", fn, got, operatorKeySealOpenCallers)
+	// operatorkey.Seal and Open are the only way the sealed organization key is made or read: the key
+	// routes seal it, the admin Test opens it.
+	for fn, want := range operatorKeySealOpenCallers {
+		if got := callersOf(files, "operatorkey."+fn+"("); !slices.Equal(got, want) {
+			t.Errorf("operatorkey.%s callers = %v, recorded %v", fn, got, want)
 		}
 	}
 	checkProviderEvidenceCalls(t, files["handler/providers_probe.go"], true)
+	for _, pin := range custodyCallOrderPins {
+		checkCallOrder(t, files[pin.file], pin, true)
+	}
 	if got := operatorKeyAliasViolations(files); len(got) != 0 {
 		t.Errorf("production files import operatorkey under a non-default name (the Seal/Open caller pin cannot see them):\n  %s", strings.Join(got, "\n  "))
 	}
 }
 
-// operatorKeyImportRE matches an import of the operatorkey package that carries a name (an alias, `_` or
-// `.`); the default-named import is the only form callersOf("operatorkey.Seal(") can see.
-var operatorKeyImportRE = regexp.MustCompile(`(?m)^\s*(?:import\s+)?[A-Za-z_.][A-Za-z0-9_]*\s+"[^"\n]*/internal/operatorkey"`)
-
 // operatorKeyAliasViolations returns the production files that import the operatorkey package under a
-// non-default name.
+// non-default name (an alias, `_` or `.`), which callersOf("operatorkey.Seal(") cannot see. It reads the
+// import specs with go/parser, so the spelling of the declaration (a single-line import, a block, a
+// comment between the name and the path) does not matter. A file that does not parse is reported too:
+// the scan must not go blind on it.
 func operatorKeyAliasViolations(files map[string]string) []string {
 	var out []string
 	for path, src := range files {
-		if operatorKeyImportRE.MatchString(src) {
-			out = append(out, path)
+		f, err := parser.ParseFile(token.NewFileSet(), path, src, parser.ImportsOnly)
+		if err != nil {
+			out = append(out, path+" (does not parse)")
+			continue
+		}
+		for _, imp := range f.Imports {
+			if strings.HasSuffix(strings.Trim(imp.Path.Value, "\"`"), "/internal/operatorkey") && imp.Name != nil {
+				out = append(out, path)
+				break
+			}
 		}
 	}
 	sort.Strings(out)
@@ -588,20 +605,29 @@ func operatorKeyAliasViolations(files map[string]string) []string {
 func TestOperatorKeyAliasScanFiresOnAliasedImports(t *testing.T) {
 	const pkg = "github.com/vtmocanu/uzi/api/internal/operatorkey"
 	files := map[string]string{
-		"handler/aliased.go": "package handler\n\nimport (\n\tok \"" + pkg + "\"\n)\n",
-		"handler/dot.go":     "package handler\n\nimport . \"" + pkg + "\"\n",
-		"handler/blank.go":   "package handler\n\nimport (\n\t_ \"" + pkg + "\"\n)\n",
-		"handler/plain.go":   "package handler\n\nimport (\n\t\"" + pkg + "\"\n)\n",
-		"handler/none.go":    "package handler\n",
+		"handler/aliased.go":      "package handler\n\nimport (\n\tok \"" + pkg + "\"\n)\n",
+		"handler/dot.go":          "package handler\n\nimport . \"" + pkg + "\"\n",
+		"handler/blank.go":        "package handler\n\nimport (\n\t_ \"" + pkg + "\"\n)\n",
+		"handler/commented.go":    "package handler\n\nimport ok /* x */ \"" + pkg + "\"\n",
+		"handler/commented_in.go": "package handler\n\nimport (\n\tok /* x */ \"" + pkg + "\"\n)\n",
+		"handler/plain.go":        "package handler\n\nimport (\n\t\"" + pkg + "\"\n)\n",
+		"handler/plain_single.go": "package handler\n\nimport \"" + pkg + "\"\n",
+		"handler/none.go":         "package handler\n",
+		"handler/broken.go":       "package handler\n\nimport (\n",
 	}
 	got := operatorKeyAliasViolations(files)
-	if want := []string{"handler/aliased.go", "handler/blank.go", "handler/dot.go"}; !slices.Equal(got, want) {
+	want := []string{"handler/aliased.go", "handler/blank.go", "handler/broken.go (does not parse)", "handler/commented.go", "handler/commented_in.go", "handler/dot.go"}
+	if !slices.Equal(got, want) {
 		t.Fatalf("alias violations = %v, want %v", got, want)
 	}
 }
 
-// operatorKeySealOpenCallers is the exact set of production files that call operatorkey.Seal or Open.
-var operatorKeySealOpenCallers = []string{}
+// operatorKeySealOpenCallers is, per function, the exact set of production files that call
+// operatorkey.Seal or Open.
+var operatorKeySealOpenCallers = map[string][]string{
+	"Seal": {handlerKey},
+	"Open": {handlerProbe},
+}
 
 func callersOf(files map[string]string, needle string) []string {
 	var got []string
@@ -700,6 +726,122 @@ func recordProviderProbeResult() {
 	q.UpsertProviderKeyTestResult()
 	q.LockVisibleProviderForEvidence()
 }`, false)
+}
+
+// callOrderPin pins, for one function of a production file, the order of its store calls: the locks are
+// each called exactly once, in this order, on the transaction queries q, and every write is called only
+// after the last lock (and at least one is called).
+type callOrderPin struct {
+	file   string
+	fn     string
+	locks  []string
+	writes []string
+}
+
+// custodyCallOrderPins are the organization key's lock orders (PRD #4540): a key write locks the
+// definition (edit) and then the key's custody row before it writes; the admin delete locks the
+// definition (delete) before the custody row; the Test evidence fence locks the definition, then the
+// key, before its upsert. The definition is always first, so no two of them can deadlock.
+var custodyCallOrderPins = []callOrderPin{
+	{handlerKey, "AdminPutOperatorKey", []string{"LockSharedModelProviderForEdit", "LockOperatorProviderKeyForWrite"},
+		[]string{"InsertOperatorProviderKey", "ReplaceOperatorProviderKey"}},
+	{handlerKey, "AdminPatchOperatorKeyEnabled", []string{"LockSharedModelProviderForEdit", "LockOperatorProviderKeyForWrite"},
+		[]string{"EnableOperatorProviderKey", "DisableOperatorProviderKey"}},
+	{handlerKey, "AdminDeleteOperatorKey", []string{"LockSharedModelProviderForEdit", "LockOperatorProviderKeyForWrite"},
+		[]string{"DeleteOperatorProviderKey"}},
+	{handlerAdmin, "AdminDeleteSharedProvider", []string{"LockSharedModelProviderForDelete", "LockOperatorProviderKeyForWrite"},
+		[]string{"DeleteSharedProviderKeys", "DeleteSharedModelProvider"}},
+	{handlerProbe, "recordOperatorProbeEvidence", []string{"LockOperatorProviderForEvidence", "LockOperatorProviderKeyForEvidence"},
+		[]string{"UpsertOperatorProviderKeyTestResult"}},
+}
+
+// callOrderViolations reads the executable selector calls of pin.fn (comments cannot satisfy it).
+func callOrderViolations(source string, pin callOrderPin) []string {
+	file, err := parser.ParseFile(token.NewFileSet(), pin.file, source, 0)
+	if err != nil {
+		return []string{pin.file + ": does not parse: " + err.Error()}
+	}
+	var out []string
+	var calls []string
+	found := false
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Name.Name != pin.fn {
+			continue
+		}
+		found = true
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			method, ok := call.Fun.(*ast.SelectorExpr)
+			if ok && (slices.Contains(pin.locks, method.Sel.Name) || slices.Contains(pin.writes, method.Sel.Name)) {
+				if id, ok := method.X.(*ast.Ident); !ok || id.Name != "q" {
+					out = append(out, pin.fn+": "+method.Sel.Name+" must use the transaction queries q")
+				}
+				calls = append(calls, method.Sel.Name)
+			}
+			return true
+		})
+	}
+	if !found {
+		return []string{pin.file + ": no function " + pin.fn}
+	}
+	var gotLocks []string
+	lastLock, firstWrite, writes := -1, len(calls), 0
+	for i, c := range calls {
+		if slices.Contains(pin.locks, c) {
+			gotLocks = append(gotLocks, c)
+			lastLock = i
+		} else {
+			writes++
+			firstWrite = min(firstWrite, i)
+		}
+	}
+	if !slices.Equal(gotLocks, pin.locks) {
+		out = append(out, pin.fn+": locks called "+strings.Join(gotLocks, ", ")+"; want exactly, in order: "+strings.Join(pin.locks, ", "))
+	}
+	if writes == 0 {
+		out = append(out, pin.fn+": calls none of "+strings.Join(pin.writes, ", "))
+	}
+	if writes > 0 && firstWrite < lastLock {
+		out = append(out, pin.fn+": a write is called before the last lock")
+	}
+	return out
+}
+
+func checkCallOrder(t *testing.T, source string, pin callOrderPin, wantOK bool) {
+	t.Helper()
+	got := callOrderViolations(source, pin)
+	if (len(got) == 0) != wantOK {
+		t.Fatalf("%s %s: violations = %v, want ok=%v", pin.file, pin.fn, got, wantOK)
+	}
+}
+
+func TestCustodyCallOrderPinFiresOnItsCanaries(t *testing.T) {
+	pin := callOrderPin{handlerKey, "put", []string{"LockEdit", "LockKey"}, []string{"Insert", "Replace"}}
+	wrap := func(body string) string { return "package handler\nfunc put() {\n" + body + "\n}\n" }
+	for _, c := range []struct {
+		name, body string
+		ok         bool
+	}{
+		{"in order", "q.LockEdit()\nq.LockKey()\nq.Insert()", true},
+		{"either write", "q.LockEdit()\nq.LockKey()\nif x {\nq.Replace()\n} else {\nq.Insert()\n}", true},
+		{"a read between the locks", "q.LockEdit()\nq.Get()\nq.LockKey()\nq.Insert()", true},
+		{"inside a closure", "run(func() {\nq.LockEdit()\nq.LockKey()\nq.Insert()\n})", true},
+		{"key before the definition", "q.LockKey()\nq.LockEdit()\nq.Insert()", false},
+		{"write before the key lock", "q.LockEdit()\nq.Insert()\nq.LockKey()", false},
+		{"no key lock", "q.LockEdit()\nq.Insert()", false},
+		{"no definition lock", "q.LockKey()\nq.Insert()", false},
+		{"no write", "q.LockEdit()\nq.LockKey()", false},
+		{"a lock twice", "q.LockEdit()\nq.LockKey()\nq.LockKey()\nq.Insert()", false},
+		{"a comment is not a call", "q.LockEdit()\n// q.LockKey()\nq.Insert()", false},
+		{"not the transaction queries", "q.LockEdit()\nh.q.LockKey()\nq.Insert()", false},
+	} {
+		t.Run(c.name, func(t *testing.T) { checkCallOrder(t, wrap(c.body), pin, c.ok) })
+	}
+	checkCallOrder(t, "package handler\nfunc other() {}\n", pin, false)
 }
 
 // TestPinnedClassesCarryExactText: a recipient, shared-admin or custody entry without its exact text
