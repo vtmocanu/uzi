@@ -1,6 +1,8 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { NAV_SECTIONS } from "../components/navItems";
 import { parseModuleList } from "./manifest";
+import { mergeModuleNav } from "./nav";
 
 const valid = {
   id: "demo",
@@ -111,5 +113,68 @@ describe("parseModuleList", () => {
   it.each([{}, "x", 3, null])("treats a non-array %j as no modules with one log", (body) => {
     expect(parseModuleList(body)).toEqual([]);
     expect(errors).toHaveBeenCalledTimes(1);
+  });
+
+  describe("navSection", () => {
+    const mods = { ...valid, navGroup: "modules" };
+
+    it.each([
+      ["Tools", "Tools"],
+      ["Tools ", "Tools"],
+      ["é".repeat(24), "é".repeat(24)],
+      ["  " + "x".repeat(24) + "\u3000", "x".repeat(24)],
+      ["\u00a0Tools\u00a0", "Tools"],
+    ])("accepts %j as %j", (raw, want) => {
+      const out = parseModuleList([{ ...mods, navSection: raw }]);
+      expect(out[0].navSection).toBe(want);
+      expect(errors).not.toHaveBeenCalled();
+    });
+
+    it("merges trimmed-equal values into one section", () => {
+      const out = parseModuleList([
+        { ...mods, id: "a", navSection: "Tools" },
+        { ...mods, id: "b", navSection: "Tools " },
+      ]);
+      const merged = mergeModuleNav(NAV_SECTIONS, out);
+      const own = merged.filter((s) => s.id.startsWith("modules"));
+      expect(own.map((s) => s.id)).toEqual(["modules:Tools"]);
+      expect(own[0].items.map((i) => i.key)).toEqual(["module:a", "module:b"]);
+    });
+
+    it.each([
+      ["blank", "   "],
+      ["25 code points", "é".repeat(25)],
+      ["bidi", "\u202eX"],
+      ["control", "a\u0000b"],
+      ["lone surrogate", "\ud800"],
+      ["number", 7],
+      ["null", null],
+    ])("drops an invalid navSection (%s) with one log and keeps the entry", (_n, navSection) => {
+      const out = parseModuleList([{ ...mods, navSection }]);
+      expect(out).toHaveLength(1);
+      expect("navSection" in out[0]).toBe(false);
+      expect(errors).toHaveBeenCalledTimes(1);
+      expect(logged()[0]).toContain("demo");
+      expect(logged()[0]).toContain("navSection");
+    });
+
+    it.each(["work", "factory"])("ignores navSection on %s silently", (navGroup) => {
+      const out = parseModuleList([{ ...valid, navGroup, navSection: "Tools" }]);
+      expect(out).toHaveLength(1);
+      expect("navSection" in out[0]).toBe(false);
+      expect(errors).not.toHaveBeenCalled();
+    });
+
+    it("ignores navSection on an unknown navGroup, with only the navGroup warning", () => {
+      const out = parseModuleList([{ ...valid, navGroup: "sidebar", navSection: "Tools" }]);
+      expect(out).toHaveLength(1);
+      expect(out[0].navGroup).toBe("modules");
+      expect("navSection" in out[0]).toBe(false);
+      expect(errors).toHaveBeenCalledTimes(1);
+      expect(logged()[0]).toContain("navGroup");
+      const ids = mergeModuleNav(NAV_SECTIONS, out).map((s) => s.id);
+      expect(ids).toContain("modules");
+      expect(ids.some((id) => id.startsWith("modules:"))).toBe(false);
+    });
   });
 });
