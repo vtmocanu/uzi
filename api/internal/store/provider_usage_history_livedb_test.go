@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -286,34 +287,74 @@ func TestAnthropicUsageCopyFencesLiveDB(t *testing.T) {
 	}
 }
 
+// admissionWindowCases pins the exact bounds of both copies' admission window,
+// `> now() - interval '1 hour'` and `<= now() + interval '15 minutes'` (issue #4755). Each
+// case runs its timestamp setup and its copy in ONE transaction, so now() (the transaction
+// start time) is the same instant in both and the boundary cases are exact: a `>=` lower
+// bound admits the exact -1 hour case, a `<` upper bound rejects the exact +15 minutes case.
+// The interval literals are single-field on purpose: PostgreSQL signs each field of an
+// interval literal separately, so '-59 minutes 59 seconds' means -00:58:01. wantMicros is
+// the offset each literal must produce, checked against the database so a sign slip fails.
+var admissionWindowCases = []struct {
+	name       string
+	offset     string
+	wantMicros int64
+	want       int64
+}{
+	{"exactly now()-1h", "-1 hour", -3_600_000_000, 0},
+	{"1µs inside now()-1h", "-3599.999999 seconds", -3_599_999_999, 1},
+	{"older than 1h", "-61 minutes", -3_660_000_000, 0},
+	{"exactly now()+15min", "15 minutes", 900_000_000, 1},
+	{"1µs past now()+15min", "15 minutes 0.000001 seconds", 900_000_001, 0},
+}
+
+// admissionTx opens the per-case transaction. The rollback cleanup is registered after the
+// fixture's pool.Close cleanup, so it runs first and a t.Fatal mid-transaction cannot leave
+// pool.Close waiting on the acquired connection.
+func admissionTx(ctx context.Context, t *testing.T, pool *pgxpool.Pool) pgx.Tx {
+	t.Helper()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	t.Cleanup(func() { _ = tx.Rollback(context.Background()) })
+	return tx
+}
+
+// assertAdmissionOffset checks, in the case's transaction, that ts sits exactly wantMicros
+// from now().
+func assertAdmissionOffset(ctx context.Context, t *testing.T, tx pgx.Tx, name string, ts time.Time, wantMicros int64) {
+	t.Helper()
+	var got int64
+	if err := tx.QueryRow(ctx, `SELECT (extract(epoch FROM ($1::timestamptz - now())) * 1000000)::bigint`, ts).Scan(&got); err != nil {
+		t.Fatalf("%s: offset: %v", name, err)
+	}
+	if got != wantMicros {
+		t.Fatalf("%s: timestamp is %dµs from now(), want %dµs", name, got, wantMicros)
+	}
+}
+
 func TestAnthropicUsageCopyAdmissionWindowLiveDB(t *testing.T) {
 	ctx, pool, q, user := rateLimitEnablementDB(t)
-	// dbNow is the database clock, microsecond precision.
-	dbNow := func(offset string) time.Time {
-		var ts time.Time
-		if err := pool.QueryRow(ctx, `SELECT date_trunc('microseconds', now() + $1::interval)`, offset).Scan(&ts); err != nil {
-			t.Fatal(err)
-		}
-		return ts.UTC()
-	}
-	for _, tc := range []struct {
-		name   string
-		offset string
-		want   int64
-	}{
-		{"just inside now()-1h", "-59 minutes 59 seconds", 1},
-		{"exactly now()-1h (the database clock has moved on by the time of the copy)", "-1 hour", 0},
-		{"older than 1h", "-61 minutes", 0},
-		{"just inside now()+15min", "14 minutes 50 seconds", 1},
-		{"above now()+15min", "16 minutes", 0},
-	} {
+	for _, tc := range admissionWindowCases {
 		// A fresh token per case: a shared token would let the same-bucket ON CONFLICT turn an
 		// expected-0 case green even with an admission guard removed.
 		sec := enablementToken(ctx, t, q, user, "window-"+uuid.NewString(), false)
 		rev := tokenRev(ctx, t, q, user, sec)
-		p := anthGauge(ctx, t, q, user, sec, rev, dbNow(tc.offset), nil)
-		if n := copyAnth(ctx, t, q, p); n != tc.want {
+
+		tx := admissionTx(ctx, t, pool)
+		qtx := q.WithTx(tx)
+		var ts time.Time
+		if err := tx.QueryRow(ctx, `SELECT now() + $1::interval`, tc.offset).Scan(&ts); err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		assertAdmissionOffset(ctx, t, tx, tc.name, ts, tc.wantMicros)
+		p := anthGauge(ctx, t, qtx, user, sec, rev, ts.UTC(), nil)
+		if n := copyAnth(ctx, t, qtx, p); n != tc.want {
 			t.Errorf("%s: copy = %d rows, want %d", tc.name, n, tc.want)
+		}
+		if err := tx.Rollback(ctx); err != nil {
+			t.Fatalf("%s: rollback: %v", tc.name, err)
 		}
 	}
 }
@@ -572,26 +613,24 @@ func TestCodexUsageCopyFencesLiveDB(t *testing.T) {
 
 func TestCodexUsageCopyAdmissionWindowLiveDB(t *testing.T) {
 	ctx, pool, q, user := codexLiveDB(t)
-	for _, tc := range []struct {
-		name   string
-		offset string
-		want   int64
-	}{
-		{"just inside now()-1h", "-59 minutes 59 seconds", 1},
-		{"exactly now()-1h (the database clock has moved on by the time of the copy)", "-1 hour", 0},
-		{"older than 1h", "-61 minutes", 0},
-		{"just inside now()+15min", "14 minutes 50 seconds", 1},
-		{"above now()+15min", "16 minutes", 0},
-	} {
+	for _, tc := range admissionWindowCases {
+		// A fresh account per case, written on the pool; only the timestamp move and the copy
+		// share the case's transaction (see admissionWindowCases).
 		f := codexGauge(ctx, t, pool, q, user, `[]`)
+
+		tx := admissionTx(ctx, t, pool)
 		var ts time.Time
-		if err := pool.QueryRow(ctx, `UPDATE codex_account_rate_limits
-			SET last_success_at = date_trunc('microseconds', now() + $3::interval), last_attempt_at = date_trunc('microseconds', now() + $3::interval)
+		if err := tx.QueryRow(ctx, `UPDATE codex_account_rate_limits
+			SET last_success_at = now() + $3::interval, last_attempt_at = now() + $3::interval
 			WHERE user_id = $1 AND provider_account_id = $2 RETURNING last_success_at`, user, f.acc, tc.offset).Scan(&ts); err != nil {
-			t.Fatal(err)
+			t.Fatalf("%s: %v", tc.name, err)
 		}
-		if n := copyCodex(ctx, t, q, f.p, tsz(ts)); n != tc.want {
+		assertAdmissionOffset(ctx, t, tx, tc.name, ts, tc.wantMicros)
+		if n := copyCodex(ctx, t, q.WithTx(tx), f.p, tsz(ts)); n != tc.want {
 			t.Errorf("%s: copy = %d rows, want %d", tc.name, n, tc.want)
+		}
+		if err := tx.Rollback(ctx); err != nil {
+			t.Fatalf("%s: rollback: %v", tc.name, err)
 		}
 	}
 }
