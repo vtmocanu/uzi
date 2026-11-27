@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -44,6 +45,9 @@ func TestScanModuleDocRejects(t *testing.T) {
 		"underflow":                    wrap(`[1e-400]`),
 		"depth 10001":                  wrap(strings.Repeat("[", 10001) + strings.Repeat("]", 10001)),
 		"dup earlier ok but last null": `{"data":1,"data":null,"expected_revision":null}`,
+		"invalid utf8 in rev":          "{\"data\":1,\"expected_revision\":\"a\xffb\"}",
+		"invalid utf8 in dup data":     "{\"data\":\"a\xffb\",\"data\":1,\"expected_revision\":null}",
+		"invalid utf8 in key":          "{\"da\xffta\":1,\"data\":1,\"expected_revision\":null}",
 	}
 	for name, body := range cases {
 		if _, err := scanModuleDoc([]byte(body)); err == nil {
@@ -186,6 +190,28 @@ func FuzzScanModuleDoc(f *testing.F) {
 		}
 		if !reflect.DeepEqual(orig, out) {
 			t.Fatalf("rewrite changed value: %q -> %q", m["data"], doc.data)
+		}
+		// Byte-level: only zero literals may change, each replaced by exactly "0".
+		var win docMember
+		for _, mem := range members {
+			if k, _ := decodeKey(body, mem.key); k == "data" {
+				win = mem
+			}
+		}
+		var rebuilt []byte
+		pos := win.val.start
+		for _, n := range win.nums {
+			f, _ := strconv.ParseFloat(string(body[n.start:n.end]), 64)
+			if f != 0 {
+				continue
+			}
+			rebuilt = append(rebuilt, body[pos:n.start]...)
+			rebuilt = append(rebuilt, '0')
+			pos = n.end
+		}
+		rebuilt = append(rebuilt, body[pos:win.val.end]...)
+		if !bytes.Equal(rebuilt, doc.data) {
+			t.Fatalf("rewrite touched more than zero literals: %q -> %q (want %q)", body[win.val.start:win.val.end], doc.data, rebuilt)
 		}
 	})
 }

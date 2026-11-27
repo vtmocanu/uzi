@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"strconv"
+	"unicode/utf8"
 )
 
 // maxModuleDocDepth is the deepest array/object nesting a stored value may have,
@@ -202,6 +203,11 @@ func decodeKey(b []byte, s span) (string, error) {
 // scanModuleDoc validates a PUT body {"data":<json>,"expected_revision":<string|null>}
 // and builds the outgoing data bytes.
 func scanModuleDoc(b []byte) (*scannedModuleDoc, error) {
+	// json.Valid accepts invalid UTF-8 inside strings and Unmarshal would silently
+	// replace it in expected_revision, so reject it anywhere in the body up front.
+	if !utf8.Valid(b) {
+		return nil, errBody()
+	}
 	members, err := scanWrapper(b)
 	if err != nil {
 		return nil, err

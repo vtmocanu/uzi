@@ -2,6 +2,7 @@ package handler
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -35,7 +37,20 @@ func newMDEnv(t *testing.T) (*mdEnv, func() uuid.UUID, func(uuid.UUID) string) {
 	user := cliSeedUser(t, pool, false)
 	e := &mdEnv{h: h, router: router, pool: pool, user: user, jwt: cliMintJWT(t, pool, user)}
 	newUser := func() uuid.UUID { return cliSeedUser(t, pool, false) }
-	jwtFor := func(u uuid.UUID) string { return cliMintJWT(t, pool, u) }
+	// A distinct TTL per call makes every minted cookie differ even within one second.
+	var seq int
+	jwtFor := func(u uuid.UUID) string {
+		var ver int32
+		if err := pool.QueryRow(context.Background(), `SELECT token_version FROM users WHERE id = $1`, u).Scan(&ver); err != nil {
+			t.Fatalf("read token_version: %v", err)
+		}
+		seq++
+		tok, err := auth.IssueToken(cliTestSecret, u.String(), ver, time.Hour+time.Duration(seq)*time.Minute)
+		if err != nil {
+			t.Fatalf("IssueToken: %v", err)
+		}
+		return tok
+	}
 	return e, newUser, jwtFor
 }
 
@@ -112,6 +127,9 @@ func TestModuleUserDataLifecycleLiveDB(t *testing.T) {
 	// AC2: first save, readable from a second session.
 	r1 := e.put(t, e.jwt, "notes", `{"a":[1,2]}`, "null")
 	second := jwtFor(e.user)
+	if second == e.jwt {
+		t.Fatalf("second session cookie is identical to the first")
+	}
 	g := e.get(t, second, "notes")
 	if g.Revision == nil || *g.Revision != r1 || string(g.Data) != `{"a": [1, 2]}` {
 		t.Errorf("second session read: %+v data %s", g, g.Data)
@@ -135,8 +153,10 @@ func TestModuleUserDataLifecycleLiveDB(t *testing.T) {
 	// AC5: another user's view and attempts.
 	other := newUser()
 	oj := jwtFor(other)
-	if g := e.get(t, oj, "notes"); g.Revision != nil {
-		t.Errorf("user B sees A's doc: %+v", g)
+	rec = e.do(t, oj, "GET", mdPath("notes"), "")
+	wantStatus(t, "B get", rec, 200)
+	if rec.Body.String() != `{"data":null,"revision":null}`+"\n" {
+		t.Errorf("user B sees A's doc: %q", rec.Body.String())
 	}
 	rec = e.do(t, oj, "PUT", mdPath("notes"), mdBody(`9`, `"`+r2+`"`))
 	wantStatus(t, "B put with A's revision", rec, 409)
@@ -145,6 +165,38 @@ func TestModuleUserDataLifecycleLiveDB(t *testing.T) {
 	}
 	rec = e.do(t, oj, "DELETE", mdPath("notes")+"?expected_revision="+r2, "")
 	wantStatus(t, "B delete with A's revision", rec, 409)
+	if strings.TrimSpace(rec.Body.String()) != `{"revision":null}` {
+		t.Errorf("B delete conflict body %q", rec.Body.String())
+	}
+
+	// B's cookie plus a conflicting identity (query and header naming A) still acts as B.
+	spoof := "?user_id=" + e.user.String()
+	spoofDo := func(method, path, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: oj}) //nolint:gosec // G124: test-only client cookie on an httptest request.
+		req.Header.Set("X-User-ID", e.user.String())
+		if method != "GET" {
+			req.Header.Set(auth.CSRFHeaderName, cliCSRFHeader(t, oj))
+		}
+		rec := httptest.NewRecorder()
+		e.router.ServeHTTP(rec, req)
+		return rec
+	}
+	rec = spoofDo("GET", mdPath("notes")+spoof, "")
+	wantStatus(t, "spoofed get", rec, 200)
+	if rec.Body.String() != `{"data":null,"revision":null}`+"\n" {
+		t.Errorf("spoofed get leaked A: %q", rec.Body.String())
+	}
+	rec = spoofDo("PUT", mdPath("notes")+spoof, mdBody(`9`, `"`+r2+`"`))
+	wantStatus(t, "spoofed put", rec, 409)
+	if strings.TrimSpace(rec.Body.String()) != `{"revision":null}` {
+		t.Errorf("spoofed put body %q", rec.Body.String())
+	}
+	rec = spoofDo("DELETE", mdPath("notes")+spoof+"&expected_revision="+r2, "")
+	wantStatus(t, "spoofed delete", rec, 409)
+	if strings.TrimSpace(rec.Body.String()) != `{"revision":null}` {
+		t.Errorf("spoofed delete body %q", rec.Body.String())
+	}
 	if g := e.get(t, e.jwt, "notes"); g.Revision == nil || *g.Revision != r2 || string(g.Data) != `2` {
 		t.Errorf("A changed: %+v", g)
 	}
@@ -226,32 +278,36 @@ func TestModuleUserDataGetShapeLiveDB(t *testing.T) {
 func TestModuleUserDataRejectsLiveDB(t *testing.T) {
 	e, _, _ := newMDEnv(t)
 	bad := map[string]string{
-		"missing data":    `{"expected_revision":null}`,
-		"missing rev":     `{"data":1}`,
-		"null data":       mdBody(`null`, `null`),
-		"upper DATA":      `{"DATA":1,"expected_revision":null}`,
-		"upper REV":       `{"data":1,"EXPECTED_REVISION":null}`,
-		"numeric rev":     mdBody(`1`, `5`),
-		"object rev":      mdBody(`1`, `{}`),
-		"extra key":       `{"data":1,"expected_revision":null,"x":1}`,
-		"top null":        `null`,
-		"top array":       `[1]`,
-		"top string":      `"x"`,
-		"bom":             "\xef\xbb\xbf" + mdBody(`1`, `null`),
-		"doubled comma":   `{"data":1,,"expected_revision":null}`,
-		"after brace":     mdBody(`1`, `null`) + ` x`,
-		"malformed":       `{"data":`,
-		"nul nested":      mdBody(`{"a":"\u0000"}`, `null`),
-		"nul in key":      mdBody(`{"\u0000":1}`, `null`),
-		"lone surrogate":  mdBody(`"\ud800"`, `null`),
-		"invalid utf8":    mdBody("\"a\xffb\"", `null`),
-		"huge fraction":   mdBody(`1.`+strings.Repeat("1", 20000), `null`),
-		"overflow":        mdBody(`1e309`, `null`),
-		"neg overflow":    mdBody(`-1e309`, `null`),
-		"underflow":       mdBody(`1e-400`, `null`),
-		"depth 10001":     mdBody(strings.Repeat("[", 10001)+strings.Repeat("]", 10001), `null`),
-		"empty":           ``,
-		"whitespace only": "  \n",
+		"missing data":     `{"expected_revision":null}`,
+		"missing rev":      `{"data":1}`,
+		"null data":        mdBody(`null`, `null`),
+		"upper DATA":       `{"DATA":1,"expected_revision":null}`,
+		"upper REV":        `{"data":1,"EXPECTED_REVISION":null}`,
+		"numeric rev":      mdBody(`1`, `5`),
+		"object rev":       mdBody(`1`, `{}`),
+		"extra key":        `{"data":1,"expected_revision":null,"x":1}`,
+		"top null":         `null`,
+		"top array":        `[1]`,
+		"top string":       `"x"`,
+		"bom":              "\xef\xbb\xbf" + mdBody(`1`, `null`),
+		"doubled comma":    `{"data":1,,"expected_revision":null}`,
+		"after brace":      mdBody(`1`, `null`) + ` x`,
+		"malformed":        `{"data":`,
+		"nul nested":       mdBody(`{"a":"\u0000"}`, `null`),
+		"nul in key":       mdBody(`{"\u0000":1}`, `null`),
+		"lone surrogate":   mdBody(`"\ud800"`, `null`),
+		"invalid utf8":     mdBody("\"a\xffb\"", `null`),
+		"huge fraction":    mdBody(`1.`+strings.Repeat("1", 20000), `null`),
+		"overflow":         mdBody(`1e309`, `null`),
+		"neg overflow":     mdBody(`-1e309`, `null`),
+		"underflow":        mdBody(`1e-400`, `null`),
+		"depth 10001":      mdBody(strings.Repeat("[", 10001)+strings.Repeat("]", 10001), `null`),
+		"empty":            ``,
+		"whitespace only":  "  \n",
+		"missing comma":    `{"data":1 "expected_revision":null}`,
+		"trailing value":   mdBody(`1`, `null`) + `{}`,
+		"wrong keys":       `{"x":1,"y":2}`,
+		"invalid utf8 rev": "{\"data\":1,\"expected_revision\":\"a\xffb\"}",
 	}
 	for name, body := range bad {
 		rec := e.do(t, e.jwt, "PUT", mdPath("rej"), body)
@@ -279,10 +335,32 @@ func TestModuleUserDataRejectsLiveDB(t *testing.T) {
 	}
 }
 
+func TestModuleUserDataDuplicateDataLiveDB(t *testing.T) {
+	e, _, _ := newMDEnv(t)
+	// Invalid UTF-8 in an overridden earlier data member is still a 400, stores nothing.
+	rec := e.do(t, e.jwt, "PUT", mdPath("dup"), "{\"data\":\"a\xffb\",\"data\":1,\"expected_revision\":null}")
+	wantStatus(t, "invalid utf8 in overridden data", rec, 400)
+	if g := e.get(t, e.jwt, "dup"); g.Revision != nil {
+		t.Errorf("a rejected body stored a document: %+v", g)
+	}
+	// An earlier duplicate whose value overflows is irrelevant: the last data wins.
+	rec = e.do(t, e.jwt, "PUT", mdPath("dup"), `{"data":[1e400],"data":1,"expected_revision":null}`)
+	wantStatus(t, "overflowing overridden data", rec, 200)
+	if g := e.get(t, e.jwt, "dup"); g.Revision == nil || string(g.Data) != `1` {
+		t.Errorf("read back %+v data %s, want 1", g, g.Data)
+	}
+}
+
+func TestModuleUserDataCapConstant(t *testing.T) {
+	if store.MaxModuleUserDocuments != 32 {
+		t.Errorf("MaxModuleUserDocuments = %d, want 32", store.MaxModuleUserDocuments)
+	}
+}
+
 func TestModuleUserDataCapLiveDB(t *testing.T) {
 	e, _, _ := newMDEnv(t)
 	revs := map[string]string{}
-	for i := 0; i < store.MaxModuleUserDocuments; i++ {
+	for i := 0; i < 32; i++ {
 		m := fmt.Sprintf("m%d", i)
 		revs[m] = e.put(t, e.jwt, m, `1`, "null")
 	}
@@ -320,8 +398,8 @@ func TestModuleUserDataZeroRewriteAndDepthLiveDB(t *testing.T) {
 		t.Fatalf("deep body shape")
 	}
 	data := b[len(prefix):i]
-	if !json.Valid(data) || len(bytes.TrimSpace(data)) < 20000 {
-		t.Errorf("deep data not valid JSON of depth 10000 (len %d)", len(data))
+	if string(data) != deep {
+		t.Errorf("deep read-back differs from the array sent (len %d, want %d)", len(data), len(deep))
 	}
 	wantStatus(t, "depth 10001", e.do(t, e.jwt, "PUT", mdPath("deep"), mdBody(strings.Repeat("[", 10001)+strings.Repeat("]", 10001), `null`)), 400)
 }
@@ -423,6 +501,8 @@ func TestModuleUserDataSizeCapLiveDB(t *testing.T) {
 	under := strings.Repeat(" ", 1000)
 	wantStatus(t, "under cap valid+ws", e.do(t, e.jwt, "PUT", mdPath("padded"), valid+under), 200)
 	wantStatus(t, "under cap malformed", e.do(t, e.jwt, "PUT", mdPath("padded2"), `{,`+under), 400)
+	wantStatus(t, "under cap trailing value", e.do(t, e.jwt, "PUT", mdPath("padded2"), valid+under+`1`), 400)
+	wantStatus(t, "under cap wrong keys", e.do(t, e.jwt, "PUT", mdPath("padded2"), `{"x":1}`+under), 400)
 }
 
 func TestModuleUserDataAuthBoundaryLiveDB(t *testing.T) {
