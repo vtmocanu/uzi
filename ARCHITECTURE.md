@@ -609,7 +609,7 @@ selected but unusable source refuses (`provider_source_unusable`). Rows still re
 code: `checker_unavailable`): a Claude checker under a provider-bound lead or a selected Claude source; a
 Codex checker with no Codex source when the lead is provider-bound or a Claude source is selected (CV/XV and
 CP/XV, lifted by a follow-up slice, #4762); and Codex-lead checks for owners with both sources until #4322 M2.
-A claim needs `codex_provider_checker_v1` (migration 00549, draft number), a custody of exactly one Codex
+A claim needs `codex_provider_checker_v1` (migration 00554), a custody of exactly one Codex
 credential source, and every provider-bound checker claim takes the lead lock first, so a provider refusal on
 a checker child settles the check `checker_unavailable` and never parks the child. At code-stage creation the
 lead's worker must advertise the capability (the checker runs there), else the check fails fast; at the plan

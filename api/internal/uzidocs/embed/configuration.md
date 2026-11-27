@@ -310,7 +310,7 @@ wake and the old-image reap of an ephemeral worker. Consequences to plan for:
 - **Codex provider cross-check checkers (#4574).** A plan or code cross-check whose Codex checker runs on the
   owner's Codex source needs the worker capability `codex_provider_checker_v1` on top of the Codex provider
   capabilities, advertised by workers that run the Codex harness with cross-check slots. It gates claim and
-  placement (migration 00549 replaces `fn_placement_admitting_workers`; the number is a draft until landing).
+  placement (migration 00554 replaces `fn_placement_admitting_workers`).
   Roll the api first: an older worker lacks the capability, so at the code stage (where the checker runs on
   the lead's worker) the check fails fast as `checker_unavailable`, and at the plan stage the checker waits up
   to its deadline for a capable worker, then the plan takes the human gate. Workers rolled first leave the
