@@ -1008,8 +1008,9 @@ func TestPRHistoryPrelockedDeleteOrderLiveDB(t *testing.T) {
 
 // TestPRHistoryCrossCheckChildDeleteDeadlockLiveDB races a watcher observation against a repo
 // delete and checks both victim choices. Each case sets explicit per-transaction
-// deadlock_timeout values with SET LOCAL, so victim selection and every wait are bounded and
-// independent of the server's deadlock_timeout.
+// deadlock_timeout values with SET LOCAL, so the victim-selection delay is short and independent
+// of the server's default deadlock_timeout. (Fixture setup and several post-race assertions run
+// outside the race's 90s context and are not covered by that bound.)
 //
 // Privilege: deadlock_timeout is a superuser-only (PGC_SUSET) parameter, so SET LOCAL needs a
 // superuser connection or the SET privilege on it (PostgreSQL 15+, including 17:
@@ -1068,7 +1069,7 @@ func TestPRHistoryCrossCheckChildDeleteDeadlockLiveDB(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()
 		f := fx.f
-		// Both actors use the same short session deadlock_timeout, so the wait below is bounded
+		// Both actors use the same short transaction-local deadlock_timeout, so the wait below is bounded
 		// whatever the server's deadlock_timeout is.
 		const dt = time.Second
 		const dtSetting = "1s"
