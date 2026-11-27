@@ -4,6 +4,7 @@
 
 import { useMemo } from "react";
 import { NAV_SECTIONS, type NavDef, type NavSection } from "../components/navItems";
+import { moduleMotionKey } from "../components/sidebarMotion";
 import { moduleIcon } from "./icons";
 import type { ModuleEntry } from "./manifest";
 import { useModules } from "./registry";
@@ -14,6 +15,7 @@ function navDefOf(m: ModuleEntry): NavDef {
     label: m.label,
     to: `/m/${m.id}`,
     icon: moduleIcon(m.icon),
+    motionKey: moduleMotionKey(m.icon),
     adminOnly: m.adminOnly || undefined,
   };
 }

@@ -8,7 +8,8 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { MemoryRouter, useNavigate, type NavigateFunction } from "react-router-dom";
 import { NavItem } from "./AppShell";
 import { NAV_SECTIONS, type NavDef } from "./navItems";
-import { SIDEBAR_MOTION_ICONS } from "./sidebarMotion";
+import { MODULE_MOTION_ICONS, SIDEBAR_MOTION_ICONS, moduleMotionKey } from "./sidebarMotion";
+import { MODULE_ICON_NAMES, moduleIcon, type ModuleIconName } from "../modules/icons";
 import { ClockIcon } from "./icons";
 import type { HealthDoc } from "../lib/api";
 
@@ -17,6 +18,15 @@ import type { HealthDoc } from "../lib/api";
 // (gating, one-shot restart, stationary geometry, rest pixels) is proven here.
 
 const DEFS: NavDef[] = NAV_SECTIONS.flatMap((s) => s.items);
+// Issue #4777: one runtime-module-shaped entry per vocabulary icon (key module:<id>, static
+// icon, motion key module-<icon>), as modules/nav.ts builds them.
+const MODULE_DEFS: NavDef[] = MODULE_ICON_NAMES.map((name) => ({
+  key: `module:x-${name}`,
+  label: `Module ${name}`,
+  to: `/m/x-${name}`,
+  icon: moduleIcon(name),
+  motionKey: moduleMotionKey(name),
+}));
 type Rail = "expanded" | "collapsed";
 const RAILS: Rail[] = ["expanded", "collapsed"];
 const PLAY = "nm-play";
@@ -79,7 +89,7 @@ function row(def: NavDef, rail: Rail, extra: Record<string, unknown> = {}): Reac
       to={def.to}
       label={def.label}
       icon={def.icon}
-      motionKey={def.key}
+      motionKey={def.motionKey ?? def.key}
       exactOnly={def.exactOnly}
       collapsed={rail === "collapsed"}
       {...extra}
@@ -97,7 +107,7 @@ function shell(children: ReactElement): ReactElement {
 }
 
 function mount(key: string, rail: Rail, extra: Record<string, unknown> = {}) {
-  const def = DEFS.find((d) => d.key === key)!;
+  const def = [...DEFS, ...MODULE_DEFS].find((d) => d.key === key)!;
   const utils = render(shell(row(def, rail, extra)));
   const link = utils.container.querySelector("a") as HTMLAnchorElement;
   const svg = link.querySelector("svg[data-nav-motion]") as SVGSVGElement;
@@ -437,7 +447,6 @@ async function rasterize(markup: string): Promise<Uint8ClampedArray> {
   const svg = holder.querySelector("svg")!;
   svg.setAttribute("width", String(SIZE));
   svg.setAttribute("height", String(SIZE));
-  svg.setAttribute("stroke", "rgb(26, 43, 60)");
   svg.setAttribute("style", "color: rgb(26, 43, 60)");
   const xml = new XMLSerializer().serializeToString(svg);
   const url = URL.createObjectURL(new Blob([xml], { type: "image/svg+xml;charset=utf-8" }));
@@ -591,5 +600,269 @@ describe("stationary geometry while a part moves", () => {
       expect(box(el), `body bbox ${i}`).toEqual(before[i]);
     });
     for (const leg of legs) expect(getComputedStyle(leg).transform).not.toBe("none");
+  });
+});
+
+// The same gestures for runtime module entries (issue #4777), one per vocabulary icon.
+describe.each(RAILS)("%s rail: module entries animate like built-in entries", (rail) => {
+  it("hover and focus start nothing; click plays within 0.7s-1.8s", { timeout: 120000 }, async () => {
+    for (const def of MODULE_DEFS) {
+      const m = mount(def.key, rail);
+      expect(m.svg.getAttribute("data-nav-motion"), `${def.key} motion key`).toBe(def.motionKey);
+      expect(cssAnims(m.svg), `${def.key} baseline`).toHaveLength(0);
+      await hover(m.link);
+      await userEvent.tab();
+      expect(document.activeElement, `${def.key} focus lands on the link`).toBe(m.link);
+      await frames();
+      expect(allAnims(m.svg), `${def.key} hover and focus start nothing`).toHaveLength(0);
+      m.link.click();
+      const first = cssAnims(m.svg);
+      expect(first.length, `${def.key} click`).toBeGreaterThan(0);
+      let total = 0;
+      for (const a of first) {
+        const t = a.effect!.getComputedTiming();
+        expect(t.fill, `${def.key} fill`).toBe("none");
+        expect(Number.isFinite(Number(t.endTime)), `${def.key} infinite`).toBe(true);
+        total = Math.max(total, Number(t.endTime));
+      }
+      expect(total, `${def.key} total`).toBeGreaterThanOrEqual(700);
+      expect(total, `${def.key} total`).toBeLessThanOrEqual(1800);
+      cleanup();
+      await userEvent.unhover(document.body);
+    }
+  });
+
+  it("Enter on a focused module row plays (real key press) and a second Enter restarts", { timeout: 120000 }, async () => {
+    for (const def of MODULE_DEFS) {
+      const m = mount(def.key, rail);
+      await userEvent.tab();
+      expect(document.activeElement, `${def.key} focus lands on the link`).toBe(m.link);
+      expect(cssAnims(m.svg), `${def.key} baseline`).toHaveLength(0);
+      await userEvent.keyboard("{Enter}");
+      const before = cssAnims(m.svg);
+      expect(before.length, `${def.key} Enter plays`).toBeGreaterThan(0);
+      seek(m.svg, 350);
+      await userEvent.keyboard("{Enter}");
+      const after = cssAnims(m.svg).filter((a) => a.playState === "running");
+      expect(after.length, `${def.key} Enter restarted`).toBeGreaterThan(0);
+      for (const a of after) {
+        expect(before.includes(a), `${def.key} Enter replaced`).toBe(false);
+        expect(Number(a.currentTime), `${def.key} Enter restarted at zero`).toBeLessThan(300);
+      }
+      cleanup();
+      await userEvent.unhover(document.body);
+    }
+  });
+
+  // Pointer and keyboard halves, shared by the setting-off and reduced-motion cases.
+  async function expectNoModuleMotion() {
+    for (const def of MODULE_DEFS) {
+      const m = mount(def.key, rail);
+      await hover(m.link);
+      m.link.click();
+      await userEvent.click(m.link);
+      expect(allAnims(m.svg), `${def.key} pointer`).toHaveLength(0);
+      expect(m.svg.classList.contains(PLAY), `${def.key} pointer class`).toBe(false);
+      const { x, y } = pagePoint(m.link);
+      await cdp().send("Input.dispatchMouseEvent", { type: "mouseMoved", x, y });
+      await cdp().send("Input.dispatchMouseEvent", { type: "mousePressed", x, y, button: "left", clickCount: 1 });
+      try {
+        expect(m.link.matches(":active"), `${def.key} link is :active`).toBe(true);
+        expect(getComputedStyle(m.svg).transform, `${def.key} held`).toBe("none");
+        expect(allAnims(m.svg), `${def.key} held animations`).toHaveLength(0);
+      } finally {
+        await cdp().send("Input.dispatchMouseEvent", { type: "mouseReleased", x, y, button: "left", clickCount: 1 });
+      }
+      cleanup();
+      await userEvent.unhover(document.body);
+
+      const k = mount(def.key, rail);
+      k.link.focus();
+      expect(document.activeElement, `${def.key} keyboard focus`).toBe(k.link);
+      let clicks = 0;
+      k.link.addEventListener("click", () => {
+        clicks++;
+      });
+      await userEvent.keyboard("{Enter}");
+      expect(clicks, `${def.key} Enter activated the link`).toBe(1);
+      expect(allAnims(k.svg), `${def.key} keyboard`).toHaveLength(0);
+      expect(k.svg.classList.contains(PLAY), `${def.key} keyboard class`).toBe(false);
+      cleanup();
+      await userEvent.unhover(document.body);
+    }
+  }
+
+  it("plays nothing with data-motion off", { timeout: 180000 }, async () => {
+    setMotion("off");
+    await expectNoModuleMotion();
+  });
+
+  it("plays nothing under prefers-reduced-motion", { timeout: 180000 }, async () => {
+    await emulateReducedMotion(true);
+    await expectNoModuleMotion();
+  });
+});
+
+describe("module twins share the built-in's motion (issue #4777)", () => {
+  const PAIRS: Array<[string, ModuleIconName]> = [
+    ["runs", "activity"],
+    ["repos", "board"],
+    ["docs", "book"],
+    ["agents", "bot"],
+    ["findings", "bug"],
+    ["chat", "chat"],
+    ["schedules", "clock"],
+    ["settings", "gear"],
+    ["overview", "home"],
+    ["judge", "scale"],
+    ["workers", "server"],
+    ["admin", "shield"],
+    ["skills", "skill"],
+  ];
+  const tuples = (svg: Element) =>
+    cssAnims(svg)
+      .map((a) => {
+        const t = a.effect!.getComputedTiming();
+        const target = (a.effect as KeyframeEffect).target as Element;
+        return JSON.stringify([target.getAttribute("class"), a.animationName, t.duration, t.iterations, t.delay, t.endTime]);
+      })
+      .sort();
+
+  it("each reused module icon runs the same animations as its built-in destination", { timeout: 120000 }, async () => {
+    for (const [builtin, name] of PAIRS) {
+      const b = mount(builtin, "expanded");
+      b.link.click();
+      const builtinTuples = tuples(b.svg);
+      expect(builtinTuples.length, `${builtin} plays`).toBeGreaterThan(0);
+      cleanup();
+      const mod = mount(`module:x-${name}`, "expanded");
+      mod.link.click();
+      expect(tuples(mod.svg), `${name} vs ${builtin}`).toEqual(builtinTuples);
+      cleanup();
+      await userEvent.unhover(document.body);
+    }
+  });
+});
+
+describe("module glyph rest geometry (issue #4777)", () => {
+  it("each module twin has the vocabulary glyph's root attributes and rasterizes pixel-identically", { timeout: 60000 }, async () => {
+    const parse = (markup: string) => {
+      const holder = document.createElement("div");
+      holder.innerHTML = markup;
+      return holder.querySelector("svg")!;
+    };
+    for (const name of MODULE_ICON_NAMES) {
+      const origMarkup = renderToStaticMarkup(moduleIcon(name) as ReactElement);
+      const twinMarkup = renderToStaticMarkup(MODULE_MOTION_ICONS[name]());
+      const o = parse(origMarkup);
+      const t = parse(twinMarkup);
+      for (const attr of ["viewBox", "width", "height", "fill", "stroke", "stroke-width", "stroke-linecap", "stroke-linejoin"]) {
+        expect(t.getAttribute(attr), `${name} ${attr}`).toBe(o.getAttribute(attr));
+      }
+      const a = await rasterize(origMarkup);
+      const b = await rasterize(twinMarkup);
+      let inked = 0;
+      for (let i = 0; i < a.length; i += 4) if (a[i] !== 255 || a[i + 1] !== 255 || a[i + 2] !== 255) inked++;
+      expect(inked, `${name} draws something`).toBeGreaterThan(50);
+      let mismatch = -1;
+      for (let i = 0; i < a.length; i++) {
+        if (a[i] !== b[i]) {
+          mismatch = i;
+          break;
+        }
+      }
+      const detail = mismatch < 0 ? "" : `byte ${mismatch}: original ${a[mismatch]} vs twin ${b[mismatch]}`;
+      expect(detail, `${name} rest pixels`).toBe("");
+    }
+  });
+});
+
+describe("chart-line motion timing (issue #4777)", () => {
+  const q = (svg: Element, sel: string) => svg.querySelector(sel) as SVGGraphicsElement;
+  const opacity = (el: Element) => getComputedStyle(el).opacity;
+  const num = (v: string) => Number.parseFloat(v);
+
+  // Rasterize the live svg with the computed paint state of each part inlined (the stylesheet
+  // does not travel into an image), the dot omitted so only the trace is counted.
+  async function traceInk(svg: SVGSVGElement): Promise<number> {
+    const clone = svg.cloneNode(true) as SVGSVGElement;
+    const live = Array.from(svg.children) as SVGGraphicsElement[];
+    Array.from(clone.children).forEach((child, i) => {
+      const cs = getComputedStyle(live[i]!);
+      if (live[i]!.classList.contains("nm-dot")) {
+        child.setAttribute("style", "display:none");
+        return;
+      }
+      child.setAttribute("style", `opacity:${cs.opacity};stroke-dasharray:${cs.strokeDasharray};stroke-dashoffset:${cs.strokeDashoffset}`);
+    });
+    const px = await rasterize(clone.outerHTML);
+    const s = SIZE / 24;
+    let inked = 0;
+    for (let y = Math.round(7 * s); y < Math.round(16 * s); y++) {
+      for (let x = Math.round(6 * s); x < Math.round(20 * s); x++) {
+        const i = (y * SIZE + x) * 4;
+        if (px[i] !== 255 || px[i + 1] !== 255 || px[i + 2] !== 255) inked++;
+      }
+    }
+    return inked;
+  }
+
+  it("redraws the trace over 900ms, then pops the end dot by 1200ms", { timeout: 60000 }, async () => {
+    const m = mount("module:x-chart-line", "expanded");
+    m.link.click();
+    const orig = q(m.svg, ".nm-orig");
+    const draw = q(m.svg, ".nm-draw");
+    const dot = q(m.svg, ".nm-dot");
+    expect(cssAnims(m.svg).length).toBe(3);
+
+    let prevOffset = Number.POSITIVE_INFINITY;
+    for (const t of [0, 300, 600, 880]) {
+      seek(m.svg, t);
+      expect(opacity(orig), `original trace hidden @${t}`).toBe("0");
+      expect(opacity(draw), `copy shown @${t}`).toBe("1");
+      const dash = getComputedStyle(draw).strokeDasharray;
+      expect(dash, `dasharray @${t}`).not.toBe("none");
+      const parts = dash.split(/[\s,]+/).map(num);
+      expect(parts[1], `dash gap @${t}`).toBeGreaterThan(0);
+      const offset = num(getComputedStyle(draw).strokeDashoffset);
+      expect(offset, `dashoffset @${t}`).toBeLessThan(prevOffset);
+      prevOffset = offset;
+    }
+    // Rendered reveal: well under the full trace at 300ms, nearly all of it at 880ms.
+    seek(m.svg, 300);
+    const early = await traceInk(m.svg);
+    seek(m.svg, 880);
+    const late = await traceInk(m.svg);
+    expect(late, "trace ink at 880").toBeGreaterThan(50);
+    expect(early, `ink @300 (${early}) vs @880 (${late})`).toBeLessThan(0.75 * late);
+
+    for (const t of [950, 1100]) {
+      seek(m.svg, t);
+      expect(opacity(orig), `original trace back @${t}`).toBe("1");
+      expect(opacity(draw), `copy hidden @${t}`).toBe("0");
+    }
+
+    const scale = (t: number) => {
+      seek(m.svg, t);
+      return new DOMMatrix(getComputedStyle(dot).transform).a;
+    };
+    expect(scale(450), "dot @450").toBe(0);
+    expect(scale(880), "dot @880").toBe(0);
+    expect(Math.abs(scale(1050) - 1.6), "dot @1050").toBeLessThan(0.1);
+    expect(Math.abs(scale(1199) - 1), "dot @1199").toBeLessThan(0.02);
+
+    // The pop grows from the dot's own centre (19, 8), not the svg origin.
+    seek(m.svg, 1050);
+    const bb = dot.getBBox();
+    expect(bb.x + bb.width / 2, "dot centre x").toBeCloseTo(19, 1);
+    expect(bb.y + bb.height / 2, "dot centre y").toBeCloseTo(8, 1);
+    const svgRect = m.svg.getBoundingClientRect();
+    const unit = svgRect.width / 24;
+    const r = dot.getBoundingClientRect();
+    expect((r.x + r.width / 2 - svgRect.x) / unit, "scaled dot centre x").toBeCloseTo(19, 1);
+    expect((r.y + r.height / 2 - svgRect.y) / unit, "scaled dot centre y").toBeCloseTo(8, 1);
+    expect(getComputedStyle(dot).transformBox).toBe("fill-box");
+    // fill-box origin 50% 50% of the 2x2 dot box, so the pop is about the dot's own centre.
+    expect(getComputedStyle(dot).transformOrigin).toBe("1px 1px");
   });
 });

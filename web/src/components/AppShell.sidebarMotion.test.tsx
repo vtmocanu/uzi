@@ -7,6 +7,14 @@ import { NAV_SECTIONS } from "./navItems";
 import { api } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
 import { unknownDoc } from "../mocks/data/health";
+import type { ModuleEntry } from "../modules/manifest";
+
+// Module entries come from the runtime list; these tests feed it directly.
+const modulesState = vi.hoisted(() => ({ modules: [] as ModuleEntry[] }));
+vi.mock("../modules/registry", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../modules/registry")>()),
+  useModules: () => ({ status: "ready" as const, modules: modulesState.modules }),
+}));
 
 // Issue #4510: the real sidebar wires the animated glyph to every NAV_SECTIONS row (by its
 // key) and to nothing else. Mocks mirror AppShell.test.tsx.
@@ -141,6 +149,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  modulesState.modules = [];
   cleanup();
   vi.clearAllMocks();
 });
@@ -171,5 +180,31 @@ describe("sidebar motion wiring in the real AppShell", () => {
       expect(child.querySelector("svg"), "repo child glyph").not.toBeNull();
       expect(child.querySelector("[data-nav-motion]"), "repo child motion").toBeNull();
     }
+  });
+
+  it("gives a module row its vocabulary icon's motion while its key and link stay the module's (issue #4777)", async () => {
+    modulesState.modules = [
+      { id: "wmod", version: "1", page: "Page", label: "Work Mod", icon: "chart-line", navGroup: "work", adminOnly: false },
+      { id: "mmod", version: "1", page: "Page", label: "Own Mod", icon: "terminal", navGroup: "modules", adminOnly: false },
+    ];
+    signIn(false);
+    const { container } = render(
+      <MemoryRouter initialEntries={["/dashboard"]}>
+        <AppShell>
+          <div>content</div>
+        </AppShell>
+      </MemoryRouter>,
+    );
+    await screen.findByRole("link", { name: "vtmocanu/atlas" });
+    for (const [id, icon] of [
+      ["wmod", "chart-line"],
+      ["mmod", "terminal"],
+    ]) {
+      const svg = container.querySelector(`svg[data-nav-motion="module-${icon}"]`);
+      expect(svg, `${id} svg`).not.toBeNull();
+      expect(svg?.closest("a")?.getAttribute("href")).toBe(`/m/${id}`);
+    }
+    const builtin = NAV_SECTIONS.flatMap((s) => s.items).filter((d) => !d.adminOnly).length;
+    expect(container.querySelectorAll("svg[data-nav-motion]")).toHaveLength(builtin + 2);
   });
 });

@@ -5,7 +5,8 @@ import { cleanup, fireEvent, render, renderHook, waitFor } from "@testing-librar
 import { MemoryRouter } from "react-router-dom";
 import { NavItem, forgeIcon } from "./AppShell";
 import { NAV_SECTIONS } from "./navItems";
-import { SIDEBAR_MOTION_ICONS, useNavIconMotion } from "./sidebarMotion";
+import { MODULE_ICON_NAMES } from "../modules/icons";
+import { MODULE_MOTION_ICONS, SIDEBAR_MOTION_ICONS, moduleMotionKey, sidebarMotionGlyph, useNavIconMotion } from "./sidebarMotion";
 import { HomeIcon } from "./icons";
 
 // The jsdom half of issue #4510: the gesture hook's gating and class lifecycle, and the glyph
@@ -155,6 +156,29 @@ describe("sidebar motion gestures", () => {
       const { container, unmount } = render(<>{def.icon}</>);
       expect(container.querySelector("[data-nav-motion]"), def.key).toBeNull();
       unmount();
+    }
+  });
+});
+
+describe("MODULE_MOTION_ICONS (issue #4777)", () => {
+  it("has one twin per module vocabulary icon, tagged module-<icon>", () => {
+    expect(Object.keys(MODULE_MOTION_ICONS).sort()).toEqual([...MODULE_ICON_NAMES].sort());
+    for (const name of MODULE_ICON_NAMES) {
+      const { container, unmount } = render(<>{MODULE_MOTION_ICONS[name]()}</>);
+      const svg = container.querySelector("svg");
+      expect(svg?.getAttribute("data-nav-motion"), name).toBe(`module-${name}`);
+      expect(moduleMotionKey(name)).toBe(`module-${name}`);
+      expect(svg?.getAttribute("viewBox")).toBe("0 0 24 24");
+      expect(svg?.getAttribute("aria-hidden")).toBe("true");
+      unmount();
+    }
+  });
+
+  it("resolves motion keys: built-in keys and module-<icon>, nothing else", () => {
+    for (const name of MODULE_ICON_NAMES) expect(sidebarMotionGlyph(`module-${name}`), name).toBe(MODULE_MOTION_ICONS[name]);
+    for (const key of KEYS) expect(sidebarMotionGlyph(key), key).toBe(SIDEBAR_MOTION_ICONS[key]);
+    for (const key of ["module-rocket", "module:x", "constructor", "module-constructor", "module-", "", "toString"]) {
+      expect(sidebarMotionGlyph(key), key).toBeUndefined();
     }
   });
 });
