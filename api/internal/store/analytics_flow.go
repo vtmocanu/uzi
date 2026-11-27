@@ -253,8 +253,10 @@ type AnalyticsFlowOutcomes struct {
 }
 
 // AnalyticsFlowFunnelDisclosure counts runs whose approval evidence is incomplete:
-// HistoricalApprovalOnly (an earlier-revision approval and none for the current revision),
-// AmbiguousCurrent (more than one eligible receipt for the current revision) and
+// HistoricalApprovalOnly (no eligible receipt for the current revision and at least one older
+// revision with exactly one eligible receipt; independent of the approval ranking),
+// AmbiguousCurrent (more than one eligible receipt for the current revision; a run with no
+// eligible current receipt whose only older evidence is ambiguous is counted in neither) and
 // LegacyEvidence (a run with any NULL-binding or unbound approve_plan receipt, even when it
 // also has human proof for the current plan; the approval classification still ranks that
 // human proof first).
@@ -286,7 +288,10 @@ type AnalyticsFlowPRUnitCell struct {
 // over legacy evidence.
 // AutoApproveConfigured has no human proof but auto_approve set (configuration, not an
 // observed event). Unknown is the rest, split by reason in order ambiguous (more than one
-// eligible current receipt), legacy_unbound, historical_approval_only, no_evidence.
+// eligible current receipt, or older-revision ambiguity with no older revision holding exactly
+// one eligible receipt), legacy_unbound, historical_approval_only (at least one older revision
+// with exactly one eligible receipt), no_evidence. Human and auto-approve configuration rank
+// ahead of any older ambiguity.
 // Total = Human + AutoApproveConfigured + Unknown.Total. Applicable follows the funnel.
 type AnalyticsFlowApproval struct {
 	TimeBasis             string                       `json:"time_basis"`

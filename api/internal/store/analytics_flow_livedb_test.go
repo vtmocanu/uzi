@@ -965,3 +965,67 @@ func TestAnalyticsFlowAllScopeLiveDB(t *testing.T) {
 		t.Errorf("owner funnel = %+v, want one unmerged unit", own.PRUnits)
 	}
 }
+
+// TestAnalyticsFlowOlderRevisionApprovalLiveDB pins how receipts on older revisions of a run whose
+// current revision has none are classified: a revision with exactly one eligible receipt is
+// historical approval evidence, a revision with several proves nothing, and an unbound receipt
+// never turns an older ambiguity into anything else.
+func TestAnalyticsFlowOlderRevisionApprovalLiveDB(t *testing.T) {
+	rev := func(revision int64, min int) receipt {
+		return receipt{Revision: revision, CreatedAt: flowAt(12, 11, min), AppliedAt: flowAt(12, 11, min+1)}
+	}
+	cases := []struct {
+		name    string
+		setup   func(f *spendFixture, r uuid.UUID)
+		reasons store.AnalyticsFlowApprovalReasons
+		disc    store.AnalyticsFlowFunnelDisclosure
+	}{
+		{"two eligible receipts on one older revision are ambiguous, not historical", func(f *spendFixture, r uuid.UUID) {
+			f.receipt(r, rev(1, 0))
+			f.receipt(r, rev(1, 10))
+		}, store.AnalyticsFlowApprovalReasons{Ambiguous: 1}, store.AnalyticsFlowFunnelDisclosure{}},
+
+		{"one eligible receipt on each of two older revisions is historical", func(f *spendFixture, r uuid.UUID) {
+			f.receipt(r, rev(1, 0))
+			f.receipt(r, rev(2, 10))
+		}, store.AnalyticsFlowApprovalReasons{HistoricalApprovalOnly: 1}, store.AnalyticsFlowFunnelDisclosure{HistoricalApprovalOnly: 1}},
+
+		{"an ambiguous older revision beside a uniquely approved one is historical", func(f *spendFixture, r uuid.UUID) {
+			f.receipt(r, rev(1, 0))
+			f.receipt(r, rev(1, 10))
+			f.receipt(r, rev(2, 20))
+		}, store.AnalyticsFlowApprovalReasons{HistoricalApprovalOnly: 1}, store.AnalyticsFlowFunnelDisclosure{HistoricalApprovalOnly: 1}},
+
+		{"an unbound receipt beside an ambiguous older revision is ambiguous and discloses legacy evidence", func(f *spendFixture, r uuid.UUID) {
+			f.receipt(r, receipt{Binding: "unbound", CreatedAt: flowAt(12, 11, 30), AppliedAt: flowAt(12, 11, 31)})
+			f.receipt(r, rev(1, 0))
+			f.receipt(r, rev(1, 10))
+		}, store.AnalyticsFlowApprovalReasons{Ambiguous: 1}, store.AnalyticsFlowFunnelDisclosure{LegacyEvidence: 1}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSpendFixture(t)
+			f.claimYear(2033)
+			o := f.owner("flowolder")
+			repo, _ := f.repo(o, "flowolder")
+			r := f.run(spendRun{Owner: o.User, Repo: repo, Status: "completed", At: flowAt(12, 10, 0), Finished: flowAt(12, 12, 0)})
+			f.patch(r, "gate_revision = $2", int64(3))
+			f.presentation(r, 1, flowAt(12, 10, 5))
+			f.presentation(r, 2, flowAt(12, 10, 10))
+			tc.setup(f, r)
+
+			for scope, call := range map[string]flowCall{"owner": {Owner: o.User}, "all": {}} {
+				d := f.flow(call).Doc
+				un := tc.reasons
+				unTotal := un.Ambiguous + un.LegacyUnbound + un.HistoricalApprovalOnly + un.NoEvidence
+				if d.Approval.Human != 0 || d.Approval.AutoApproveConfigured != 0 || d.Approval.Total != unTotal ||
+					d.Approval.Unknown.Reasons != un || d.Approval.Unknown.Total != unTotal {
+					t.Errorf("%s approval = %+v, want human 0 auto 0 total %d unknown %+v", scope, d.Approval, unTotal, un)
+				}
+				if d.DeliveryFunnel.Disclosure != tc.disc {
+					t.Errorf("%s disclosure = %+v, want %+v", scope, d.DeliveryFunnel.Disclosure, tc.disc)
+				}
+			}
+		})
+	}
+}
