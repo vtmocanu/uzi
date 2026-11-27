@@ -18,7 +18,8 @@ Read this before enabling anything.
 - **Enabling a module is your trust decision.** Configuration is deployment-only; there is no UI or API to add one. Deploy only modules you trust, and pin each module image by digest.
 - **Module files are public to anyone who can reach the web tier.** `/modules.json` and every file under `/modules/<id>/` need no authentication, including the id, label, version and `adminOnly` flag of admin-only modules. `adminOnly` hides the nav entry and gates the route in the UI only; the API still authorizes every call. Keep secrets and personal or confidential material out of a module and out of the list.
 - **The CSP is unchanged.** Modules are served same-origin, so `script-src 'self'` stays as it is and no module origin is allowlisted.
-- **No api involvement.** The list and the module files are served by the web nginx. There is no new api endpoint, privilege or credential, and no new trust boundary beyond the module you chose to trust.
+- **Module discovery and asset serving have no api involvement.** The list and the module files are served by the web nginx, with no api call, privilege or credential.
+- **The one api surface for modules is per-user storage.** A module can keep one small JSON document per module id in the signed-in user's own account (see [Per-user storage](#per-user-storage)). The module id is a storage namespace, not a permission boundary: any module or page script can read and write any valid id for that user. Use it for preferences, not secrets. It is separate from the public module files above, which need no authentication.
 - **Module code is not integrity-checked in the browser** (no SRI). Provenance comes from pinning the module image by digest.
 
 ## The module list
@@ -126,6 +127,39 @@ The host contains these failures to the module's own page: a load failure (netwo
 - Errors in a module's own async code outside React rendering. They surface as console errors and unhandled rejections.
 - Global CSS a module injects, a module blocking the main thread, or deliberate misuse of page authority. A trusted module scopes its CSS.
 - Module code that runs before the compatibility check. The check runs after the page is loaded, so it prevents rendering, not execution of the module's top-level code.
+
+## Per-user storage
+
+A signed-in user can keep one small JSON document per module id. Modules reach it through `sdk.api.request`, which already sends the session cookie and the CSRF header (see [web-modules-dev.md](./web-modules-dev.md)). No CLI command uses these routes.
+
+Routes: `GET`, `PUT` and `DELETE /api/modules/{module_id}/user-data`.
+
+- **Cookie session only.** A Bearer CLI token gets 401. `PUT` and `DELETE` also need the CSRF header.
+- **Module id.** It must match the manifest rule `^[a-z][a-z0-9-]{0,31}$`, else 400 `invalid module`. The api does not check that the module is configured, so a document can exist for an id that is not in the list.
+- **No caching.** Every api response on these paths carries `Cache-Control: no-store`.
+- **Own documents only.** A user sees only their own documents; there is no admin or cross-user route.
+- **Backups.** A full-database operator backup (a full `pg_dump`, or the chart's database backups when enabled; they are off by default) includes these documents.
+
+| Call | Request | Success | Other outcomes |
+|---|---|---|---|
+| `GET` | none | 200 `{"data": <value>\|null, "revision": "<string>"\|null}` | none stored: `data` and `revision` are `null` |
+| `PUT` | `{"data": <any JSON except null>, "expected_revision": <string\|null>}` | 200 `{"revision": "<r>"}` | 409 `{"revision": <current or null>}` on a stale or unknown revision, nothing changes; 409 `too many module documents`; 413; 400 |
+| `DELETE` | `?expected_revision=<r>` (required) | 204 | 400 when the parameter is absent; 409 with the current revision when it is present but empty or stale |
+
+`PUT` rules:
+
+- Both keys are required, with exactly these names, and no others are allowed. A `null` `expected_revision` means create: no document may exist.
+- **Limits.** At most 32 documents per user: a new id past that gets 409 `too many module documents`, while existing ids stay updatable. The whole request body, wrapper included, may be at most 64 KiB, else 413.
+- **400** for malformed, missing or extra fields; values PostgreSQL cannot store (for example `\u0000`, invalid UTF-8, lone surrogates); numbers outside the finite float64 (JavaScript number) range or nonzero numbers that underflow to zero; and `data` nested deeper than 10,000 levels. Zero-valued numbers (for example `0e-400`, `-0.0`) are stored as `0`. If a key repeats, the last wins.
+- **Round trip.** Values round-trip at value level with `jsonb` normalisation: key order, whitespace and duplicate keys are not preserved. A Go client using `encoding/json` cannot unmarshal a `GET` response whose `data` is 10,000 levels deep, because the wrapper adds a level.
+
+Revisions are opaque strings drawn from one database sequence. Compare them only for equality; there is no ordering promise. A revision is never reused, not even after a delete and re-create, on the same database primary with PostgreSQL's default durability settings (`synchronous_commit` on, `fsync` on, storage that honours flushes). There is no guarantee across a failover, a point-in-time restore or a manual sequence reset.
+
+**Unknown outcome.** A 503 `{"error":"outcome unknown"}` means the commit outcome is not known. `GET` and decide again from what you read, which may include other writers' changes. Never write unconditionally, and do not blindly re-create after an uncertain create.
+
+**Data is user-controlled.** Validate it when you read it back. As in the [trust model](#trust-model), the module id is a namespace and not a permission boundary, and modules share the page's authority, so keep secrets out of it.
+
+**What guarantees what.** The api guarantees the 64 KiB streaming cap, the choice between 400 and 413, and `no-store`. The web tier's nginx proxy may answer with its own error page first, for example its own 413 above 1 MiB, before the api runs.
 
 ## Troubleshooting
 
