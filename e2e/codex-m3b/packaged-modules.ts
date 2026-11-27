@@ -43,6 +43,15 @@ async function load<T>(relative: string): Promise<T> {
   return (await import(pathToFileURL(`${srcDir()}/${relative}`).href)) as T;
 }
 
+/** The packaged pinned tree removal (`rmTeardownTree`): the production run-home teardown, whose
+ *  runner-cmd pass removes a command root's private 0700 `.docker` (issue #4416) that a plain
+ *  worker-uid `rmSync` cannot read. */
+export type RmtreeModule = typeof import("../../agent/src/rmtree.js");
+
+export function loadPackagedRmtree(): Promise<RmtreeModule> {
+  return load<RmtreeModule>("rmtree.ts");
+}
+
 export function loadPackagedCodexExecutor(): Promise<CodexExecutorModule> {
   return load<CodexExecutorModule>("codex/codex-executor.ts");
 }

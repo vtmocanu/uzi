@@ -34,6 +34,7 @@ import { PassThrough } from "node:stream";
 
 import {
   loadPackagedCodexExecutor,
+  loadPackagedRmtree,
   loadPackagedSessionState,
   loadPackagedSelect,
   loadPackagedLauncher,
@@ -1250,6 +1251,15 @@ function makeScratch(): { scratch: string; worktree: string; home: string } {
   fs.mkdirSync(worktree, { recursive: true, mode: 0o2770 });
   fs.chmodSync(worktree, 0o2770);
   return { scratch, worktree, home: nodePath.join(scratch, "home") };
+}
+
+/** Remove a makeScratch() tree through the PRODUCTION pinned teardown (`rmTeardownTree`, the
+ *  terminal run-home removal), not a worker-uid `rmSync`: under the uid split a model command
+ *  root (runner-cmd) creates the run home's private 0700 `.docker` (issue #4416), which only
+ *  that walk's runner-cmd pass can read. A refusal still fails the test. */
+async function removeScratch(scratch: string): Promise<void> {
+  const { rmTeardownTree } = await loadPackagedRmtree();
+  await rmTeardownTree(scratch);
 }
 
 function sleepMs(ms: number): Promise<void> {
@@ -2774,7 +2784,7 @@ describe("codex-m3b packaged lifecycle (real launch → loopback provider)", { s
         await exec.safety.dispose({ boundary: "terminal", deadlineMs: 3000 }).catch(() => undefined);
       }
       await fake.close();
-      fs.rmSync(scratch, { recursive: true, force: true });
+      await removeScratch(scratch);
     }
   });
 
@@ -2887,7 +2897,7 @@ describe("codex-m3b packaged lifecycle (real launch → loopback provider)", { s
         await exec.safety.dispose({ boundary: "terminal", deadlineMs: 3000 }).catch(() => undefined);
       }
       await fake.close();
-      fs.rmSync(scratch, { recursive: true, force: true });
+      await removeScratch(scratch);
     }
   });
 });
