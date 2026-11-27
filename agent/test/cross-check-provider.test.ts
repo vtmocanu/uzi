@@ -7,7 +7,7 @@ import { PassThrough, Writable } from "node:stream";
 import { CodexCrossCheck, type CrossCheckModelDeps } from "../src/codex/cross-check.js";
 import { codexCustomProviderName } from "../src/codex/config.js";
 import { captureExtraCa } from "../src/codex/extra-ca.js";
-import { ProviderModelUnmappedError } from "../src/provider-binding.js";
+import { CrossCheckCheckerUnavailableError } from "../src/codex/model-rejection.js";
 import { CrossCheckRunner } from "../src/cross-check-runner.js";
 import { createLogger, type Logger } from "../src/log.js";
 import { providerKeyForms } from "../src/redact.js";
@@ -173,7 +173,7 @@ describe("provider-bound Codex checker on the frozen binding", () => {
     pinned.cross_check!.model_source = "pin";
     const { log, counts } = countingLogger();
     const p = rig(pinned, { log });
-    await assert.rejects(p.run(), (e: unknown) => e instanceof ProviderModelUnmappedError);
+    await assert.rejects(p.run(), (e: unknown) => e instanceof CrossCheckCheckerUnavailableError);
     assert.equal(p.specs.length, 0, "nothing launched");
     assert.equal(counts.size, 0);
   });
@@ -235,6 +235,7 @@ describe("provider-bound Codex checker on the frozen binding", () => {
       const bundle = await ca();
       const vendor = rig(vendorClaim(), { extraCa: bundle });
       await vendor.checker.run(vendorClaim(), "/checkout", "/owned", new AbortController().signal, async () => {}).catch(() => {});
+      assert.ok(vendor.specs.length > 0, "control: the vendor checker launched, so the bundle check is not vacuous");
       assert.equal(vendor.specs.some(s => "codexExtraCa" in s), false);
     });
   });
@@ -363,6 +364,20 @@ describe("CrossCheckRunner on a provider-bound Codex claim", () => {
       assert.equal(ran, false);
       // The refusal precedes the telemetry batcher and the activity recorder: nothing was streamed.
       assert.deepEqual(h.posted, [], "refused before any checker telemetry started");
+      assert.equal(h.verdicts.length, 1);
+      assert.deepEqual(h.verdicts[0], { verdict: "failed", reason_class: "checker_unavailable",
+        summary: "The cross-check did not complete.", items: [] });
+    } finally { await h.cleanup(); }
+  });
+
+  it("an unmapped explicit pin through the real checker is reported checker_unavailable, not model_error", async () => {
+    const h = await harness();
+    const pinned = providerClaim("plan", MAP, "gpt-6-luna");
+    pinned.cross_check!.model_source = "pin";
+    const r = rig(pinned);
+    try {
+      await runnerOf(h, nullLogger(), r.checker).execute(pinned);
+      assert.equal(r.specs.length, 0, "nothing launched");
       assert.equal(h.verdicts.length, 1);
       assert.deepEqual(h.verdicts[0], { verdict: "failed", reason_class: "checker_unavailable",
         summary: "The cross-check did not complete.", items: [] });

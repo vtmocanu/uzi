@@ -4,10 +4,11 @@
 //
 // The resolver is pure and is what the executors send AND what the reporter reports, so the record
 // is by construction the request. The reporter is best-effort and never throws into a turn: a
-// failed, slow or refused report must not change what the run does.
-// PRD #4574 M2: the server's cross-check same-model guard reads this record (the highest-seq row for
-// the lead's claim generation and phase). A missing record never changes the lead's run; it fails a
-// provider-involved check closed as model_unresolved, so a dropped report costs a check, not safety.
+// failed, slow or refused report must not change what the lead's own run does.
+// PRD #4574 M2: the record now also gates provider-involved cross-checks. The server's same-model
+// guard reads it (the highest-seq row for the lead's claim generation and phase). A missing record
+// never changes the lead's run; it fails such a check closed, reported as checker_unavailable
+// (internal reason model_unresolved), so a dropped report costs a check, not safety.
 
 import type { LeadConfigPostOutcome } from "./client.js";
 import { isCodexRoleModel } from "./codex/render.js";

@@ -6,7 +6,9 @@
 // as e2e/codex-m4/provider-advice-judge.test.ts does: this is not a UID-split, Landlock or
 // kernel-drainage proof (the packaged confinement probes own those).
 // The pinned runtime is baked at /opt/uzi-codex in the worker image. Where it is absent this file reports a
-// skip with the reason; the image build and CI run it where the runtime is baked.
+// skip with the reason. This is a local real-runtime check: CI (test-agent-shard, the image build) does
+// not have /opt/uzi-codex, so it skips there. The CI real-runtime proof for the provider checker is the
+// private-CA image fixture in `test:codex-m4` (e2e/codex-private-ca/fixture.test.ts).
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import fs from "node:fs/promises";

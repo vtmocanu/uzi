@@ -22,7 +22,7 @@ import { CrossCheckCheckerUnavailableError } from "./model-rejection.js";
 import { createCodexAppServerAuth, type CodexAppServerAuthSession } from "./appserver-auth.js";
 import { selectCodexExecutionAuthority } from "./select.js";
 import { codexCustomProviderName } from "./config.js";
-import { resolveCodexProviderModelSlot } from "../provider-binding.js";
+import { ProviderModelUnmappedError, resolveCodexProviderModelSlot } from "../provider-binding.js";
 import { providerKeyForms } from "../redact.js";
 import type { ClaimCodexProviderBinding } from "../protocol.js";
 import { CodexUsageAccountant } from "./token-accounting.js";
@@ -384,9 +384,18 @@ export class CodexCrossCheck {
   }
   const modelPinned = claim.cross_check?.model_source === "pin";
   // Provider: the map slot selects the launch config; the slot's mapped target is the model every RPC
-  // and the usage accountant carry. An explicit owner pin must have its own slot (a typed refusal).
+  // and the usage accountant carry. An explicit owner pin must have its own slot; a missing slot is
+  // reported as checker_unavailable (CrossCheckCheckerUnavailableError), like the server's same-model guard.
   const providerMap = providerAuthority?.providerBinding.model_map;
-  const providerSlot = providerMap ? resolveCodexProviderModelSlot(logicalModel, providerMap as ClaimCodexProviderBinding["model_map"], modelPinned) : undefined;
+  let providerSlot: ReturnType<typeof resolveCodexProviderModelSlot> | undefined;
+  if (providerMap) {
+   try {
+    providerSlot = resolveCodexProviderModelSlot(logicalModel, providerMap as ClaimCodexProviderBinding["model_map"], modelPinned);
+   } catch (err) {
+    if (err instanceof ProviderModelUnmappedError) throw new CrossCheckCheckerUnavailableError();
+    throw err;
+   }
+  }
   const providerEntry = providerMap && providerSlot ? providerMap[providerSlot]! : undefined;
   const model = providerEntry ? providerEntry.model : logicalModel!;
   const secrets = new Set<string>();
