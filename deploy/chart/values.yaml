@@ -1822,8 +1822,8 @@ web:
   #   version   (required) a string shown to admins in error cards (quote it: 1.0 is a number).
   #   page      (required) the module's exposed page name.
   #   label     (required) the nav label, 1 to 40 characters, no control or invisible characters.
-  #   icon      (required) one of activity board book bot bug chat clock factory file-text gear git
-  #             home key package scale search server shield skill terminal.
+  #   icon      (required) one of activity board book bot bug chart-line chat clock factory
+  #             file-text gear git home key package scale search server shield skill terminal.
   #   navGroup  (required) work | factory | modules (the sidebar section).
   #   navSection (optional) the sidebar heading for a navGroup modules entry (default "Modules");
   #             1 to 24 characters after trimming whitespace, no control or invisible characters;

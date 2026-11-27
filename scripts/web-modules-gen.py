@@ -49,7 +49,7 @@ import tempfile
 
 # Keep equal to MODULE_ICON_NAMES in web/src/modules/icons.tsx and to uzi.webModules.icons in
 # deploy/chart/templates/_web-modules.tpl; web/src/modules/parity.test.ts pins all three.
-ICONS = ("activity", "board", "book", "bot", "bug", "chat", "clock", "factory", "file-text", "gear", "git", "home", "key", "package", "scale", "search", "server", "shield", "skill", "terminal")
+ICONS = ("activity", "board", "book", "bot", "bug", "chart-line", "chat", "clock", "factory", "file-text", "gear", "git", "home", "key", "package", "scale", "search", "server", "shield", "skill", "terminal")
 # Keep equal to NAV_GROUPS in web/src/modules/manifest.ts and the chart's navGroup list.
 NAV_GROUPS = ("work", "factory", "modules")
 

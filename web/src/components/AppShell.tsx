@@ -32,7 +32,7 @@ import { BuildInfoPopover } from "./BuildInfoPopover";
 import { ChangelogDrawer } from "./ChangelogDrawer";
 import { type NavBadgeKey } from "./navItems";
 import { useNavSections } from "../modules/nav";
-import { SIDEBAR_MOTION_ICONS, useNavIconMotion } from "./sidebarMotion";
+import { sidebarMotionGlyph, useNavIconMotion } from "./sidebarMotion";
 import { CommandMenu } from "./CommandMenu";
 import { CommandMenuContext } from "./CommandMenuContext";
 import { isApplePlatform } from "../lib/platform";
@@ -448,8 +448,9 @@ export function NavItem({
 }: NavItemBadge & {
   to: string;
   icon?: ReactNode;
-  // Opt-in animated glyph (issue #4510): the NAV_SECTIONS key whose SIDEBAR_MOTION_ICONS entry
-  // replaces `icon`. Only the top-level destinations pass it; repo child rows do not.
+  // Opt-in animated glyph (issue #4510): a sidebarMotionGlyph key (a NAV_SECTIONS key, or
+  // `module-<icon>` for a runtime module entry) whose glyph replaces `icon`. Only the
+  // top-level destinations and module entries pass it; repo child rows do not.
   motionKey?: string;
   label: string;
   exactOnly?: boolean;
@@ -488,7 +489,7 @@ export function NavItem({
 }) {
   const { pathname } = useLocation();
   const motion = useNavIconMotion();
-  const motionGlyph = motionKey ? SIDEBAR_MOTION_ICONS[motionKey] : undefined;
+  const motionGlyph = motionKey ? sidebarMotionGlyph(motionKey) : undefined;
   const iconNode = motionGlyph ? motionGlyph() : icon;
   const active = exactOnly ? pathname === to : isNavActive(pathname, to);
   const hasBadge = badge > 0;
@@ -827,7 +828,7 @@ function SidebarContent({
                 <NavItem
                   to={def.to}
                   icon={def.icon}
-                  motionKey={def.key}
+                  motionKey={def.motionKey ?? def.key}
                   label={def.label}
                   exactOnly={def.exactOnly}
                   onNavigate={onNavigate}
