@@ -62,7 +62,7 @@ rw_link AS MATERIALIZED (
            (t.repo_id = rw.repo_id AND t.mr_iid = rw.mr_iid AND t.user_id = rw.user_id) IS TRUE AS verified
     FROM rework rw
     LEFT JOIN runs t ON t.id = rw.target_run_id
-    -- IS TRUE keeps a hashed SubPlan (no pulled-up semi-join, so no nested loop in a generic plan).
+    -- The IS TRUE wrapper prevents semi-join pull-up; PostgreSQL hashes the SubPlan only when it fits the hash memory budget.
     WHERE ((rw.repo_id, rw.mr_iid) IN (SELECT q.repo_id, q.mr_iid FROM rw_sel q)) IS TRUE
 ),
 rw_cnt AS MATERIALIZED (
@@ -409,7 +409,7 @@ rw_link AS MATERIALIZED (
            (t.repo_id = rw.repo_id AND t.mr_iid = rw.mr_iid AND t.user_id = rw.user_id) IS TRUE AS verified
     FROM rework rw
     LEFT JOIN runs t ON t.id = rw.target_run_id
-    -- IS TRUE keeps a hashed SubPlan (no pulled-up semi-join, so no nested loop in a generic plan).
+    -- The IS TRUE wrapper prevents semi-join pull-up; PostgreSQL hashes the SubPlan only when it fits the hash memory budget.
     WHERE ((rw.repo_id, rw.mr_iid) IN (SELECT q.repo_id, q.mr_iid FROM rw_sel q)) IS TRUE
 ),
 rw_cnt AS MATERIALIZED (

@@ -986,8 +986,35 @@ func qualityShapeProblems(root *planNode) []string {
 	return out
 }
 
+// qualityExecutedProblems needs an EXPLAIN ANALYZE plan: it requires that at least one CTE Scan of
+// rw_sel under a hashed SubPlan actually returned rows. Otherwise the rework-link membership was
+// never exercised (an empty rw_sel or rework set in the seed, or a predicate that empties it), and
+// the shape and row-count checks pass vacuously. Scans of rw_sel outside the SubPlan do not count.
+func qualityExecutedProblems(root *planNode) []string {
+	hashedSubPlans := hashedSubPlanNames(root)
+	executed := false
+	var visit func(n *planNode, sub *planNode)
+	visit = func(n *planNode, sub *planNode) {
+		if n.ParentRelationship == "SubPlan" {
+			sub = n
+		}
+		if n.NodeType == "CTE Scan" && n.CTEName == "rw_sel" && sub != nil &&
+			hashedSubPlans[sub.SubplanName] && n.ActualRows*n.ActualLoops > 0 {
+			executed = true
+		}
+		for i := range n.Plans {
+			visit(&n.Plans[i], sub)
+		}
+	}
+	visit(root, nil)
+	if executed {
+		return nil
+	}
+	return []string{"no CTE Scan on rw_sel under a hashed SubPlan returned rows: the seed must give both rw_sel and rework a non-empty set, or the membership check is vacuous"}
+}
+
 // qualityOffenders is the generic-plan check of the Quality statements: the row-count classes
-// shared with Spend (loopOffenders) plus qualityShapeProblems.
+// shared with Spend (loopOffenders) plus qualityShapeProblems and qualityExecutedProblems.
 //
 // The looped-work bound counts CTE Scans and scans of runs only, and the join-discard bound is
 // not applied: a per-row probe of a small side table (the judge_skips EXISTS, a nested loop
@@ -996,7 +1023,8 @@ func qualityShapeProblems(root *planNode) []string {
 // (repo_id, mr_iid) nested-loop class is checked separately by qualityShapeProblems.
 func (e *genericPlanEnv) qualityOffenders(root *planNode) []string {
 	counted := func(n *planNode) bool { return n.CTEName != "" || n.RelationName == "runs" }
-	return append(e.loopOffenders(root, counted, false), qualityShapeProblems(root)...)
+	out := append(e.loopOffenders(root, counted, false), qualityShapeProblems(root)...)
+	return append(out, qualityExecutedProblems(root)...)
 }
 
 // nodeWork is a node's total row work across all its loops: the rows it emitted, plus,
