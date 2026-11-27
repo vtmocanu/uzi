@@ -20,6 +20,10 @@ vi.mock("../lib/api", async (importOriginal) => {
       adminPatchSharedProvider: vi.fn(),
       adminRetireSharedProvider: vi.fn(),
       adminDeleteSharedProvider: vi.fn(),
+      adminPutOperatorKey: vi.fn(),
+      adminSetOperatorKeyEnabled: vi.fn(),
+      adminDeleteOperatorKey: vi.fn(),
+      adminTestOperatorKey: vi.fn(),
       listProviders: vi.fn(),
     },
   };
@@ -362,5 +366,229 @@ describe("AdminSharedProviders — delete", () => {
     );
     await waitFor(() => expect(screen.getByTestId("selected-count-s1").textContent).toBe("Selected by 1 user"));
     expect(screen.getByRole("group", { name: "Confirm deleting platform-gateway" })).toBeTruthy();
+  });
+});
+
+// PRD #4540 M3: organization-funded (operator_key) definitions.
+function operator(over: Partial<AdminSharedProvider> = {}): AdminSharedProvider {
+  return shared({
+    id: "o1",
+    name: "org-gateway",
+    credential_mode: "operator_key",
+    attached_key_count: 0,
+    auth_style: "bearer",
+    operator_key: { present: true, enabled: true, set_at: "2026-11-20T10:00:00Z" },
+    ...over,
+  });
+}
+
+async function openOperatorForm() {
+  await renderPage([]);
+  fireEvent.click(screen.getByRole("button", { name: "New shared provider" }));
+  const form = within(screen.getByRole("form", { name: "New shared provider" }));
+  fireEvent.change(form.getByLabelText("Credential source"), { target: { value: "operator_key" } });
+  return form;
+}
+
+describe("AdminSharedProviders — organization key create", () => {
+  it("offers the credential source for Claude only", async () => {
+    await renderPage([]);
+    fireEvent.click(screen.getByRole("button", { name: "New shared provider" }));
+    const form = within(screen.getByRole("form", { name: "New shared provider" }));
+    const source = form.getByLabelText("Credential source") as HTMLSelectElement;
+    expect([...source.options].map((o) => o.value)).toEqual(["per_user_key", "operator_key"]);
+    fireEvent.change(source, { target: { value: "operator_key" } });
+    fireEvent.change(form.getByLabelText("Engine"), { target: { value: "codex" } });
+    expect(form.queryByLabelText("Credential source")).toBeNull();
+    expect(form.queryByRole("group", { name: "Organization key disclosures" })).toBeNull();
+    // Back to Claude: the choice starts over at per-user keys.
+    fireEvent.change(form.getByLabelText("Engine"), { target: { value: "claude" } });
+    expect((form.getByLabelText("Credential source") as HTMLSelectElement).value).toBe("per_user_key");
+  });
+
+  it("shows no disclosures for per-user keys", async () => {
+    await renderPage([]);
+    fireEvent.click(screen.getByRole("button", { name: "New shared provider" }));
+    const form = within(screen.getByRole("form", { name: "New shared provider" }));
+    expect(form.queryByRole("group", { name: "Organization key disclosures" })).toBeNull();
+    expect(form.queryByLabelText(/acknowledge/i)).toBeNull();
+  });
+
+  const disclosures: [string, RegExp][] = [
+    ["disclosure-copy", /receive the key and can copy it.*revoking access in uzi does not take copies back.*rotating the key at the gateway/i],
+    ["disclosure-redirect", /redirecting gateway can forward request bodies to the redirect host.*same-host sibling path.*another host with the x_api_key.*Bearer is recommended/i],
+    ["disclosure-product-token", /external product's job token.*can spend the key/i],
+    ["disclosure-shared-identity", /shared identity.*requests, logs or batches.*expose recipients' work/i],
+    ["disclosure-secret-key", /rotating UZI_SECRET_KEY invalidates the stored key/i],
+    ["disclosure-authorized-users", /restricted to the organization's authorized users/i],
+  ];
+  it.each(disclosures)("states disclosure %s", async (testId, pattern) => {
+    const form = await openOperatorForm();
+    const group = within(form.getByRole("group", { name: "Organization key disclosures" }));
+    expect(group.getByTestId(testId).textContent).toMatch(pattern);
+  });
+
+  it("lists exactly the six disclosures", async () => {
+    const form = await openOperatorForm();
+    const group = form.getByRole("group", { name: "Organization key disclosures" });
+    expect(group.querySelectorAll("li").length).toBe(6);
+  });
+
+  it("keeps Save disabled until the acknowledgment is checked, then sends it", async () => {
+    mockApi.adminCreateSharedProvider.mockResolvedValue({ provider: operator() });
+    const form = await openOperatorForm();
+    fireEvent.change(form.getByLabelText("Provider name"), { target: { value: "org-gateway" } });
+    fireEvent.change(form.getByLabelText("Base URL"), { target: { value: URL_B } });
+    fireEvent.change(form.getByLabelText("Haiku model (required)"), { target: { value: "gw-small" } });
+    const save = form.getByRole("button", { name: "Create shared provider" }) as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+    const ack = form.getByRole("checkbox", { name: /acknowledge/i }) as HTMLInputElement;
+    expect(ack.checked).toBe(false);
+    fireEvent.click(ack);
+    expect(save.disabled).toBe(false);
+    fireEvent.click(ack);
+    expect(save.disabled).toBe(true);
+    fireEvent.click(ack);
+    fireEvent.click(save);
+    await waitFor(() =>
+      expect(mockApi.adminCreateSharedProvider).toHaveBeenCalledWith({
+        engine: "claude",
+        name: "org-gateway",
+        base_url: URL_B,
+        auth_style: "bearer",
+        model_map: { haiku: { model: "gw-small" } },
+        credential_mode: "operator_key",
+        acknowledge_recipient_trust: true,
+      }),
+    );
+  });
+
+  it("drops the acknowledgment when the choice goes back to per-user keys", async () => {
+    const form = await openOperatorForm();
+    fireEvent.click(form.getByRole("checkbox", { name: /acknowledge/i }));
+    fireEvent.change(form.getByLabelText("Credential source"), { target: { value: "per_user_key" } });
+    expect((form.getByRole("button", { name: "Create shared provider" }) as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.change(form.getByLabelText("Credential source"), { target: { value: "operator_key" } });
+    expect((form.getByRole("checkbox", { name: /acknowledge/i }) as HTMLInputElement).checked).toBe(false);
+    expect((form.getByRole("button", { name: "Create shared provider" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+});
+
+describe("AdminSharedProviders — organization key card", () => {
+  it("shows the mode, key status and last Test result, and keeps per-user counts off the card", async () => {
+    await renderPage([
+      operator({ operator_key: { present: true, enabled: false, set_at: "2026-11-20T10:00:00Z", probe: { auth_result: "ok", tool_result: "passed", probed_at: "2026-11-21T00:00:00Z" } } }),
+    ]);
+    expect(screen.getByTestId("credential-mode-o1").textContent).toBe("Organization key");
+    expect(screen.getByTestId("key-status-o1").textContent).toMatch(/Key set, disabled/);
+    expect(screen.getByTestId("key-status-o1").textContent).toMatch(/Set /);
+    const probe = screen.getByTestId("probe-results-o1").textContent ?? "";
+    expect(probe).toMatch(/Authentication worked/);
+    expect(probe).toMatch(/Tool use passed/);
+    expect(screen.queryByTestId("key-count-o1")).toBeNull();
+  });
+
+  it("says when there is no key or no Test yet", async () => {
+    await renderPage([operator({ operator_key: { present: false, enabled: false } })]);
+    expect(screen.getByTestId("key-status-o1").textContent).toMatch(/No key set/);
+    expect(screen.getByTestId("probe-results-o1").textContent).toMatch(/Not tested yet/);
+    expect(screen.queryByRole("button", { name: /Disable/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /Delete organization key/ })).toBeNull();
+    expect((screen.getByRole("button", { name: "Test organization key for org-gateway" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("leaves a per-user card without any organization key controls", async () => {
+    await renderPage([shared()]);
+    expect(screen.queryByLabelText("Organization key")).toBeNull();
+    expect(screen.queryByTestId("credential-mode-s1")).toBeNull();
+  });
+
+  it("sets a key through a password input, never echoes it, and clears the input", async () => {
+    mockApi.adminPutOperatorKey.mockResolvedValue({ provider: operator() });
+    await renderPage([operator({ operator_key: { present: false, enabled: false } })]);
+    const input = screen.getByLabelText("Organization key") as HTMLInputElement;
+    expect(input.type).toBe("password");
+    expect(input.autocomplete).toBe("off");
+    const save = screen.getByRole("button", { name: "Set organization key for org-gateway" }) as HTMLButtonElement;
+    expect(save.disabled).toBe(true);
+    fireEvent.change(input, { target: { value: "org-secret-value" } });
+    expect(save.disabled).toBe(false);
+    fireEvent.click(save);
+    await waitFor(() => expect(mockApi.adminPutOperatorKey).toHaveBeenCalledWith("o1", "org-secret-value"));
+    await waitFor(() => expect(mockApi.adminListSharedProviders).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText(/Organization key for org-gateway saved/)).toBeTruthy();
+    expect((screen.getByLabelText("Organization key") as HTMLInputElement).value).toBe("");
+    expect(document.body.textContent).not.toContain("org-secret-value");
+  });
+
+  it("clears the typed key even when the save is refused", async () => {
+    mockApi.adminPutOperatorKey.mockRejectedValue(new ApiError(400, "bad key", { error: "bad key" }));
+    await renderPage([operator()]);
+    fireEvent.change(screen.getByLabelText("Organization key"), { target: { value: "org-secret-value" } });
+    fireEvent.click(screen.getByRole("button", { name: "Replace organization key for org-gateway" }));
+    expect(await screen.findByText("bad key")).toBeTruthy();
+    expect((screen.getByLabelText("Organization key") as HTMLInputElement).value).toBe("");
+  });
+
+  it("disables and enables the key with the effect stated", async () => {
+    mockApi.adminSetOperatorKeyEnabled.mockResolvedValue({ provider: operator() });
+    await renderPage([operator()]);
+    expect(screen.getByTestId("disable-effect-o1").textContent).toMatch(
+      /stops this key being used.*frozen copies held by recipients are not revoked/i,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Disable organization key for org-gateway" }));
+    await waitFor(() => expect(mockApi.adminSetOperatorKeyEnabled).toHaveBeenCalledWith("o1", false));
+  });
+
+  it("enables a disabled key", async () => {
+    mockApi.adminSetOperatorKeyEnabled.mockResolvedValue({ provider: operator() });
+    await renderPage([operator({ operator_key: { present: true, enabled: false } })]);
+    fireEvent.click(screen.getByRole("button", { name: "Enable organization key for org-gateway" }));
+    await waitFor(() => expect(mockApi.adminSetOperatorKeyEnabled).toHaveBeenCalledWith("o1", true));
+  });
+
+  it("deletes the key only after a confirmation that opens on Cancel and names the limit", async () => {
+    mockApi.adminDeleteOperatorKey.mockResolvedValue({ provider: operator({ operator_key: { present: false, enabled: false } }) });
+    await renderPage([operator()]);
+    fireEvent.click(screen.getByRole("button", { name: "Delete organization key for org-gateway" }));
+    expect(mockApi.adminDeleteOperatorKey).not.toHaveBeenCalled();
+    const group = screen.getByRole("group", { name: "Confirm deleting the organization key of org-gateway" });
+    expect(group.textContent).toMatch(/copies recipients already hold are not taken back/i);
+    expect(document.activeElement).toBe(within(group).getByRole("button", { name: "Cancel" }));
+    fireEvent.click(within(group).getByRole("button", { name: "Delete key" }));
+    await waitFor(() => expect(mockApi.adminDeleteOperatorKey).toHaveBeenCalledWith("o1"));
+  });
+
+  it("runs Test and shows its result, naming that it uses the key", async () => {
+    mockApi.adminTestOperatorKey.mockResolvedValue({ probe: { auth_result: "rejected", tool_result: "not_run", probed_at: "2026-11-21T00:00:00Z" } });
+    await renderPage([operator()]);
+    expect(screen.getByTestId("test-effect-o1").textContent).toMatch(/sends one small request/i);
+    fireEvent.click(screen.getByRole("button", { name: "Test organization key for org-gateway" }));
+    await waitFor(() => expect(mockApi.adminTestOperatorKey).toHaveBeenCalledWith("o1"));
+    expect((await screen.findByTestId("probe-results-o1")).textContent).toMatch(/Authentication rejected/);
+  });
+
+  it("explains a rate-limited Test", async () => {
+    mockApi.adminTestOperatorKey.mockRejectedValue(new ApiError(429, "slow", { error: "slow", reason: "provider_probe_rate_limited" }));
+    await renderPage([operator()]);
+    fireEvent.click(screen.getByRole("button", { name: "Test organization key for org-gateway" }));
+    expect((await screen.findByRole("alert")).textContent).toMatch(/Tests are rate limited/);
+  });
+
+  it("explains a stale Test and refreshes the card", async () => {
+    mockApi.adminTestOperatorKey.mockRejectedValue(
+      new ApiError(409, "the organization key or provider changed while it was being tested; test it again", { error: "the organization key or provider changed while it was being tested; test it again" }),
+    );
+    await renderPage([operator()]);
+    fireEvent.click(screen.getByRole("button", { name: "Test organization key for org-gateway" }));
+    expect((await screen.findByRole("alert")).textContent).toBe("The provider or key changed while testing; test again.");
+    await waitFor(() => expect(mockApi.adminListSharedProviders).toHaveBeenCalledTimes(2));
+  });
+
+  it("explains a key route refused for a per-user definition", async () => {
+    mockApi.adminSetOperatorKeyEnabled.mockRejectedValue(conflict("provider_not_operator_key"));
+    await renderPage([operator()]);
+    fireEvent.click(screen.getByRole("button", { name: "Disable organization key for org-gateway" }));
+    expect((await screen.findByRole("alert")).textContent).toMatch(/not organization-funded/);
   });
 });

@@ -34,3 +34,22 @@ it("sends a shared Claude definition's engine with the Messages protocol", async
     engine: "claude", protocol: "anthropic_messages", name: "shared-gw", base_url: "https://gateway.example", auth_style: "x_api_key", model_map,
   });
 });
+it("sends the organization-key create fields and calls the four key routes with the right verbs", async () => {
+  const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify({ provider: {}, probe: {} }), { status: 200 }));
+  vi.stubGlobal("fetch", fetchMock);
+  const call = (i: number) => {
+    const [url, init] = fetchMock.mock.calls[i] as unknown as [string, RequestInit];
+    return { url, method: init.method, body: init.body ? JSON.parse(init.body as string) : undefined };
+  };
+  const model_map = { haiku: { model: "gateway-haiku" } };
+  await api.adminCreateSharedProvider({ engine: "claude", name: "org", base_url: "https://gateway.example", auth_style: "bearer", model_map, credential_mode: "operator_key", acknowledge_recipient_trust: true });
+  expect(call(0).body).toMatchObject({ credential_mode: "operator_key", acknowledge_recipient_trust: true });
+  await api.adminPutOperatorKey("p 1", "the-key");
+  expect(call(1)).toMatchObject({ url: "/api/admin/providers/p%201/key", method: "PUT", body: { key: "the-key" } });
+  await api.adminSetOperatorKeyEnabled("p1", false);
+  expect(call(2)).toMatchObject({ url: "/api/admin/providers/p1/key/enabled", method: "PATCH", body: { enabled: false } });
+  await api.adminDeleteOperatorKey("p1");
+  expect(call(3)).toMatchObject({ url: "/api/admin/providers/p1/key", method: "DELETE" });
+  await api.adminTestOperatorKey("p1");
+  expect(call(4)).toMatchObject({ url: "/api/admin/providers/p1/test", method: "POST" });
+});

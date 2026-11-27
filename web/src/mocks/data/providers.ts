@@ -1,4 +1,4 @@
-import type { ProviderDTO } from "../../lib/api";
+import type { ProviderDTO, ProviderProbe } from "../../lib/api";
 import { minsAgo } from "./time";
 
 // Allowed gateway base URLs the demo operator configured (UZI_PROVIDER_ALLOWED_BASE_URLS).
@@ -72,3 +72,34 @@ export const mockSharedProviderOtherUsers: Record<string, { selected: number; ke
   "prov-shared-platform": { selected: 2, keys: 3 },
   "prov-shared-legacy": { selected: 0, keys: 1 },
 };
+
+// An organization-funded definition (PRD #4540, credential_mode "operator_key"). It is kept
+// OUT of mockProviders on purpose: that array is the demo user's own /me/providers list, which
+// the server never lets an operator definition into, and its owner routes answer 404 for it.
+// Only the admin routes see it. The key itself is never stored in the mock, only its state.
+export interface MockOperatorProvider {
+  def: Omit<ProviderDTO, "credential_mode" | "has_key" | "key_enabled" | "probe">;
+  key: { present: boolean; enabled: boolean; set_at?: string; probe?: ProviderProbe };
+  selectedUsers: number;
+}
+
+export const mockOperatorProviders: MockOperatorProvider[] = [
+  {
+    def: {
+      id: "prov-operator-org",
+      name: "org-gateway",
+      engine: "claude",
+      retired: false,
+      current_revision: 1,
+      protocol: "anthropic_messages",
+      base_url: "https://gateway.example.com/v1",
+      auth_style: "bearer",
+      model_map: {
+        haiku: { model: "org-small", context_window: 65536 },
+        sonnet: { model: "org-large", context_window: 200000 },
+      },
+    },
+    key: { present: true, enabled: true, set_at: minsAgo(60 * 24 * 3), probe: { auth_result: "ok", tool_result: "passed", probed_at: minsAgo(90) } },
+    selectedUsers: 0,
+  },
+];
