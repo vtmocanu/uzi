@@ -629,9 +629,9 @@ Plan response, the funnel and the approval classification share these rules:
   Receipts that are not eligible never make a revision ambiguous. Reporting
   differs by surface: `plan_response` reports the pair as `ambiguous`;
   `approval` follows the ranking below (current-revision ambiguity is
-  `ambiguous`; older-revision ambiguity is `ambiguous` only when no older
-  revision has a unique receipt, otherwise the run is
-  `historical_approval_only`); the funnel's `ambiguous_current` counts only
+  `ambiguous`; older-revision ambiguity counts as `ambiguous` only when no
+  older revision has a unique receipt, and otherwise the run takes the next
+  reason that applies in the ranking); the funnel's `ambiguous_current` counts only
   current-revision ambiguity.
 - **Current revision.** Human proof for a run is exactly one eligible receipt
   for the run's current gate revision. This is evidence only: an older
