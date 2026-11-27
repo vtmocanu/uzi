@@ -644,6 +644,9 @@ type RenderConfig struct {
 	// (and its spec hash) byte-identical.
 	GoBuildParallelism int
 	GoMaxProcs         int
+	// GoMemLimit renders WORKER_GO_MEMLIMIT. Empty omits the env, so unset
+	// leaves the pod template and spec hash byte-identical.
+	GoMemLimit string
 	// RunCacheCapMaxBytes / RunCacheCapFraction are relayed verbatim as the worker
 	// container's UZI_RUN_CACHE_CAP_MAX_BYTES / UZI_RUN_CACHE_CAP_FRACTION. Empty omits
 	// the env (no trimming or parsing here; the worker parses leniently), so unset config
@@ -1239,6 +1242,9 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 	}
 	if cfg.GoMaxProcs > 0 {
 		env = append(env, corev1.EnvVar{Name: "WORKER_GO_MAXPROCS", Value: strconv.Itoa(cfg.GoMaxProcs)})
+	}
+	if cfg.GoMemLimit != "" {
+		env = append(env, corev1.EnvVar{Name: "WORKER_GO_MEMLIMIT", Value: cfg.GoMemLimit})
 	}
 	if cfg.RunCacheCapMaxBytes != "" {
 		env = append(env, corev1.EnvVar{Name: "UZI_RUN_CACHE_CAP_MAX_BYTES", Value: cfg.RunCacheCapMaxBytes})

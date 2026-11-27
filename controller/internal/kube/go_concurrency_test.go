@@ -6,6 +6,43 @@ import (
 	"github.com/vtmocanu/uzi/controller/internal/protocol"
 )
 
+func TestGoMemLimitRenderAndSpecHash(t *testing.T) {
+	spec := testSpec(t, "base", "m")
+	const key = "WORKER_GO_MEMLIMIT"
+	for name, w := range map[string]protocol.DesiredWorker{
+		"plain":    desired("abc"),
+		"isolated": desiredIsolated("iso"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			base := testConfig()
+			if name == "isolated" {
+				base = laneTestConfig()
+			}
+			if _, ok := envMap(laneWorkerContainer(t, base, w))[key]; ok {
+				t.Errorf("unset config rendered %s", key)
+			}
+			set := base
+			set.GoMemLimit = "6GiB"
+			c := laneWorkerContainer(t, set, w)
+			n := 0
+			for _, e := range c.Env {
+				if e.Name == key {
+					n++
+					if e.Value != "6GiB" {
+						t.Errorf("%s = %q, want 6GiB", key, e.Value)
+					}
+				}
+			}
+			if n != 1 {
+				t.Errorf("%s rendered %d times, want 1", key, n)
+			}
+			if SpecHashOf(base, w, spec) == SpecHashOf(set, w, spec) {
+				t.Error("setting the env must roll the pod")
+			}
+		})
+	}
+}
+
 func TestGoConcurrencyRenderAndSpecHash(t *testing.T) {
 	spec := testSpec(t, "base", "m")
 	const (

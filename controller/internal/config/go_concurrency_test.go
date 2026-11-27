@@ -5,6 +5,46 @@ import (
 	"testing"
 )
 
+func TestLoadWorkerGoMemLimit(t *testing.T) {
+	const name = "UZI_WORKER_GO_MEMLIMIT"
+	load := func(t *testing.T, raw string) (Config, error) {
+		t.Helper()
+		setWorkerEnv(t)
+		t.Setenv("UZI_API_URL", "https://uzi.example.com")
+		t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "controller-token"))
+		t.Setenv(name, raw)
+		return Load()
+	}
+
+	for _, v := range []struct{ raw, want string }{
+		{"6GiB", "6GiB"}, {"512MiB", "512MiB"}, {"007GiB", "7GiB"},
+		{"\t 6GiB\n", "6GiB"}, {"2147483647GiB", "2147483647GiB"},
+		{"", ""}, {"  \t ", ""},
+	} {
+		t.Run("ok/"+v.raw, func(t *testing.T) {
+			cfg, err := load(t, v.raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.WorkerGoMemLimit != v.want {
+				t.Fatalf("got %q, want %q", cfg.WorkerGoMemLimit, v.want)
+			}
+		})
+	}
+
+	const msg = "UZI_WORKER_GO_MEMLIMIT must be a positive integer <= 2147483647 followed by MiB or GiB"
+	for _, raw := range []string{
+		"0GiB", "00MiB", "6gib", "6G", "6GB", "6", "1.5GiB", "+6GiB", "-6GiB",
+		"2147483648GiB", "off", "\ufeff6GiB", "\u00856GiB",
+	} {
+		t.Run("invalid/"+raw, func(t *testing.T) {
+			if _, err := load(t, raw); err == nil || !strings.Contains(err.Error(), msg) {
+				t.Fatalf("%q: %v", raw, err)
+			}
+		})
+	}
+}
+
 func TestLoadWorkerGoConcurrency(t *testing.T) {
 	const (
 		build = "UZI_WORKER_GO_BUILD_PARALLELISM"
