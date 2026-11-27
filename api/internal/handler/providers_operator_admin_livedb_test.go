@@ -361,47 +361,51 @@ func TestOperatorKeyAdminDeleteCascadeLiveDB(t *testing.T) {
 			return err
 		}, "model_provider_operator_keys", true},
 	} {
-		held := s.createOperator(t, "held-"+uuid.NewString()[:6])
-		s.mustPutOrgKey(t, held.ID, orgKeyFixture())
-		tx, err := s.f.pool.Begin(ctx)
-		if err != nil {
-			t.Fatal(err)
-		}
-		hid := uuid.MustParse(held.ID)
-		if err := c.hold(store.New(tx), hid); err != nil {
-			_ = tx.Rollback(ctx)
-			t.Fatalf("%s: hold: %v", c.name, err)
-		}
-		done := blockedRequest(cookieReqPrepared(t, s.f.router, http.MethodDelete, opPath(held.ID), s.admin.jwt, ""))
-		assertBlocked(t, done, "the delete ("+c.name+")")
-		if n := countRows(t, s.sharedFx, `SELECT count(*) FROM pg_stat_activity
-			WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%FOR UPDATE%' AND query LIKE '%'||$1||'%'`, c.waitsOn); n < 1 {
-			_ = tx.Rollback(ctx)
-			t.Fatalf("%s: no backend is waiting on a lock in a statement on %q", c.name, c.waitsOn)
-		}
-		if c.defHeldByD {
-			probe, err := s.f.pool.Begin(ctx)
+		// One subtest per case: the deferred rollback releases the holder on every exit (a Fatal
+		// included) before the subtest's fixture cleanup deletes the definition it locks.
+		t.Run(c.name, func(t *testing.T) {
+			held := s.createOperator(t, "held-"+uuid.NewString()[:6])
+			s.mustPutOrgKey(t, held.ID, orgKeyFixture())
+			tx, err := s.f.pool.Begin(ctx)
 			if err != nil {
-				_ = tx.Rollback(ctx)
 				t.Fatal(err)
 			}
-			_, err = probe.Exec(ctx, `SELECT 1 FROM model_providers WHERE id = $1 FOR UPDATE NOWAIT`, hid)
-			_ = probe.Rollback(ctx)
-			var pgErr *pgconn.PgError
-			if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
-				_ = tx.Rollback(ctx)
-				t.Fatalf("%s: the blocked delete does not hold the definition lock (probe = %v), want lock_not_available", c.name, err)
+			defer func() { _ = tx.Rollback(ctx) }() // a no-op after the explicit commit below
+			hid := uuid.MustParse(held.ID)
+			if err := c.hold(store.New(tx), hid); err != nil {
+				t.Fatalf("%s: hold: %v", c.name, err)
 			}
-		}
-		if err := tx.Commit(ctx); err != nil {
-			t.Fatal(err)
-		}
-		if rec := awaitDone(t, done, "the delete ("+c.name+")"); rec.Code != http.StatusOK {
-			t.Fatalf("%s: delete after the holder committed = %d %s", c.name, rec.Code, rec.Body.String())
-		}
-		if got := lastDelete(held.ID); got != "true" {
-			t.Errorf("%s: operator_key_deleted = %q, want true", c.name, got)
-		}
+			done := blockedRequest(cookieReqPrepared(t, s.f.router, http.MethodDelete, opPath(held.ID), s.admin.jwt, ""))
+			assertBlocked(t, done, "the delete ("+c.name+")")
+			if n := countRows(t, s.sharedFx, `SELECT count(*) FROM pg_stat_activity
+			WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%FOR UPDATE%' AND query LIKE '%'||$1||'%'`, c.waitsOn); n < 1 {
+				_ = tx.Rollback(ctx)
+				t.Fatalf("%s: no backend is waiting on a lock in a statement on %q", c.name, c.waitsOn)
+			}
+			if c.defHeldByD {
+				probe, err := s.f.pool.Begin(ctx)
+				if err != nil {
+					_ = tx.Rollback(ctx)
+					t.Fatal(err)
+				}
+				_, err = probe.Exec(ctx, `SELECT 1 FROM model_providers WHERE id = $1 FOR UPDATE NOWAIT`, hid)
+				_ = probe.Rollback(ctx)
+				var pgErr *pgconn.PgError
+				if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+					_ = tx.Rollback(ctx)
+					t.Fatalf("%s: the blocked delete does not hold the definition lock (probe = %v), want lock_not_available", c.name, err)
+				}
+			}
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if rec := awaitDone(t, done, "the delete ("+c.name+")"); rec.Code != http.StatusOK {
+				t.Fatalf("%s: delete after the holder committed = %d %s", c.name, rec.Code, rec.Body.String())
+			}
+			if got := lastDelete(held.ID); got != "true" {
+				t.Errorf("%s: operator_key_deleted = %q, want true", c.name, got)
+			}
+		})
 	}
 }
 
