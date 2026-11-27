@@ -465,11 +465,18 @@ Things to know:
   in `best-effort` on a kernel with Landlock. With `off` (the default) it holds
   too. Store
   only read-only, narrowly scoped registry credentials.
-- **Credential helpers.** With no `credsStore` in the configuration, the Docker
-  CLI on Linux auto-detects only the `pass` or `secretservice` helper
-  (`docker-credential-pass` when `pass` is on `PATH`, or
-  `docker-credential-secretservice`) and uses it instead of writing the login
-  to `config.json`.
+- **Credential helpers.** The login lasts across commands only when Docker
+  writes it to the run's `.docker/config.json`. The worker images ship no
+  `pass` and no `docker-credential-*` helper, so with the run's empty
+  configuration that is where `docker login` writes it. When the configuration
+  holds no `credsStore`, no `credHelpers` and no saved login, the Docker CLI on
+  Linux picks `pass` if `pass` is on
+  `PATH`, otherwise `secretservice`, and uses that helper when its
+  `docker-credential-pass` or `docker-credential-secretservice` binary is on
+  `PATH` (for example, a repo that adds one through devbox). The login is then
+  stored by that helper, not in the run's directory, and is not covered: a
+  later command may not find it (on Codex each command gets a fresh home
+  directory). Log in in the same command that uses the registry in that case.
 - **A refused directory.** On Codex, if the sandbox cannot set up the directory
   (for example a planted symlink), the command prints
   `Docker config directory unavailable` on stderr and runs without a persistent

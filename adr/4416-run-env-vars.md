@@ -826,9 +826,13 @@ Residuals:
 - (b) The owner check does not bind the directory to a run: all runs share one command uid.
 - (c) A planted `.docker` keeps a run degraded, visible only to the model through the stderr line.
 - (d) There is no size bound on `.docker`.
-- (e) The Docker CLI may detect a `docker-credential-*` helper on `PATH` when no `credsStore` is
-  set, and the command `PATH` includes the shared `/nix` only when the run is provisioned with devbox (the
-  fixed command `PATH` has no `/nix`).
+- (e) The Docker CLI may detect `docker-credential-pass` or `docker-credential-secretservice` on
+  `PATH` when the configuration holds no `credsStore`, no `credHelpers` and no saved login; the
+  secret it stores in that helper is not in `.docker` and is not covered by the guarantee: a later
+  command may not find it (on Codex each command has a fresh HOME). The worker images ship no such
+  helper. On Codex the command `PATH` includes the shared `/nix` only when the run is provisioned
+  with devbox (the fixed command `PATH` has no `/nix`); on Claude the runner `PATH` always includes
+  the shared `/nix/var/nix/profiles/default/bin`.
 - (f) A successor attempt executor gets a new home, so its login is lost; the resume note tells
   the model.
 - (g) Codex creates the grant whether or not Docker is wired; Claude sets `DOCKER_CONFIG` only
