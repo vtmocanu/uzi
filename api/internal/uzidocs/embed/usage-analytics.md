@@ -247,7 +247,7 @@ budget, so the request would otherwise have been a 503. All-time stays
 available for the owner route and for admin `user=<uuid>`; owner `all` Spend
 measured about 1.8 s (statement-level median, custom plan) on the same seed, and
 end-to-end request latency was not measured. Per-run, per-model totals for finished runs now exist (#4700) and make
-admin all-users `7d`, `30d` and `90d` about 36 to 43% faster on the same seed. All-time still misses the 8 second
+admin all-users `7d`, `30d` and `90d` about 36 to 43% faster on the same seed once the backfill is complete (with nothing stored they were up to about 4 to 5% slower). All-time still misses the 8 second
 budget in the steady state, even with every run stored, because the cost is in building the Spend document over every
 run, not in reading the totals. It stays unavailable (owner decision, 2026-11-27); see
 [ADR-4700](../adr/4700-run-usage-model-folds.md).

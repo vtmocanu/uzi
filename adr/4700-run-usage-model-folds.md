@@ -1,6 +1,6 @@
 # ADR-4700: materialized per-run, per-model usage folds; admin all-users all-time stays unavailable
 
-**Status**: Accepted, partially (issue #4700). The materialized fold, its freshness protocol, the writers and the `AnalyticsAllSpend` read path shipped. Re-enabling admin all-users `window=all` was **not adopted**: its must-pass measurement failed (see [Decision](#decision-owner-2026-11-27)).
+**Status**: Accepted, partially (issue #4700). The materialized fold, its freshness protocol, the writers and the `AnalyticsAllSpend` read path are delivered by this change. Re-enabling admin all-users `window=all` was **not adopted**: its must-pass measurement failed (see [Decision](#decision-owner-2026-11-27)).
 **Date**: 2026-11-27
 **Deciders**: lead (plan), coder (implementation and measurement), reviewer, dba (lock analysis and an independent measurement on a different host); owner (decision to keep `window=all` refused).
 **Related**: [ADR-1620](1620-custom-plan-cache-mode.md) (the generic-plan hazard the M4 measurement ran under, and the `run_usage_totals` query-shape rule); [ADR-1184](1184-admin-judge-scope.md) (D1: the owner and all-scope analytics statements stay separate, which is why only the all-scope statement reads the folds). The scoped analytics API and the 400 refusal come from #4684 (`prds/done/4684-scoped-usage-spend-api.md`); the user-facing limit is in [Usage analytics API](../docs/usage-analytics.md#performance-limit).
@@ -57,8 +57,9 @@ include. The rest of this ADR is that freshness protocol and what it costs.
 
 ### Lock inventory
 
-The `runs` row is the master lock. Everything that takes more than one lock takes the `runs`
-row first.
+The `runs` row is the master lock. Every path that takes more than one lock takes the `runs`
+row first, except materializer step (b), which locks state rows without the `runs` row;
+that is safe because it uses `SKIP LOCKED` and never waits.
 
 | Path | Locks, in order |
 |---|---|
@@ -146,12 +147,23 @@ failure or power loss.
     finds nothing.
 - A batch that hit a lane deadline is retried run by run on the next pass; a run that fails
   alone is skipped for 10 minutes. One semaphore serialises every materializer call, because
-  two concurrent calls on the same new run fail a whole batch with `55P03`. The shutdown wait
-  runs concurrently with the drain.
+  two concurrent calls on the same new run fail a whole batch with `55P03`. `UsageFolder.Wait` starts after
+  the HTTP drain and runs alongside the generated-output and prerequisite drain
+  (`drainShutdownWork` in `api/cmd/server/main.go`), bounded to 5 s.
 
-A dropped kick is caught by the sweeper after at most one missing-lane traversal (one tick
-per 2000 eligible runs) plus the backoff. Until then that run is read live, which is correct,
-only slower.
+A dropped kick is caught by the sweeper through one of two lanes, each with its own bound.
+Until then the run is read live, which is correct, only slower.
+
+- **Stale lane.** Every usage write creates or re-stales the run's state row through
+  `fn_run_usage_fold_lock`, so a run with any usage write after the upgrade is a stale-lane
+  candidate. The lane takes up to 100 runs per pass and walks the stale set by ascending
+  `run_id` with a wrapping cursor, so the worst case is one wrap of the stale set. That wrap
+  can be long: after the rollback reset below marks about 115k rows stale it takes about
+  1,158 passes, roughly 4.8 hours at one pass per 15 s.
+- **Missing lane.** It covers only eligible runs that have no state row. One tick inspects a
+  window of 2000 eligible runs, so a full traversal is one tick per 2000 eligible runs only
+  when each window yields fewer than 100 candidates; more candidates take more passes. After
+  a full traversal that finds nothing it backs off for 5 minutes.
 
 ## Operations
 
@@ -162,7 +174,8 @@ Hand-written DML on `run_usage` must, in the same transaction and **before** it 
 
 ```sql
 SELECT id FROM runs WHERE id = ANY($1) ORDER BY id FOR UPDATE;
-SELECT fn_run_usage_fold_lock(run_id) FROM unnest($1::uuid[]) AS run_id;  -- run-id order
+SELECT fn_run_usage_fold_lock(s.r)
+FROM (SELECT DISTINCT unnest($1::uuid[]) AS r ORDER BY 1) s;
 ```
 
 A refold after the commit is not enough: a reader can use the stale-but-fresh-marked fold
@@ -184,8 +197,8 @@ DELETE FROM run_usage_fold_state s WHERE NOT EXISTS (SELECT 1 FROM runs r WHERE 
   drain every pre-#4700 API writer first, then run
   `UPDATE run_usage_fold_state SET stale = true`, then start the upgraded API. An old writer
   does not call the lock function, so one that commits after the reset could leave a stale
-  fold marked fresh. The API is a single `Recreate` replica, so a forward deploy never
-  overlaps old writers; only a rollback needs this step.
+  fold marked fresh. With the chart defaults (`api.replicaCount` 1, strategy `Recreate`) a forward deploy never
+  overlaps old writers, and that guarantee depends on those values; only a rollback needs this step.
 
 ### Rejected alternative
 
@@ -197,29 +210,31 @@ touches and step (a0) to lock every run, not only the new ones.
 
 Evidence is from a build-tagged handler harness (`analyticsevidence` build tag, files
 `api/internal/handler/analytics_folds_evidence_livedb_test.go` and
+`api/internal/handler/analytics_reads_evidence_livedb_test.go` and
 `api/internal/store/analytics_evidence_livedb_test.go`). The seed is the #4684 evidence seed:
 120,000 runs (115,757 eligible), 4-CPU PostgreSQL 17, default settings, through the real
 handler with the re-enable applied in a **scratch copy only**, and the production 8 s
-snapshot timeout. The shipped handler still refuses `window=all`.
+snapshot timeout. The handler in this change still refuses `window=all`.
 
 **Read path, all runs stored.**
 
 | Mode | Result for the default `?window=all` request |
 |---|---|
-| Production plan mode (pgx cached statements; generic plan after 5 executions) | median 7.7 s, p95 8.07 s, 2 of 12 over 8 s (another run: 2 of 12 were 503); generic plans up to 4 of 12 503 |
-| Custom plans | median 6.9 s, p95 7.2 s |
+| Production plan mode (pgx cached statements; PostgreSQL may switch to a generic plan from the 6th execution when it estimates it cheaper, which these samples observed) | median 7.7 s, p95 8.07 s, 2 of 12 over 8 s (another run: 2 of 12 were 503); generic plans up to 4 of 12 503 |
+| Custom plans | median about 6.9 to 7.0 s, p95 about 7.1 to 7.2 s |
 | `split=harness&breakdown=kind` | passes in every mode (p95 at most 6.65 s) |
 
 The fold read is about 0.44 s. The remainder is the post-fold Spend document (per-run
-sorting, windowing and aggregation over about 117k runs). `work_mem` 64MB helps by about 6%.
+sorting, windowing and aggregation over about 117k runs). `work_mem` 64MB helps by about 6% for custom plans and about 0% for generic plans.
 That is why a full fold does not rescue the request.
 
 **Fallback (some runs unstored).** `split=harness&breakdown=kind` passes with up to 25% of
-runs unstored, is marginal at 40%, and returns 503 at 50% or more. With nothing stored every
+runs unstored, is marginal at 40%, and returns 503 at 50% or more under auto and generic plans (custom plans passed at 50% for that request). With nothing stored every
 sample is 503.
 
-**Controls (39 cells).** No regression and byte-identical bodies. Admin all-users `7d`, `30d`
-and `90d` are 36 to 43% faster.
+**Controls (39 cells).** Byte-identical bodies. Once the backfill is complete there is no
+regression and admin all-users `7d`, `30d` and `90d` are 36 to 43% faster. With nothing stored
+admin all-users was up to about 4 to 5% slower, within the 10% control threshold.
 
 **Backfill.** 1,159 passes at one pass per 15 s tick is about 4.8 hours for 120k runs.
 
@@ -228,8 +243,9 @@ and `90d` are 36 to 43% faster.
 - Within +0.5 ms p99 per usage write (typically +0.035 ms per upsert; worst round +0.16 ms
   in the claim shape, +0.39 ms for a bare upsert).
 - Refold: +0.93 ms p99 per run.
-- WAL: +11 to 66 B per write on active runs, about +330 B on a fresh-to-stale flip, +6.1 kB
-  per refolded run.
+- WAL: +11 to 66 B per write on active runs in the claim shape; a bare upsert on an existing
+  key measured +108 to 109 B; a fresh-to-stale flip 276 to 416 B per transaction (one write)
+  or about 330 B (five writes); +6.1 kB per refolded run.
 - The one-time legacy refold's `UPDATE runs` loses HOT updates because `00544`'s predicate
   covers `usage_refolded`.
 - Materializer: no p99 cost; p99.9 3.4 to 5.9 ms on runs being folded.
@@ -249,7 +265,7 @@ complete) would not fix that steady-state miss, so it was not built.
    `api/internal/handler/analytics.go` is unchanged. Options still omits `all` for that
    scope. Owner `all` and admin `user=<uuid>` `all` are unchanged.
 2. **Land the materialized fold** with the M4 evidence above. It makes admin all-users `7d`,
-   `30d` and `90d` about 36 to 43% faster on the same seed.
+   `30d` and `90d` about 36 to 43% faster on the same seed once the backfill is complete.
 3. **Follow-up scope.** Re-enabling all-time is out of scope here. If it is wanted later it
    is a separate issue targeting the post-fold Spend document (its per-run sorting,
    windowing and aggregation), not the fold. The DBA's per-run cost also bounds how large
