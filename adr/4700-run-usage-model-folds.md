@@ -155,8 +155,8 @@ A dropped kick is caught by the sweeper through one of two lanes, each with its 
 Until then the run is read live, which is correct, only slower.
 
 - **Stale lane.** Every usage write creates or re-stales the run's state row through
-  `fn_run_usage_fold_lock`, so a run with any usage write after the upgrade is a stale-lane
-  candidate. The lane takes up to 100 runs per pass and walks the stale set by ascending
+  `fn_run_usage_fold_lock`, so a finished, non-chat, refolded run with any usage write after
+  the upgrade is a stale-lane candidate (unless it is in the folder's skip set). The lane takes up to 100 runs per pass and walks the stale set by ascending
   `run_id` with a wrapping cursor, so the worst case is one wrap of the stale set. That wrap
   can be long: after the rollback reset below marks about 115k rows stale it takes about
   1,158 passes, roughly 4.8 hours at one pass per 15 s.
@@ -197,8 +197,9 @@ DELETE FROM run_usage_fold_state s WHERE NOT EXISTS (SELECT 1 FROM runs r WHERE 
   drain every pre-#4700 API writer first, then run
   `UPDATE run_usage_fold_state SET stale = true`, then start the upgraded API. An old writer
   does not call the lock function, so one that commits after the reset could leave a stale
-  fold marked fresh. With the chart defaults (`api.replicaCount` 1, strategy `Recreate`) a forward deploy never
-  overlaps old writers, and that guarantee depends on those values; only a rollback needs this step.
+  fold marked fresh. The API Deployment's strategy is hard-coded to `Recreate`
+  (`deploy/chart/templates/api-deployment.yaml`), so a forward deploy stops every old writer
+  before a new one starts and never overlaps them; only a rollback needs this step.
 
 ### Rejected alternative
 
@@ -225,7 +226,7 @@ snapshot timeout. The handler in this change still refuses `window=all`.
 | `split=harness&breakdown=kind` | passes in every mode (p95 at most 6.65 s) |
 
 The fold read is about 0.44 s. The remainder is the post-fold Spend document (per-run
-sorting, windowing and aggregation over about 117k runs). `work_mem` 64MB helps by about 6% for custom plans and about 0% for generic plans.
+sorting, windowing and aggregation over about 117k runs). `work_mem` 64MB helps by about 6% for custom plans and about 0 to 3% for generic plans.
 That is why a full fold does not rescue the request.
 
 **Fallback (some runs unstored).** `split=harness&breakdown=kind` passes with up to 25% of
