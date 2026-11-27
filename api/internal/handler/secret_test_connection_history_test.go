@@ -51,14 +51,14 @@ func TestCopyAnthropicHistoryLogCategories(t *testing.T) {
 			id := uuid.New()
 			h.copyAnthropicHistory(context.Background(), store.UpsertRateLimitsParams{UserSecretID: id})
 
+			// Every captured line counts: the copy must emit exactly one record, the warning.
+			out := strings.TrimSpace(logs.String())
 			var lines []string
-			for _, l := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
-				if strings.Contains(l, "usage history copy") {
-					lines = append(lines, l)
-				}
+			if out != "" {
+				lines = strings.Split(out, "\n")
 			}
 			if len(lines) != 1 {
-				t.Fatalf("history-copy log lines = %d, want 1: %q", len(lines), logs.String())
+				t.Fatalf("captured log lines = %d, want exactly 1: %q", len(lines), logs.String())
 			}
 			l := lines[0]
 			if !strings.Contains(l, "level=WARN") || !strings.Contains(l, tc.msg) ||
