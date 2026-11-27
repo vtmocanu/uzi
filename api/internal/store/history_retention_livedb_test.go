@@ -617,6 +617,13 @@ func TestHistoryRetentionFailedOpenLiveDB(t *testing.T) {
 	// is still open.
 	root.run(t, "try-lock sent, reply lost, work deadline expires", func(t *testing.T, f *hrFx) {
 		p, w := hrReplyLostPool(t, f)
+		// Warm the probe pool (dial and handshake) before the work context exists: the wrapper only
+		// arms on the try-lock write, so the 500 ms work budget is spent on the open itself.
+		warm, err := p.pool.Acquire(f.ctx)
+		if err != nil {
+			t.Fatalf("warm the probe pool: %v", err)
+		}
+		warm.Release()
 		cleanupCtx, cancelCleanup := context.WithTimeout(f.ctx, 6*time.Second)
 		defer cancelCleanup()
 		workCtx, cancelWork := context.WithTimeout(f.ctx, 500*time.Millisecond)
@@ -666,8 +673,11 @@ func TestHistoryRetentionFailedOpenLiveDB(t *testing.T) {
 		if !sawLock {
 			t.Fatalf("the server never showed an advisory lock held by the probe backend (reply hold armed=%v)", w.armed())
 		}
-		if w.closed() {
-			t.Fatal("the wrapped connection was already closed when the server-side lock was observed")
+		// The lock was held while the open was still pending: the open has not returned yet.
+		select {
+		case r := <-done:
+			t.Fatalf("open returned (%v, %v, %v) while the server-side lock was held and the reply withheld", r.s, r.got, r.err)
+		default:
 		}
 		if !w.armed() {
 			t.Fatal("the lock is held but the wrapper never saw the try-lock execute: the reply was not withheld by the design under test")
@@ -680,7 +690,9 @@ func TestHistoryRetentionFailedOpenLiveDB(t *testing.T) {
 		if !w.blockedRead() {
 			t.Error("no client read was ever blocked: the reply was not lost")
 		}
-		// The probe pool is still open here.
+		// The probe pool is still open here. The backend-gone and lock-gone assertions below also hold
+		// through pgx's own asynchronous close of the broken connection; the store-specific assertions
+		// of this subtest are the "try lock" error, got=false and s=nil above.
 		f.waitNoSessions(t, p.tag)
 		if f.count(`SELECT count(*) FROM pg_stat_activity WHERE pid = $1`, holderPID) > 0 {
 			t.Errorf("backend %d that held the lock is still alive after the open returned", holderPID)
@@ -768,6 +780,7 @@ type hrReplyLostConn struct {
 	sawSQL   bool
 	hold     bool
 	blocked  bool
+	released bool
 	isClosed bool
 	deadline time.Time
 	wake     chan struct{}
@@ -776,8 +789,17 @@ type hrReplyLostConn struct {
 // pgExecuteUnnamedPortal is the Execute message for the unnamed portal with no row limit.
 var pgExecuteUnnamedPortal = []byte{'E', 0, 0, 0, 9, 0, 0, 0, 0, 0}
 
+// pgTerminate is the Terminate message.
+var pgTerminate = []byte{'X', 0, 0, 0, 4}
+
 func (c *hrReplyLostConn) Write(b []byte) (int, error) {
 	c.mu.Lock()
+	if bytes.Equal(b, pgTerminate) {
+		// A Terminate message: the client is ending the session. Release the read hold so pgx's
+		// asynchronous close drain sees the server's EOF instead of waiting out its own deadline.
+		c.released = true
+		c.signal()
+	}
 	if !c.hold {
 		if bytes.Contains(b, []byte("pg_try_advisory_lock")) {
 			c.sawSQL = true
@@ -819,7 +841,7 @@ func (c *hrReplyLostConn) SetReadDeadline(t time.Time) error {
 func (c *hrReplyLostConn) Read(b []byte) (int, error) {
 	for {
 		c.mu.Lock()
-		if !c.hold || c.isClosed {
+		if !c.hold || c.released || c.isClosed {
 			closed := c.isClosed
 			c.mu.Unlock()
 			if closed {
@@ -855,7 +877,6 @@ func (c *hrReplyLostConn) Close() error {
 }
 
 func (c *hrReplyLostConn) armed() bool       { c.mu.Lock(); defer c.mu.Unlock(); return c.hold }
-func (c *hrReplyLostConn) closed() bool      { c.mu.Lock(); defer c.mu.Unlock(); return c.isClosed }
 func (c *hrReplyLostConn) blockedRead() bool { c.mu.Lock(); defer c.mu.Unlock(); return c.blocked }
 
 // hrTimeoutErr is the error a net.Conn read returns when its deadline passes.
@@ -875,6 +896,10 @@ func hrReplyLostPool(t *testing.T, f *hrFx) (*wcsProbe, *hrReplyLostConn) {
 	}
 	p := &wcsProbe{tag: "hr-lost-reply-" + uuid.NewString()}
 	cfg.MaxConns = 1
+	// Plaintext, so the SQL bytes the wrapper inspects are readable, and no fallback config, so
+	// exactly one dial happens.
+	cfg.ConnConfig.TLSConfig = nil
+	cfg.ConnConfig.Fallbacks = nil
 	if cfg.ConnConfig.RuntimeParams == nil {
 		cfg.ConnConfig.RuntimeParams = map[string]string{}
 	}
@@ -902,6 +927,12 @@ func hrReplyLostPool(t *testing.T, f *hrFx) (*wcsProbe, *hrReplyLostConn) {
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
+	// Close the wrapper too, so no drain goroutine or socket outlives the subtest.
+	t.Cleanup(func() {
+		if w.Conn != nil {
+			_ = w.Close()
+		}
+	})
 	p.pool = pool
 	return p, w
 }

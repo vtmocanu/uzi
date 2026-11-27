@@ -142,6 +142,8 @@ type heFx struct {
 	user   uuid.UUID
 	codex  string
 	tables []store.HistoryRetentionTable
+	// version is the server_version read on the marker check's own backend by requireEvidenceMarker.
+	version string
 }
 
 func heTableByShort(s string) store.HistoryRetentionTable {
@@ -177,7 +179,8 @@ func heRows() int { return heEnvInt("UZI_EVIDENCE_ROWS", 1_000_000) }
 // (the e2e/test-database-marker.sql shape) and EVERY path, including the cold one, verifies that
 // hrev itself carries the marker before anything mutates it, so a hrev that something else made
 // is refused. With admin=true it then migrates hrev; with admin=false (the cold tick) it opens the
-// pool and nothing else, so no query touches the history tables before the first measured tick.
+// pool and nothing else (the marker check ran on a separate pool of its own), so no query touches
+// the history tables, and none runs on fx.pool, before the first measured tick.
 func newHeFx(t *testing.T, admin bool) *heFx {
 	t.Helper()
 	if os.Getenv("UZI_HISTORY_RETENTION_EVIDENCE") != "1" {
@@ -238,7 +241,7 @@ func newHeFx(t *testing.T, admin bool) *heFx {
 	}
 	t.Cleanup(pool.Close)
 	fx.pool = pool
-	fx.log.rec("env", map[string]any{"server_version": fx.serverVersion(), "rows": heRows(), "diagnostic_overrides": heDiagnosticReasons(fx)})
+	fx.log.rec("env", map[string]any{"server_version": fx.serverVersion(), "rows": heRows(), "diagnostic_overrides": heDiagnosticReasons(fx, false)})
 	if admin {
 		fx.ensureOwner()
 	}
@@ -278,21 +281,21 @@ func (fx *heFx) requireEvidenceMarker() {
 	if err := p.QueryRow(fx.ctx, `SELECT marker FROM uzi_test_harness.database_marker`).Scan(&marker); err != nil || marker != heMarker {
 		fx.t.Fatalf("refusing to touch database %s: it does not carry the throwaway marker (marker=%q err=%v); drop it so the harness can recreate it", heDBName, marker, err)
 	}
-}
-
-func (fx *heFx) serverVersion() string {
-	fx.t.Helper()
-	var v string
-	if err := fx.pool.QueryRow(fx.ctx, `SHOW server_version`).Scan(&v); err != nil {
+	// server_version is read here, on the marker check's own backend, so fx.pool never runs it.
+	if err := p.QueryRow(fx.ctx, `SHOW server_version`).Scan(&fx.version); err != nil {
 		fx.t.Fatalf("SHOW server_version: %v", err)
 	}
-	return v
 }
 
+// serverVersion returns the version read by requireEvidenceMarker; it runs no query.
+func (fx *heFx) serverVersion() string { return fx.version }
+
 // heDiagnosticReasons lists every override that makes a run diagnostic only: fewer rows than the
-// 1,000,000 of the evidence fixture, a smoke shorter than 300 s, or a table or candidate selector
-// that narrows coverage. Empty means the run is qualifying.
-func heDiagnosticReasons(fx *heFx) []string {
+// 1,000,000 of the evidence fixture, a smoke shorter than 300 s, a table or candidate selector
+// that narrows coverage, or UZI_EVIDENCE_NO_AV=1 (autovacuum off during a compressed run). Empty
+// means the run is qualifying. forSmoke counts only the overrides that affect the smoke: the
+// candidate selector and the autovacuum switch only apply to the compressed runs.
+func heDiagnosticReasons(fx *heFx, forSmoke bool) []string {
 	var r []string
 	if n := heRows(); n < 1_000_000 {
 		r = append(r, fmt.Sprintf("UZI_EVIDENCE_ROWS=%d (below 1000000)", n))
@@ -303,8 +306,14 @@ func heDiagnosticReasons(fx *heFx) []string {
 	if len(fx.tables) < len(store.HistoryRetentionTables()) {
 		r = append(r, fmt.Sprintf("UZI_EVIDENCE_TABLES selects %d of %d tables", len(fx.tables), len(store.HistoryRetentionTables())))
 	}
+	if forSmoke {
+		return r
+	}
 	if c := heList("UZI_EVIDENCE_CANDS", heCands); len(c) < len(heCands) {
 		r = append(r, fmt.Sprintf("UZI_EVIDENCE_CANDS selects %d of %d candidates", len(c), len(heCands)))
+	}
+	if os.Getenv("UZI_EVIDENCE_NO_AV") == "1" {
+		r = append(r, "UZI_EVIDENCE_NO_AV=1 (autovacuum off during compressed runs)")
 	}
 	return r
 }
@@ -935,10 +944,12 @@ type heTabRun struct {
 }
 
 // autovacuumState reads the table's actual autovacuum_enabled reloption from pg_class.reloptions
-// (not the environment flag) and returns whether it is off, with the raw reloptions text.
+// (not the environment flag) and returns whether it is off, with the raw reloptions text. The value
+// is matched case-insensitively against the boolean spellings PostgreSQL treats as false.
 func (fx *heFx) autovacuumState(table store.HistoryRetentionTable) (off bool, reloptions string) {
 	fx.t.Helper()
-	if err := fx.pool.QueryRow(fx.ctx, `SELECT coalesce('autovacuum_enabled=false' = ANY (reloptions), false), coalesce(reloptions::text, '')
+	if err := fx.pool.QueryRow(fx.ctx, `SELECT EXISTS (SELECT 1 FROM unnest(coalesce(reloptions, '{}'::text[])) o
+		          WHERE lower(o) ~ '^autovacuum_enabled=(false|off|0|no|f|n)$'), coalesce(reloptions::text, '')
 	        FROM pg_class WHERE oid = $1::regclass`, string(table)).Scan(&off, &reloptions); err != nil {
 		fx.t.Fatalf("read reloptions of %s: %v", table, err)
 	}
@@ -1154,6 +1165,8 @@ func (fx *heFx) reportCompressed(mode, cand string, table store.HistoryRetention
 		"del_median_ms": heQuant(r.msByTick, 0.5), "del_p99_ms": heQuant(r.msByTick, 0.99), "del_max_ms": heMaxF(r.msByTick),
 		"steady_median_ms": heQuant(steady, 0.5), "steady_p99_ms": heQuant(steady, 0.99), "steady_max_ms": heMaxF(steady),
 		"insert_median_ms": heQuant(insMS, 0.5), "insert_max_ms": heMaxF(insMS)}
+	reasons := heDiagnosticReasons(fx, false)
+	kv["qualifying"], kv["diagnostic_overrides"] = len(reasons) == 0, reasons
 	// compact per-tick record: deletes per tick and latency, in 50-tick blocks to keep the log small
 	var blockDel []int64
 	var blockMax []float64
@@ -1312,7 +1325,7 @@ func TestHistoryRetentionSmokeEvidenceLiveDB(t *testing.T) {
 	kv["per_table_delta_ok"], kv["smoke_pass"] = perTable, pass2
 	kv["indexes"] = fmt.Sprint(idx)
 	kv["server_version"] = fx.serverVersion()
-	reasons := heDiagnosticReasons(fx)
+	reasons := heDiagnosticReasons(fx, true)
 	kv["qualifying"], kv["diagnostic_overrides"] = len(reasons) == 0, reasons
 	av := map[string]bool{}
 	for _, table := range store.HistoryRetentionTables() {
@@ -1349,7 +1362,10 @@ func truncateTail(s string, n int) string {
 //	otherwise                  run EXACTLY one tick of UZI_EVIDENCE_COLD_CASE (a, b or c), as the
 //	                           first work after the pool opens. A shell script restarts the
 //	                           container before each invocation. The cutoff is computed from the
-//	                           fixture spec, so no query touches the table first.
+//	                           fixture spec, so no query touches the table first. The marker
+//	                           check (requireEvidenceMarker, which also reads server_version)
+//	                           opens a separate backend first on its own pool; the tick is the
+//	                           first work on fx.pool.
 func TestHistoryRetentionColdEvidenceLiveDB(t *testing.T) {
 	table := heTableByShort(os.Getenv("UZI_EVIDENCE_COLD_TABLE"))
 	if os.Getenv("UZI_EVIDENCE_COLD_SETUP") == "1" {
