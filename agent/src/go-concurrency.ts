@@ -49,7 +49,7 @@ function optionalGoSetting(env: NodeJS.ProcessEnv, name: string): number | undef
   return value;
 }
 
-/** Parse the two optional worker settings; throws an Error naming the bad variable. */
+/** Parse the three optional worker settings; throws an Error naming the bad variable. */
 export function parseGoConcurrency(env: NodeJS.ProcessEnv): GoConcurrency {
   const out: GoConcurrency = {};
   const parallelism = optionalGoSetting(env, "WORKER_GO_BUILD_PARALLELISM");

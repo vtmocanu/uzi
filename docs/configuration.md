@@ -872,8 +872,9 @@ injected.
 | `WORKER_GO_MAXPROCS` | `goMaxProcs` | empty | Sets `GOMAXPROCS=N`: the Go runtime's CPU parallelism. The `go` command's `-p` defaults to `GOMAXPROCS`, so this also bounds package parallelism when no `-p` is set. |
 | `WORKER_GO_MEMLIMIT` | `goMemLimit` | empty | Sets `GOMEMLIMIT`: a per-process soft memory target for the Go runtime's garbage collector. |
 
-String values (quoted YAML, `--set-string`, and the controller and worker
-environment) must be positive decimal digits up to `2147483647`; surrounding
+For `goBuildParallelism` and `goMaxProcs`, string values (quoted YAML,
+`--set-string`, and the controller and worker environment) must be positive
+decimal digits up to `2147483647`; surrounding
 whitespace is trimmed, empty means unset, and leading zeros are accepted
 (`007` is `7`). Zero, signs, fractions, non-digits and larger values are
 rejected: the chart render fails, the controller refuses to start, or the worker
@@ -896,7 +897,9 @@ Precedence: `GOFLAGS` and `GOMAXPROCS` set here always win. `GOMEMLIMIT` instead
 yields to a run variable named `GOMEMLIMIT`, which reaches only lead-lane agent
 Bash (Claude) and Codex commands, including Codex delegated (subagent) commands
 and the worker's Codex Go helpers. Worker checks, JavaScript installs, the
-PR-description helper and non-lead lanes always get the operator value. The
+PR-description helper and non-lead lanes always get the operator value. A
+`GOMEMLIMIT` from a provisioned tool profile does not win: the operator value
+replaces it. The
 validation guarantee is only that a malformed operator value never reaches Go; a
 malformed run variable named `GOMEMLIMIT` still makes Go programs fail to start
 (existing behaviour).
@@ -928,7 +931,7 @@ Limits:
   `WORKER_MEMORY_GUARD_ENABLED`) or the container limit.
 - On Codex, the worker's own Go helper processes (supervisor, sandbox and
   file-operation helper) launched with the command environment also inherit
-  `GOMAXPROCS`.
+  `GOMAXPROCS` and `GOMEMLIMIT`.
 
 See [Worker setup](./worker-setup.md#3-run-the-worker) for supplying the values
 to a self-run worker.
