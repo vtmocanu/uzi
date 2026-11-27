@@ -197,7 +197,7 @@ func TestRunUsageWritersTakeFoldLock_SQL(t *testing.T) {
 		if err != nil {
 			t.Fatalf("migration %s has no numeric prefix", base)
 		}
-		if n <= 543 {
+		if n <= foldSchemaMigration(t, migs) {
 			continue
 		}
 		later++
@@ -404,4 +404,23 @@ func TestRefoldRunUsageLocksRunBeforeDelete(t *testing.T) {
 	if v := refoldProtocolViolations(t, "fixture.go", good); len(v) != 0 {
 		t.Errorf("good fixture rejected: %v", v)
 	}
+}
+
+// foldSchemaMigration returns the number of the migration that creates the fold schema
+// (run_usage_model_folds), so the writer guard scans every migration after it without a
+// hard-coded number that a landing renumber would leave stale.
+func foldSchemaMigration(t *testing.T, migs []string) int {
+	t.Helper()
+	for _, f := range migs {
+		base := filepath.Base(f)
+		if strings.HasSuffix(base, "_run_usage_model_folds.sql") {
+			n, err := strconv.Atoi(strings.SplitN(base, "_", 2)[0])
+			if err != nil {
+				t.Fatalf("fold schema migration %s has no numeric prefix", base)
+			}
+			return n
+		}
+	}
+	t.Fatal("no *_run_usage_model_folds.sql migration found")
+	return 0
 }

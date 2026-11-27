@@ -191,6 +191,11 @@ DELETE FROM run_usage_fold_state s WHERE NOT EXISTS (SELECT 1 FROM runs r WHERE 
 
 - **`TRUNCATE`** of `runs` leaves inert orphan state rows: every reader and lane joins
   through `runs`, so an orphan is never read or folded. Clean them with the statement above.
+- **`TRUNCATE` of `run_usage` alone is unsupported.** It leaves the runs and their fresh
+  fold markers in place, so Spend keeps serving the stored totals of usage that no longer
+  exists. Do it only together with, in the same transaction, invalidating the fold state
+  (`UPDATE run_usage_fold_state SET stale = true`) or clearing it
+  (`TRUNCATE run_usage_model_folds, run_usage_fold_state`).
 - **Disabled triggers and the replica role** skip the `runs` delete trigger. The same orphan
   handling applies.
 - **Rollback boundary.** For a rollback to a pre-#4700 build and a later re-upgrade, stop and
