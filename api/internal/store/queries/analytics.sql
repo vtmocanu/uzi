@@ -1759,7 +1759,7 @@ plan_legacy AS (
 fr AS MATERIALIZED (
     SELECT c.id, c.kind, c.status, c.created_at, c.auto_approve, c.has_plan, c.plan_source, c.gate_revision,
            c.repo_id, c.mr_iid, c.bidx, o.outcome,
-           COALESCE(e.cur_n, 0) AS cur_n, COALESCE(e.hist_n, 0) AS hist_n,
+           COALESCE(e.cur_n, 0) AS cur_n, COALESCE(e.hist_ok, 0) AS hist_ok, COALESCE(e.hist_amb, 0) AS hist_amb,
            COALESCE(e.legacy, false) AS legacy, COALESCE(e.any_receipt, 0) AS any_receipt,
            (c.mr_iid IS NOT NULL AND c.repo_id IS NOT NULL) AS pr_present,
            (c.mr_iid IS NOT NULL AND c.repo_id IS NOT NULL
@@ -1768,16 +1768,23 @@ fr AS MATERIALIZED (
     LEFT JOIN LATERAL (SELECT oc.outcome FROM run_outcome_classes oc WHERE oc.run_id = c.id OFFSET 0) o ON true
     -- Per-run receipt aggregate as a probe of idx_run_user_inputs_run_id: a join against a cohort-wide
     -- GROUP BY CTE is re-read once per run under a generic plan.
+    -- Eligible receipts are counted per revision (g.n): more than one on a revision proves nothing about it,
+    -- so an older revision is historical approval (hist_ok) only with exactly one, else ambiguous (hist_amb).
     LEFT JOIN LATERAL (
-        SELECT count(*) FILTER (WHERE y.ab AND y.dok AND y.cok AND y.rev = c.gate_revision) AS cur_n,
-               count(*) FILTER (WHERE y.ab AND y.dok AND y.cok AND y.rev < c.gate_revision) AS hist_n,
-               bool_or(y.gate_binding IS NULL OR y.gate_binding = 'unbound') AS legacy,
-               count(*) AS any_receipt
-        FROM (SELECT x.gate_binding, x.gate_revision AS rev,
-                     COALESCE(x.gate_binding = 'bound' AND x.gate_revision > 0 AND x.applied_at IS NOT NULL, false) AS ab,
-                     (x.disposition IS NULL OR x.disposition = 'applied') AS dok,
-                     COALESCE(x.created_at <= x.applied_at, false) AS cok
-              FROM run_user_inputs x WHERE x.run_id = c.id AND x.kind = 'approve_plan' OFFSET 0) y
+        SELECT COALESCE(max(g.n) FILTER (WHERE g.rev = c.gate_revision), 0) AS cur_n,
+               count(*) FILTER (WHERE g.rev < c.gate_revision AND g.n = 1) AS hist_ok,
+               count(*) FILTER (WHERE g.rev < c.gate_revision AND g.n > 1) AS hist_amb,
+               bool_or(g.legacy) AS legacy,
+               COALESCE(sum(g.total), 0)::bigint AS any_receipt
+        FROM (SELECT y.rev, count(*) FILTER (WHERE y.ab AND y.dok AND y.cok) AS n,
+                     bool_or(y.gate_binding IS NULL OR y.gate_binding = 'unbound') AS legacy,
+                     count(*) AS total
+              FROM (SELECT x.gate_binding, x.gate_revision AS rev,
+                           COALESCE(x.gate_binding = 'bound' AND x.gate_revision > 0 AND x.applied_at IS NOT NULL, false) AS ab,
+                           (x.disposition IS NULL OR x.disposition = 'applied') AS dok,
+                           COALESCE(x.created_at <= x.applied_at, false) AS cok
+                    FROM run_user_inputs x WHERE x.run_id = c.id AND x.kind = 'approve_plan' OFFSET 0) y
+              GROUP BY y.rev) g
     ) e ON true
     WHERE c.kind IN ('issue', 'self_improve')
 ),
@@ -1794,9 +1801,9 @@ fr_class AS (
            (f.gate_revision > 0 OR f.auto_approve OR f.any_receipt > 0) AS in_plan_cohort,
            CASE WHEN f.cur_n = 1 THEN 'human'
                 WHEN f.auto_approve THEN 'auto_approve_configured'
-                WHEN f.cur_n > 1 THEN 'ambiguous'
+                WHEN f.cur_n > 1 OR (f.hist_amb > 0 AND f.hist_ok = 0) THEN 'ambiguous'
                 WHEN f.legacy THEN 'legacy_unbound'
-                WHEN f.hist_n > 0 THEN 'historical_approval_only'
+                WHEN f.hist_ok > 0 THEN 'historical_approval_only'
                 ELSE 'no_evidence' END AS approval
     FROM fr f
 ),
@@ -1833,7 +1840,7 @@ funnel AS (
            count(*) FILTER (WHERE f.outcome = 'plan_rejected') AS o_plan_rejected,
            count(*) FILTER (WHERE f.outcome = 'base_diverged') AS o_base_diverged,
            count(*) FILTER (WHERE f.outcome IS NULL) AS o_in_progress,
-           count(*) FILTER (WHERE f.cur_n = 0 AND f.hist_n > 0) AS d_historical,
+           count(*) FILTER (WHERE f.cur_n = 0 AND f.hist_ok > 0) AS d_historical,
            count(*) FILTER (WHERE f.cur_n > 1) AS d_ambiguous,
            count(*) FILTER (WHERE f.legacy) AS d_legacy,
            count(*) FILTER (WHERE f.in_plan_cohort) AS a_total,
@@ -2189,7 +2196,7 @@ plan_legacy AS (
 fr AS MATERIALIZED (
     SELECT c.id, c.kind, c.status, c.created_at, c.auto_approve, c.has_plan, c.plan_source, c.gate_revision,
            c.repo_id, c.mr_iid, c.bidx, o.outcome,
-           COALESCE(e.cur_n, 0) AS cur_n, COALESCE(e.hist_n, 0) AS hist_n,
+           COALESCE(e.cur_n, 0) AS cur_n, COALESCE(e.hist_ok, 0) AS hist_ok, COALESCE(e.hist_amb, 0) AS hist_amb,
            COALESCE(e.legacy, false) AS legacy, COALESCE(e.any_receipt, 0) AS any_receipt,
            (c.mr_iid IS NOT NULL AND c.repo_id IS NOT NULL) AS pr_present,
            (c.mr_iid IS NOT NULL AND c.repo_id IS NOT NULL
@@ -2198,16 +2205,23 @@ fr AS MATERIALIZED (
     LEFT JOIN LATERAL (SELECT oc.outcome FROM run_outcome_classes oc WHERE oc.run_id = c.id OFFSET 0) o ON true
     -- Per-run receipt aggregate as a probe of idx_run_user_inputs_run_id: a join against a cohort-wide
     -- GROUP BY CTE is re-read once per run under a generic plan.
+    -- Eligible receipts are counted per revision (g.n): more than one on a revision proves nothing about it,
+    -- so an older revision is historical approval (hist_ok) only with exactly one, else ambiguous (hist_amb).
     LEFT JOIN LATERAL (
-        SELECT count(*) FILTER (WHERE y.ab AND y.dok AND y.cok AND y.rev = c.gate_revision) AS cur_n,
-               count(*) FILTER (WHERE y.ab AND y.dok AND y.cok AND y.rev < c.gate_revision) AS hist_n,
-               bool_or(y.gate_binding IS NULL OR y.gate_binding = 'unbound') AS legacy,
-               count(*) AS any_receipt
-        FROM (SELECT x.gate_binding, x.gate_revision AS rev,
-                     COALESCE(x.gate_binding = 'bound' AND x.gate_revision > 0 AND x.applied_at IS NOT NULL, false) AS ab,
-                     (x.disposition IS NULL OR x.disposition = 'applied') AS dok,
-                     COALESCE(x.created_at <= x.applied_at, false) AS cok
-              FROM run_user_inputs x WHERE x.run_id = c.id AND x.kind = 'approve_plan' OFFSET 0) y
+        SELECT COALESCE(max(g.n) FILTER (WHERE g.rev = c.gate_revision), 0) AS cur_n,
+               count(*) FILTER (WHERE g.rev < c.gate_revision AND g.n = 1) AS hist_ok,
+               count(*) FILTER (WHERE g.rev < c.gate_revision AND g.n > 1) AS hist_amb,
+               bool_or(g.legacy) AS legacy,
+               COALESCE(sum(g.total), 0)::bigint AS any_receipt
+        FROM (SELECT y.rev, count(*) FILTER (WHERE y.ab AND y.dok AND y.cok) AS n,
+                     bool_or(y.gate_binding IS NULL OR y.gate_binding = 'unbound') AS legacy,
+                     count(*) AS total
+              FROM (SELECT x.gate_binding, x.gate_revision AS rev,
+                           COALESCE(x.gate_binding = 'bound' AND x.gate_revision > 0 AND x.applied_at IS NOT NULL, false) AS ab,
+                           (x.disposition IS NULL OR x.disposition = 'applied') AS dok,
+                           COALESCE(x.created_at <= x.applied_at, false) AS cok
+                    FROM run_user_inputs x WHERE x.run_id = c.id AND x.kind = 'approve_plan' OFFSET 0) y
+              GROUP BY y.rev) g
     ) e ON true
     WHERE c.kind IN ('issue', 'self_improve')
 ),
@@ -2224,9 +2238,9 @@ fr_class AS (
            (f.gate_revision > 0 OR f.auto_approve OR f.any_receipt > 0) AS in_plan_cohort,
            CASE WHEN f.cur_n = 1 THEN 'human'
                 WHEN f.auto_approve THEN 'auto_approve_configured'
-                WHEN f.cur_n > 1 THEN 'ambiguous'
+                WHEN f.cur_n > 1 OR (f.hist_amb > 0 AND f.hist_ok = 0) THEN 'ambiguous'
                 WHEN f.legacy THEN 'legacy_unbound'
-                WHEN f.hist_n > 0 THEN 'historical_approval_only'
+                WHEN f.hist_ok > 0 THEN 'historical_approval_only'
                 ELSE 'no_evidence' END AS approval
     FROM fr f
 ),
@@ -2263,7 +2277,7 @@ funnel AS (
            count(*) FILTER (WHERE f.outcome = 'plan_rejected') AS o_plan_rejected,
            count(*) FILTER (WHERE f.outcome = 'base_diverged') AS o_base_diverged,
            count(*) FILTER (WHERE f.outcome IS NULL) AS o_in_progress,
-           count(*) FILTER (WHERE f.cur_n = 0 AND f.hist_n > 0) AS d_historical,
+           count(*) FILTER (WHERE f.cur_n = 0 AND f.hist_ok > 0) AS d_historical,
            count(*) FILTER (WHERE f.cur_n > 1) AS d_ambiguous,
            count(*) FILTER (WHERE f.legacy) AS d_legacy,
            count(*) FILTER (WHERE f.in_plan_cohort) AS a_total,

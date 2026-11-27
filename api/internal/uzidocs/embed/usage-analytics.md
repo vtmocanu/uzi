@@ -561,11 +561,15 @@ never null.
   - `outcomes` are exclusive and sum to `stages.created`: `completed`,
     `failed`, `cancelled`, `plan_rejected`, `base_diverged` and `in_progress`
     (no outcome yet).
-  - `disclosure` counts runs with incomplete approval evidence:
-    `historical_approval_only`, `ambiguous_current` and `legacy_evidence`
-    (an `issue` or `self_improve` run with any no-binding or `unbound`
-    `approve_plan` receipt, even when the run also has timed pairs or current
-    human proof). These counts are not additive with
+  - `disclosure` counts runs with incomplete approval evidence.
+    `historical_approval_only` counts runs with no eligible receipt for the
+    current revision and at least one older revision with exactly one eligible
+    receipt; it is a disclosure counter, independent of the `approval` ranking.
+    `ambiguous_current` counts runs with more than one eligible receipt for the
+    current revision. A run whose only older evidence is ambiguous is counted
+    in neither. `legacy_evidence` counts an `issue` or `self_improve` run with
+    any no-binding or `unbound` `approve_plan` receipt, even when the run also
+    has timed pairs or current human proof. These counts are not additive with
     each other, with `approval.unknown` or with plan response `unknown`: a run
     can appear in several.
   - `pr_units` counts **distinct PRs**, not runs. A PR is the pair (repo, PR
@@ -583,8 +587,12 @@ never null.
   by an eligible applied receipt (below). `auto_approve_configured` has no
   human proof but the run has `auto_approve` set; it is configuration, not an
   observed event, and carries no timestamp. Human proof wins over
-  configuration. `unknown` is split by the first reason that applies:
-  `ambiguous`, `legacy_unbound`, `historical_approval_only`, `no_evidence`.
+  configuration. `unknown` is split by the first reason that applies, in this
+  order: `ambiguous` (more than one eligible current-revision receipt, or
+  older-revision ambiguity with no uniquely approved older revision),
+  `legacy_unbound`, `historical_approval_only` (at least one older revision
+  with exactly one eligible receipt), `no_evidence`. See
+  [Approval evidence](#approval-evidence) for the ranking.
   `applicable` follows the funnel.
 - **`issue_elapsed`** is `COALESCE(finished_at, status_since) - first_started_at`
   for terminal `issue` runs in the creation cohort, so it includes held time.
@@ -617,12 +625,19 @@ Plan response, the funnel and the approval classification share these rules:
   applied. A superseded, declined or advisory receipt is not eligible, and an
   input that was only acknowledged is not applied.
 - **Ambiguity.** More than one eligible receipt for the same run and revision
-  is ambiguous: it proves nothing and is reported as such. Receipts that are
-  not eligible never make a pair ambiguous.
+  is ambiguous evidence for that revision: it proves nothing about it.
+  Receipts that are not eligible never make a revision ambiguous. Reporting
+  differs by surface: `plan_response` reports the pair as `ambiguous`;
+  `approval` follows the ranking below (current-revision ambiguity is
+  `ambiguous`; older-revision ambiguity is `ambiguous` only when no older
+  revision has a unique receipt, otherwise the run is
+  `historical_approval_only`); the funnel's `ambiguous_current` counts only
+  current-revision ambiguity.
 - **Current revision.** Human proof for a run is exactly one eligible receipt
-  for the run's current gate revision. An eligible receipt only for an earlier
-  revision is `historical_approval_only`. Revisions are never matched across
-  runs.
+  for the run's current gate revision. This is evidence only: an older
+  revision with exactly one eligible receipt is historical approval evidence,
+  an older revision with more than one proves nothing, and the run's label is
+  decided by the ranking below. Revisions are never matched across runs.
 - **Legacy and unbound.** A receipt written before gate binding (no binding) or
   recorded as `unbound` never proves an approval. A run with such an
   `approve_plan` receipt is counted once in plan response
@@ -635,9 +650,14 @@ Plan response, the funnel and the approval classification share these rules:
   receipts all fail eligibility is `invalid_chronology` or
   `excluded_disposition`.
 - **Approval classification ranks separately.** `approval` places a run by the
-  first reason that applies: human, `auto_approve_configured`, `ambiguous`,
-  then `legacy_unbound`, so a run with current human proof is `human` there
-  while still counted in the disclosure and plan response legacy counts.
+  first reason that applies: human (exactly one eligible current-revision
+  receipt), `auto_approve_configured`, `ambiguous` (more than one eligible
+  current receipt, or older-revision ambiguity with no uniquely approved older
+  revision), `legacy_unbound`, `historical_approval_only` (at least one older
+  revision with exactly one eligible receipt), then `no_evidence`. Current
+  human proof and auto-approve configuration rank ahead of any older
+  ambiguity, so a run with current human proof is `human` there while still
+  counted in the disclosure and plan response legacy counts.
 - **Disclosure counts are not additive.** `unknown.legacy_unbound`,
   `disclosure.legacy_evidence` and `approval.unknown.legacy_unbound` have
   different populations and precedence, and must not be summed or compared as
