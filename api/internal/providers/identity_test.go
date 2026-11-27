@@ -26,7 +26,7 @@ func TestResolveModelIDFixture(t *testing.T) {
 	if err := json.Unmarshal(raw, &cases); err != nil {
 		t.Fatal(err)
 	}
-	const wantCases = 11
+	const wantCases = 14
 	if len(cases) != wantCases {
 		t.Fatalf("fixture has %d cases, want %d", len(cases), wantCases)
 	}
@@ -55,10 +55,24 @@ func TestResolveModelIDFixture(t *testing.T) {
 		"claude inherit goes through sonnet", "codex key with a differing target",
 		"codex key absent and not explicit gives default", "codex key absent and explicit is unresolved",
 		"codex blank gives default", "codex requested default literal with explicit",
+		"claude whitespace-only goes through sonnet", "codex explicit blank is unresolved",
+		"codex requested default literal without explicit",
 	} {
 		if !seen[name] {
 			t.Errorf("fixture case %q was not exercised", name)
 		}
+	}
+}
+
+// An empty target in the map is Unresolved (fail closed). Go-only: the agent treats it differently by
+// design and the map validator refuses empty targets, so it is not a shared fixture case.
+func TestResolveModelIDEmptyTargetFailsClosed(t *testing.T) {
+	m := ModelMap{"default": {Model: ""}, "sonnet": {Model: ""}}
+	if got, ok := ResolveModelID(EngineCodex, m, "default", false); ok {
+		t.Errorf("codex empty target: got (%q, true), want unresolved", got)
+	}
+	if got, ok := ResolveModelID(EngineClaude, m, "sonnet", false); ok {
+		t.Errorf("claude empty target: got (%q, true), want unresolved", got)
 	}
 }
 

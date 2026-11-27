@@ -41,6 +41,18 @@ describe("provider model identity contract (PRD #4574 M2)", () => {
   const cases = readCases();
 
   it("resolves each case exactly as the fixture states", () => {
+    // Pinned here, independent of the fixture: deleting or renaming a fixture case turns this red.
+    // Keep in step with the name list in api/internal/providers/identity_test.go.
+    const expected = [
+      "claude alias present", "claude alias absent", "claude target value maps to itself",
+      "claude non-alias value matching no target", "claude blank goes through sonnet",
+      "claude inherit goes through sonnet", "claude whitespace-only goes through sonnet",
+      "codex key with a differing target", "codex key absent and not explicit gives default",
+      "codex key absent and explicit is unresolved", "codex blank gives default",
+      "codex explicit blank is unresolved", "codex requested default literal without explicit",
+      "codex requested default literal with explicit",
+    ];
+    assert.deepEqual([...cases.map((c) => c.name)].sort(), [...expected].sort(), "fixture case names");
     const seen = new Set<string>();
     for (const c of cases) {
       if (c.resolved === null) {
@@ -51,7 +63,6 @@ describe("provider model identity contract (PRD #4574 M2)", () => {
       seen.add(c.name);
     }
     assert.equal(seen.size, cases.length, "case names must be unique");
-    for (const c of cases) assert.ok(seen.has(c.name), `case not exercised: ${c.name}`);
     assert.ok(cases.length > 0);
     assert.ok(cases.some((c) => c.engine === "claude"), "no claude case");
     assert.ok(cases.some((c) => c.engine === "codex"), "no codex case");

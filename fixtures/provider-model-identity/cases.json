@@ -48,6 +48,14 @@
     "resolved": "gw-sonnet"
   },
   {
+    "name": "claude whitespace-only goes through sonnet",
+    "engine": "claude",
+    "map": {"haiku": {"model": "gw-haiku"}, "opus": {"model": "gw-opus"}, "sonnet": {"model": "gw-sonnet"}},
+    "requested": "  ",
+    "explicit": false,
+    "resolved": "gw-sonnet"
+  },
+  {
     "name": "codex key with a differing target",
     "engine": "codex",
     "map": {"default": {"model": "gw-default"}, "gpt-6-sol": {"model": "gw-sol"}},
@@ -76,6 +84,22 @@
     "engine": "codex",
     "map": {"default": {"model": "gw-default"}, "gpt-6-sol": {"model": "gw-sol"}},
     "requested": "",
+    "explicit": false,
+    "resolved": "gw-default"
+  },
+  {
+    "name": "codex explicit blank is unresolved",
+    "engine": "codex",
+    "map": {"default": {"model": "gw-default"}, "gpt-6-sol": {"model": "gw-sol"}},
+    "requested": "",
+    "explicit": true,
+    "resolved": null
+  },
+  {
+    "name": "codex requested default literal without explicit",
+    "engine": "codex",
+    "map": {"default": {"model": "gw-default"}, "gpt-6-sol": {"model": "gw-sol"}},
+    "requested": "default",
     "explicit": false,
     "resolved": "gw-default"
   },

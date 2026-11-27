@@ -58,6 +58,11 @@ func targetOf(m ModelMap, key string) (string, bool) {
 
 // NormalizedHost returns the host of a stored (already normalized) provider base URL. Stored
 // values are lowercase with no trailing dot, so the result is comparable by string equality.
+//
+// The port and path are deliberately dropped: two gateways on one host are treated as the same
+// provider. A SameModel outcome fails closed (the checker is refused), so the wider match can only
+// over-refuse, never admit a shared model. A caller must treat an error here as a refusal and never
+// compare an empty host.
 func NormalizedHost(baseURL string) (string, error) {
 	norm, err := NormalizeBaseURL(baseURL, true)
 	if err != nil {
@@ -67,7 +72,7 @@ func NormalizedHost(baseURL string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("base URL host: %w", err)
 	}
-	return strings.ToLower(host), nil
+	return host, nil
 }
 
 // IdentityOutcome is the result of comparing the lead's and the checker's resolved model identity.

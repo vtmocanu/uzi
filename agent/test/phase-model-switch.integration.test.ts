@@ -119,6 +119,9 @@ test("Claude phase case 9: init precedes requests but is not a prompt or abort a
 test("Claude phase: an alias request reports the canonical id as observed_model, never the alias", async () => {
   const { CLAUDE_CANONICAL_MODELS } = await import("../src/claude-canonical-models.js");
   const { toLeadObservation } = await import("../src/runtime-observation.js");
+  const { LeadConfigReporter } = await import("../src/lead-config-report.js");
+  const noop = () => {};
+  const logger = { debug: noop, info: noop, warn: noop, error: noop, addSecret: noop } as never;
   for (const [alias, turn] of [["opus", a], ["sonnet", b]] as const) {
     const canonical = CLAUDE_CANONICAL_MODELS[alias];
     assert.ok(canonical, `${alias}: the table carries a canonical id`);
@@ -126,6 +129,20 @@ test("Claude phase: an alias request reports the canonical id as observed_model,
     const reported = toLeadObservation({ model: turn.model, modelEvidence: "claude_init", effortEvidence: "unknown" });
     assert.equal(reported.model, canonical, `${alias}: observed_model is the canonical id`);
     assert.equal(reported.modelEvidence, "claude_init");
+
+    // The wire body the real reporter POSTs: requested_model stays the alias, observed_model is canonical.
+    const posts: Array<Record<string, unknown>> = [];
+    const reporter = new LeadConfigReporter({
+      client: { async recordLeadConfig(_id, body) { posts.push(structuredClone(body) as unknown as Record<string, unknown>); return { kind: "ok" }; } },
+      runId: "run-1", claimGeneration: 1, active: true, logger,
+    });
+    const entry = await reporter.enterPhase("implement", { model: alias, modelSource: "builtin", effortMode: "runtime_default", effortSource: "builtin" });
+    reporter.observe(entry, reported);
+    for (let i = 0; i < 200 && posts.length < 2; i++) await new Promise((r) => setTimeout(r, 5));
+    assert.equal(posts.length, 2, `${alias}: request row then observation row`);
+    assert.equal(posts[1]?.requested_model, alias);
+    assert.equal(posts[1]?.observed_model, canonical, `${alias}: the posted observed_model is the canonical id`);
+    assert.equal(posts[1]?.observed_model_evidence, "claude_init");
   }
 });
 
