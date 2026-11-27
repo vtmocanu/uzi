@@ -1,6 +1,6 @@
 ---
 title: Pull request merge and close history
-order: 70
+order: 71
 audience: operator
 ---
 
