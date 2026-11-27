@@ -14068,13 +14068,13 @@ SELECT * FROM cross_checks WHERE lead_run_id = @lead_run_id AND stage = 'plan' O
 
 -- name: CreatePlanCrossCheckChild :one
 -- Preserve the lead's frozen inference policy; declared requirements keep their repo-hint source.
--- model_provider_key_mode (PRD #4320 M4), class REFUSED-LANE: written as an explicit NULL because this lane does not support provider-sourced runs yet (PRD #4322); workersvc refuses provider_lane_unsupported BEFORE this INSERT for a provider-sourced owner.
+-- The five model_provider_* columns (PRD #4574 M2) are stamped from sqlc.narg parameters: all NULL is a vendor checker, all set is a provider-bound checker. createRunAtomic decides the lane under the shared secret-mutation lock (checkerLaneDecision) and verifyRunBinding asserts the inserted row equals the resolution, so an unstamped provider decision fails closed (errProviderBindingMismatch).
 INSERT INTO runs (id, user_id, repo_id, kind, target_run_id, harness, priority,
                   report_only, budget_wall_seconds, dispatched_at, auto_approve,
-                  issue_title, issue_description, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, trigger_source, worker_id, model_provider_key_mode)
+                  issue_title, issue_description, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, trigger_source, worker_id, model_provider_id, model_provider_revision, model_provider_key_mode, model_provider_key_secret_id, model_provider_key_rev)
 SELECT @child_id, lead.user_id, lead.repo_id, 'cross_check', lead.id, @child_harness::text, 2,
        true, @budget_wall_seconds::int, now(), true, lead.issue_title, lead.issue_description,
-       COALESCE(repo.required_capabilities, '{}'), COALESCE(repo.required_capabilities, '{}'), lead.ignored_inferred_capabilities, 'cross_check', lead.worker_id, NULL::text
+       COALESCE(repo.required_capabilities, '{}'), COALESCE(repo.required_capabilities, '{}'), lead.ignored_inferred_capabilities, 'cross_check', lead.worker_id, sqlc.narg('model_provider_id')::uuid, sqlc.narg('model_provider_revision')::int, sqlc.narg('model_provider_key_mode')::text, sqlc.narg('model_provider_key_secret_id')::uuid, sqlc.narg('model_provider_key_rev')::bigint
 FROM runs lead JOIN repos repo ON repo.id = lead.repo_id
 WHERE lead.id = @lead_run_id AND lead.user_id = @user_id
   AND lead.worker_id = @worker_id AND lead.claim_generation = @claim_generation

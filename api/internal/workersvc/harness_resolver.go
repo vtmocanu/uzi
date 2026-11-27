@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/codexselect"
+	"github.com/vtmocanu/uzi/api/internal/providers"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -470,29 +471,66 @@ func explicitHarnessRefusal(ctx context.Context, q harnessResolverStore, userID 
 	return errNoCredentialForHarness
 }
 
-// BothHarnessesUsable applies the same credential rules as run creation when a user
-// enables plan cross-check. In particular, Codex must be usable under the user's
-// codex_account_mode (resolveUsableCodexCredential); no usage score is read.
+// BothHarnessesUsable is the consent toggle's check (T, PRD #4574 M2, owner decision Q3). Each half
+// follows the lane decision, with the lead's provider-boundness unknown (false) at enable time:
+//   - Codex half: checkerLaneDecision for a Codex checker. Provider (a selected Codex source) is usable
+//     exactly when that source is usable, and a selected but unusable source is not usable even with a
+//     usable vendor Codex credential (a Provider decision never resolves to vendor). Refused (a selected
+//     Claude source and no Codex source) is not usable, as before. Vendor keeps today's rule: the
+//     Codex credential must be usable under the user's codex_account_mode (resolveUsableCodexCredential);
+//     no usage score is read.
+//   - Claude half: a selected Claude source is usable exactly when that source is usable (a selected but
+//     unusable source is not usable even with a vendor Anthropic token); with no Claude source, today's
+//     vendor Anthropic check. This follows how Claude runs resolve, not the Claude-checker decision.
 func (s *Service) BothHarnessesUsable(ctx context.Context, userID uuid.UUID) (bool, error) {
 	q, ok := s.harnessStore()
 	if !ok {
 		return false, errHarnessStoreUnavailable
 	}
-	if err := s.refuseProviderLane(ctx, q, userID, HarnessCodex); err != nil {
-		if errors.Is(err, ErrProviderLaneUnsupported) {
-			return false, nil
-		}
-		return false, err
-	}
-	claude, _, err := s.claudeAvailability(ctx, q, userID, true)
+	sources, err := q.GetUserProviderLaneSources(ctx, userID)
 	if err != nil {
 		return false, err
 	}
-	if !claude {
+	var codexVendor bool
+	switch checkerLaneDecision(false, HarnessCodex, sources) {
+	case checkerLaneRefused:
 		return false, nil
+	case checkerLaneProvider:
+		usable, err := s.providerSourceUsable(ctx, q, userID, HarnessCodex)
+		if err != nil || !usable {
+			return false, err
+		}
+	default:
+		codexVendor = true
+	}
+	if sources.ClaudeProviderID.Valid {
+		usable, err := s.providerSourceUsable(ctx, q, userID, HarnessClaude)
+		if err != nil || !usable {
+			return false, err
+		}
+	} else {
+		claude, _, err := s.claudeAvailability(ctx, q, userID, true)
+		if err != nil {
+			return false, err
+		}
+		if !claude {
+			return false, nil
+		}
+	}
+	if !codexVendor {
+		return true, nil
 	}
 	_, codex, err := s.resolveUsableCodexCredential(ctx, userID, q)
 	return codex, err
+}
+
+// providerSourceUsable reports whether the owner's selected source for an engine is usable.
+func (s *Service) providerSourceUsable(ctx context.Context, q harnessResolverStore, userID uuid.UUID, engine Harness) (bool, error) {
+	src, err := ResolveProviderSource(ctx, q, userID, string(engine), s.providerAllow)
+	if err != nil {
+		return false, err
+	}
+	return src.State == ProviderSourceUsable, nil
 }
 
 // ResolveSettingsHarness resolves the harness the settings surface projects the legacy
@@ -777,15 +815,15 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 			// A provider binding's re-check and insert need one transaction: fail closed.
 			return store.Run{}, resolvedHarness{}, errProviderCreateRequiresTx
 		}
-		if (origin.RefuseProviderOwner || origin.JudgeLane || origin.JobLane) && (explicit == nil || (*explicit != HarnessClaude && *explicit != HarnessCodex)) {
+		if (origin.CheckerLane || origin.JudgeLane || origin.JobLane) && (explicit == nil || (*explicit != HarnessClaude && *explicit != HarnessCodex)) {
 			return store.Run{}, resolvedHarness{}, ErrProviderLaneUnsupported
 		}
 		rq, ok := s.harnessStore()
 		if !ok {
 			return store.Run{}, resolvedHarness{}, errHarnessStoreUnavailable
 		}
-		if origin.RefuseProviderOwner {
-			if err := s.refuseProviderLane(ctx, rq, userID, *explicit); err != nil {
+		if origin.CheckerLane {
+			if err := s.checkerLaneNonAtomic(ctx, rq, userID, *explicit, origin.LeadProviderBound); err != nil {
 				return store.Run{}, resolvedHarness{}, err
 			}
 		}
@@ -799,7 +837,7 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 				return store.Run{}, resolvedHarness{}, err
 			}
 		}
-		res, err := s.resolveRunHarnessMode(ctx, userID, explicit, rq, inherit != nil || origin.RefuseProviderOwner || origin.JudgeLane || origin.JobLane)
+		res, err := s.resolveRunHarnessMode(ctx, userID, explicit, rq, inherit != nil || origin.CheckerLane || origin.JudgeLane || origin.JobLane)
 		if err != nil {
 			return store.Run{}, resolvedHarness{}, err
 		}
@@ -858,14 +896,6 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 		}
 	}
 
-	if origin.RefuseProviderOwner {
-		if explicit == nil {
-			return store.Run{}, resolvedHarness{}, ErrProviderLaneUnsupported
-		}
-		if err := s.refuseProviderLane(ctx, qtx, userID, *explicit); err != nil {
-			return store.Run{}, resolvedHarness{}, err
-		}
-	}
 	// A judge decides its lane under the shared secret-mutation lock (PRD #4322 M1a): the lock is
 	// taken after the consumer gate and before the policy read, and held to commit, so every writer
 	// of the pin policy and the sources (all exclusive) is ordered before this read or after commit.
@@ -925,6 +955,33 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 			jobProvider = true
 		}
 	}
+	// A checker child decides its lane under the same shared lock (PRD #4574 M2), taken BEFORE the
+	// source read and held to commit, at the JobLane position: every writer of the sources takes it
+	// exclusively, so the one decision below is ordered before such a write or after its commit. The
+	// creation closure takes the lead row lock only after this (secret lock, then lead row). It is
+	// taken on every checker creation, Vendor and Refused included.
+	checkerProvider := false
+	if origin.CheckerLane {
+		if explicit == nil || (*explicit != HarnessClaude && *explicit != HarnessCodex) {
+			return store.Run{}, resolvedHarness{}, ErrProviderLaneUnsupported
+		}
+		if err := store.LockSecretMutationShared(ctx, tx, userID); err != nil {
+			return store.Run{}, resolvedHarness{}, fmt.Errorf("checker lane: secret lock: %w", err)
+		}
+		sources, err := qtx.GetUserProviderLaneSources(ctx, userID)
+		if err != nil {
+			return store.Run{}, resolvedHarness{}, err
+		}
+		if s.checkerDecidedHook != nil {
+			s.checkerDecidedHook(ctx)
+		}
+		switch checkerLaneDecision(origin.LeadProviderBound, *explicit, sources) {
+		case checkerLaneRefused:
+			return store.Run{}, resolvedHarness{}, ErrProviderLaneUnsupported
+		case checkerLaneProvider:
+			checkerProvider = true
+		}
+	}
 	if inheritedProvider {
 		// A successor of a provider-bound run uses the SOURCE RUN's binding and never consults the
 		// owner's current source (PRD #4320 inheritance).
@@ -953,7 +1010,7 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 	// columns from the source frozen under the shared lock (freezeProviderJudge). A provider JOB is the one guarded lane
 	// that does consult the source: it resolves it (usable, or typed ErrProviderSourceUnusable) and
 	// freezes it below, while a vendor job (no Claude source under the shared lock) is vendorOnly.
-	vendorOnly := inherit != nil || origin.RefuseProviderOwner || origin.JudgeLane || (origin.JobLane && !jobProvider)
+	vendorOnly := inherit != nil || origin.JudgeLane || (origin.JobLane && !jobProvider) || (origin.CheckerLane && !checkerProvider)
 	resolve := func() (resolvedHarness, error) {
 		return s.resolveRunHarnessMode(ctx, userID, explicit, qtx, vendorOnly)
 	}
@@ -977,9 +1034,9 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 		if err != nil {
 			return store.Run{}, resolvedHarness{}, err
 		}
-		if jobProvider && res.ProviderSource == nil {
+		if (jobProvider || checkerProvider) && res.ProviderSource == nil {
 			// The lane read saw a Claude source but the resolution carries none: never fall through to a
-			// vendor job under a selected source.
+			// vendor job or checker under a selected source.
 			return store.Run{}, resolvedHarness{}, &ProviderSourceUnusableError{Reason: SourceUnusableProviderMissing}
 		}
 	}
@@ -1197,6 +1254,14 @@ func (s *Service) verifyRunBinding(ctx context.Context, q *store.Queries, run st
 		// A judge runs one model, not a lead plus templates: validate it strictly (PRD #4322 M1a).
 		return s.checkProviderJudgeModel(ctx, q, run, *res.ProviderSource)
 	}
+	if run.Kind == runkind.CrossCheck {
+		// A checker's model is decided at claim time (the same-model guard resolves it then), so
+		// creation validates only the frozen map: no lead or template model is read (PRD #4574 M2).
+		if providers.ValidateModelMapForEngine(res.ProviderSource.Engine, res.ProviderSource.ModelMap) != nil {
+			return errProviderBindingMismatch
+		}
+		return nil
+	}
 	if run.Kind == runkind.Job {
 		// A job runs one model, not a lead plus templates: validate it strictly (PRD #4322 M1b).
 		return s.checkProviderJobModel(ctx, q, run, *res.ProviderSource)
@@ -1221,6 +1286,70 @@ func (s *Service) refuseProviderLane(ctx context.Context, q providerLaneSourceRe
 	}
 	if sources.ClaudeProviderID.Valid || (lane == HarnessCodex && sources.CodexProviderID.Valid) {
 		return ErrProviderLaneUnsupported
+	}
+	return nil
+}
+
+// checkerLaneKind is the outcome of checkerLaneDecision.
+type checkerLaneKind int
+
+const (
+	// checkerLaneRefused: the checker has no lane (ErrProviderLaneUnsupported, the stage's
+	// unavailable sink).
+	checkerLaneRefused checkerLaneKind = iota
+	// checkerLaneVendor: the checker resolves vendor credentials only (today's path).
+	checkerLaneVendor
+	// checkerLaneProvider: the checker is provider-bound to the owner's source for its engine,
+	// frozen under the shared secret-mutation lock; an unusable source fails closed.
+	checkerLaneProvider
+)
+
+// checkerLaneDecision is the one pure decision for a cross-check checker creation, its recheck and its
+// attestation (PRD #4574 M2), over the lead's provider-boundness, the checker's engine and one
+// GetUserProviderLaneSources read:
+//   - Codex checker: a selected Codex source is Provider; otherwise a provider-bound lead or a selected
+//     Claude source is Refused (today's refusal), else Vendor.
+//   - Claude checker: a selected Claude source or a provider-bound lead is Refused (PRD #4322 M2 widens
+//     it), else Vendor.
+//
+// Any other engine is Refused.
+func checkerLaneDecision(leadProviderBound bool, checkerEngine Harness, sources store.GetUserProviderLaneSourcesRow) checkerLaneKind {
+	switch checkerEngine {
+	case HarnessCodex:
+		if sources.CodexProviderID.Valid {
+			return checkerLaneProvider
+		}
+		if leadProviderBound || sources.ClaudeProviderID.Valid {
+			return checkerLaneRefused
+		}
+		return checkerLaneVendor
+	case HarnessClaude:
+		if leadProviderBound || sources.ClaudeProviderID.Valid {
+			return checkerLaneRefused
+		}
+		return checkerLaneVendor
+	default:
+		return checkerLaneRefused
+	}
+}
+
+// checkerLaneNonAtomic is the checker lane check for the creation paths that have no transaction (no
+// beginner wired, or the in-memory fake store), so no secret-mutation lock: Refused keeps
+// ErrProviderLaneUnsupported, Vendor proceeds to today's outcome per checker engine, and only a
+// Provider decision fails closed with errProviderCreateRequiresTx (its freeze needs the atomic create).
+func (s *Service) checkerLaneNonAtomic(ctx context.Context, q providerLaneSourceReader, userID uuid.UUID, lane Harness, leadProviderBound bool) error {
+	if lane != HarnessClaude && lane != HarnessCodex {
+		return ErrProviderLaneUnsupported
+	}
+	sources, err := q.GetUserProviderLaneSources(ctx, userID)
+	if err != nil {
+		return err
+	}
+	switch checkerLaneDecision(leadProviderBound, lane, sources) {
+	case checkerLaneRefused:
+		return ErrProviderLaneUnsupported
+	case checkerLaneProvider:
+		return errProviderCreateRequiresTx
 	}
 	return nil
 }

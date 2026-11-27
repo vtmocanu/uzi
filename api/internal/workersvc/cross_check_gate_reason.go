@@ -102,20 +102,31 @@ func (s *Service) validatePlanCrossCheckGateReason(ctx context.Context, q Store,
 		if !ok {
 			return ErrInvalidState
 		}
-		// PRD #4320: a provider-bound lead or a refused owner selection has no
-		// checker lane (provider_lane_unsupported until PRD #4322). That is the server's own fact,
-		// attested here, so the plan lands on the human gate (a non-pass never auto-approves).
-		if providerBoundRun(lead) {
-			return nil
-		}
+		// PRD #4574 M2: the same checkerLaneDecision the creation used, over a fresh read of the lead's
+		// frozen binding and the owner's sources. Refused is the server's own fact (the stage lands on
+		// the human gate; a non-pass never auto-approves). Provider is attested only when its source
+		// is unusable, since no child exists at attestation; a usable source has a checker lane, and
+		// a source that vanished is no fact to attest. Only Vendor runs the vendor-resolution check.
 		harness, known := oppositeHarness(lead.Harness)
 		if !known {
 			return ErrInvalidState
 		}
-		if lerr := s.refuseProviderLane(ctx, resolver, lead.UserID, harness); errors.Is(lerr, ErrProviderLaneUnsupported) {
+		sources, serr := resolver.GetUserProviderLaneSources(ctx, lead.UserID)
+		if serr != nil {
+			return serr
+		}
+		switch checkerLaneDecision(providerBoundRun(lead), harness, sources) {
+		case checkerLaneRefused:
 			return nil
-		} else if lerr != nil {
-			return lerr
+		case checkerLaneProvider:
+			src, perr := ResolveProviderSource(ctx, resolver, lead.UserID, string(harness), s.providerAllow)
+			if perr != nil {
+				return perr
+			}
+			if src.State == ProviderSourceUnusable {
+				return nil
+			}
+			return ErrInvalidState
 		}
 		_, err := s.resolveRunHarnessMode(ctx, lead.UserID, &harness, resolver, true)
 		if errors.Is(err, ErrNoCredentialForHarness) || errors.Is(err, ErrHarnessCredentialDisabled) {
