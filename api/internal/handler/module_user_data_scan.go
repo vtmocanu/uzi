@@ -36,7 +36,6 @@ type scannedModuleDoc struct {
 	data []byte
 	// expectedRevision is nil when expected_revision is null.
 	expectedRevision *string
-	members          []docMember
 }
 
 func isJSONWS(c byte) bool { return c == ' ' || c == '\t' || c == '\n' || c == '\r' }
@@ -230,7 +229,7 @@ func scanModuleDoc(b []byte) (*scannedModuleDoc, error) {
 	if bytes.Equal(dataSpan, []byte("null")) {
 		return nil, errData()
 	}
-	out := &scannedModuleDoc{members: members}
+	out := &scannedModuleDoc{}
 	rs := b[members[revIdx].val.start:members[revIdx].val.end]
 	if !bytes.Equal(rs, []byte("null")) {
 		var s string

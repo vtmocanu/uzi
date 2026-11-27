@@ -3,6 +3,7 @@ package handler
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"reflect"
 	"strings"
@@ -48,6 +49,13 @@ func TestScanModuleDocRejects(t *testing.T) {
 		if _, err := scanModuleDoc([]byte(body)); err == nil {
 			t.Errorf("%s: accepted %.80q", name, body)
 		}
+	}
+	// The scanner's own depth guard (D2) answers "invalid data"; stdlib's json.Valid would
+	// only reject the same body later as "invalid request body".
+	deep := wrap(strings.Repeat("[", 10001) + strings.Repeat("]", 10001))
+	var de *moduleDocError
+	if _, err := scanModuleDoc([]byte(deep)); !errors.As(err, &de) || de.Msg != "invalid data" {
+		t.Errorf("depth 10001: err = %v, want the scanner's depth guard (invalid data)", err)
 	}
 }
 
