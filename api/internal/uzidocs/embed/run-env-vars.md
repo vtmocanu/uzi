@@ -443,8 +443,10 @@ printf '%s' "$REGISTRY_PASSWORD" | docker login "$REGISTRY_HOST" -u "$REGISTRY_U
 docker pull "$REGISTRY_HOST/team/image:tag"
 ```
 
-The login lasts for the rest of the run when the worker has Docker, including
-image builds and test libraries that read the Docker client configuration. Each
+When Docker writes the login to the run's `.docker/config.json` (the default on
+uzi's worker images, see *Credential helpers* below), it lasts for the rest of
+the run when the worker has Docker, including image builds and test libraries
+that read the Docker client configuration. Each
 run has its own Docker client configuration directory, `.docker` in the run's
 home directory, and the worker points `DOCKER_CONFIG` at it, so you cannot set
 `DOCKER_CONFIG` yourself.
@@ -465,8 +467,8 @@ Things to know:
   in `best-effort` on a kernel with Landlock. With `off` (the default) it holds
   too. Store
   only read-only, narrowly scoped registry credentials.
-- **Credential helpers.** The login lasts across commands only when Docker
-  writes it to the run's `.docker/config.json`. The worker images ship no
+- **Credential helpers.** uzi's guarantee covers only a login Docker writes to
+  the run's `.docker/config.json`. The worker images ship no
   `pass` and no `docker-credential-*` helper, so with the run's empty
   configuration that is where `docker login` writes it. When the configuration
   holds no `credsStore`, no `credHelpers` and no saved login, the Docker CLI on
@@ -474,9 +476,11 @@ Things to know:
   `PATH`, otherwise `secretservice`, and uses that helper when its
   `docker-credential-pass` or `docker-credential-secretservice` binary is on
   `PATH` (for example, a repo that adds one through devbox). The login is then
-  stored by that helper, not in the run's directory, and is not covered: a
-  later command may not find it (on Codex each command gets a fresh home
-  directory). Log in in the same command that uses the registry in that case.
+  stored by that helper, not in the run's directory, and is not covered: whether
+  a later command finds it, and when it is removed, depend on the helper and its
+  store, not on uzi. uzi's cleanup of the run's home does not remove it. Log in
+  in the same command that uses the registry in that case, and log out when
+  done.
 - **A refused directory.** On Codex, if the sandbox cannot set up the directory
   (for example a planted symlink), the command prints
   `Docker config directory unavailable` on stderr and runs without a persistent
