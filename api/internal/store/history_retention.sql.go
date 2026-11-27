@@ -100,7 +100,7 @@ type DeleteExpiredPRHistoryEventsParams struct {
 // and worker_capacity_samples, and the flip was also seen on pr_history_events (about 30 ms, no
 // timeout). The ORDER BY lets the planner satisfy LIMIT from the btree on the expiry column in
 // expiry order, an Index Scan, and it removes the oldest rows first. The indexes are created by
-// migrations 00549 to 00552.
+// migrations 00555 to 00558.
 //
 // Without a valid index on the expiry column the ORDER BY forces a sort of all expired rows (about
 // 27 MiB in the measured backlog), because LockRows sits between Limit and Sort and the limit

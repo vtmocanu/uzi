@@ -1357,7 +1357,7 @@ Measured (PostgreSQL 17, 1M-row synthetic fixtures, compressed time; one workloa
 
 ### Indexes and the boot-time build
 
-Migrations 00549 to 00552 add four btree indexes: `pr_history_events (observed_at) WHERE NOT first_merge`, and one on `bucket_start` for each of the three sample tables. They are built with `CREATE INDEX CONCURRENTLY` at boot, one non-transactional migration each, and they are built and maintained **even while retention is off**. The migration comments carry the measurements behind the choice of btree over BRIN.
+Migrations 00555 to 00558 add four btree indexes: `pr_history_events (observed_at) WHERE NOT first_merge`, and one on `bucket_start` for each of the three sample tables. They are built with `CREATE INDEX CONCURRENTLY` at boot, one non-transactional migration each, and they are built and maintained **even while retention is off**. The migration comments carry the measurements behind the choice of btree over BRIN.
 
 - **Do not drop them.** Without a valid index each batch sorts every expired row and will likely hit the statement timeout.
 - **The build can be slow.** `CREATE INDEX CONCURRENTLY` waits for transactions that modified the table before each of its two scans, then for every transaction holding an older snapshot, and the four builds run back to back. While one runs it blocks VACUUM and autovacuum on that table, and the index's write-ahead log is shipped to replicas.

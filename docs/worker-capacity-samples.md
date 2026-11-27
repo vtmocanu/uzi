@@ -99,7 +99,7 @@ Every registered worker row is sampled, online or offline, so each one writes
 compresses well with many workers per owner; with one worker per owner, an
 estimate (not measured) is nearer 28 MiB per worker-year.
 
-These figures were measured before the retention index (migration 00552, a btree on
+These figures were measured before the retention index (migration 00558, a btree on
 `bucket_start`) existed and do not include it. Without retention they are the growth to
 plan for; with `UZI_HISTORY_RETENTION` set, rows older than that age are deleted.
 

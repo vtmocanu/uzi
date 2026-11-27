@@ -524,7 +524,7 @@ func (fx *heFx) reseed(s heSpec) time.Duration {
 // ---------------------------------------------------------------------------------------------
 // candidate indexes and sizes
 
-// heShipped is the btree the migrations 00549 to 00552 create on each table. The btree candidate IS
+// heShipped is the btree the migrations 00555 to 00558 create on each table. The btree candidate IS
 // this index (same name, same definition), so the database migrated by newHeFx already carries
 // it; the BRIN candidates and none are the earlier selection evidence and drop it first.
 var heShipped = map[store.HistoryRetentionTable]string{

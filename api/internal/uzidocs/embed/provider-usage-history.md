@@ -142,7 +142,7 @@ stored out of line; the largest Codex projections are compressed inline (a 4,080
 took 1,853 B), so their real size depends on how compressible the data is, and a less
 compressible admissible reading can take more than the largest row measured here.
 Each table has one index from the original migration (the primary key), about 68 to 76% full as grown (90% when loaded in
-time order). The retention migrations (00550, 00551) add a second btree on `bucket_start` per table, which these figures do not include.
+time order). The retention migrations (00556, 00557) add a second btree on `bucket_start` per table, which these figures do not include.
 
 WAL per copy depends on checkpoints. In a burst of copies across thousands of identities it
 averaged 570 to 617 B (Anthropic), 873 to 902 B (typical Codex) and 2.3 to 2.4 KB (max Codex). At

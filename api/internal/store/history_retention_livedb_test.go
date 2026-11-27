@@ -959,7 +959,7 @@ func (p *hrPlan) findIndexScan(relation, index string) bool {
 	return false
 }
 
-// hrRetentionIndex is the time index migrations 00549 to 00552 create for each table.
+// hrRetentionIndex is the time index migrations 00555 to 00558 create for each table.
 var hrRetentionIndex = map[store.HistoryRetentionTable]string{
 	store.HistoryRetentionPRHistoryEvents:      "pr_history_events_observed_at_idx",
 	store.HistoryRetentionAnthropicUsage:       "anthropic_usage_samples_bucket_start_idx",
@@ -981,8 +981,8 @@ func (p *hrPlan) find(nodeType, relation string) bool {
 
 // hrGenericPlan pins the plan shape of the four delete statements under force_generic_plan: the
 // outer DELETE must be a Tid Scan on the target table, the inner page read a LockRows over an
-// Index Scan (or Index Only Scan) on the table's retention time index from migrations 00549 to
-// 00552, which the ORDER BY on the expiry column lets the planner use. Under force_generic_plan the
+// Index Scan (or Index Only Scan) on the table's retention time index from migrations 00555 to
+// 00558, which the ORDER BY on the expiry column lets the planner use. Under force_generic_plan the
 // cutoff is a parameter, so the planner costs it with default selectivity and the fixture's expired
 // fraction plays no part; what the test pins is the plan shape, the migrations' index names and the
 // partial predicate of the pr_history_events index. The stale-statistics custom-plan flip (a Seq Scan
