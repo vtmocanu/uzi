@@ -218,8 +218,10 @@ var visibilityTable = map[string]visEntry{
 		callers: []string{"handler/providers_probe.go"}},
 	"DeleteProviderKeySecret": {class: classIdentity, must: []string{"WHERE user_id = $1 AND provider_id = $2"},
 		callers: []string{"handler/providers.go"}},
+	// workersvc/cross_check_gate_reason.go (PRD #4574 M2 attestation) passes lead.UserID, the lead
+	// run's own owner, to re-derive the checker lane decision; it reads only the owner's selections.
 	"GetUserProviderLaneSources": {class: classIdentity, must: []string{"WHERE id = $1"},
-		callers: []string{"workersvc/harness_resolver.go"}},
+		callers: []string{"workersvc/cross_check_gate_reason.go", "workersvc/harness_resolver.go"}},
 	"GetUserJudgeLanePolicy": {class: classIdentity, must: []string{"WHERE id = $1"},
 		callers: []string{"workersvc/harness_resolver.go"}},
 }

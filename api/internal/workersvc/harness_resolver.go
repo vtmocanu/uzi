@@ -999,17 +999,17 @@ func (s *Service) createRunAtomic(ctx context.Context, userID uuid.UUID, explici
 	}
 	// A successor of a vendor run resolves vendor credentials as today, WITHOUT the owner's
 	// provider source (vendorOnly): the source run's lineage, not the owner's setting, decides.
-	// A guarded vendor lane (cross-check) does the same: the guard above allowed its source
-	// snapshot, and a vendor lane insert stamps no binding, so a second source read here could only
-	// see a source selected in between and then fail the binding assertion as an internal mismatch.
+	// A Vendor checker (cross-check, PRD #4574 M2) does the same: its lane was decided from the
+	// sources read under the shared secret lock taken above, and a vendor checker stamps no binding.
 	// A vendor job (no Claude source under the shared lock the job lane takes) is vendorOnly too; the
 	// lock, not a snapshot, is what makes that read final.
 	// A vendor judge needs vendorOnly for a different reason: its pin policy can choose vendor while
 	// a Claude source IS selected (pinned with a credential), so the resolver must not consult the
 	// source. A provider judge (Claude or Codex) never reaches resolve(): it stamps all five binding
-	// columns from the source frozen under the shared lock (freezeProviderJudge). A provider JOB is the one guarded lane
-	// that does consult the source: it resolves it (usable, or typed ErrProviderSourceUnusable) and
-	// freezes it below, while a vendor job (no Claude source under the shared lock) is vendorOnly.
+	// columns from the source frozen under the shared lock (freezeProviderJudge). A provider JOB and a Provider
+	// checker (a Codex checker under a selected Codex source, PRD #4574 M2) are the guarded lanes that
+	// consult the source: each resolves it (usable, or typed ErrProviderSourceUnusable) and freezes it
+	// below, while a vendor job or a Vendor checker is vendorOnly.
 	vendorOnly := inherit != nil || origin.JudgeLane || (origin.JobLane && !jobProvider) || (origin.CheckerLane && !checkerProvider)
 	resolve := func() (resolvedHarness, error) {
 		return s.resolveRunHarnessMode(ctx, userID, explicit, qtx, vendorOnly)

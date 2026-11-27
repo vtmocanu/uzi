@@ -731,7 +731,9 @@ func TestProviderLanesRefuseAProviderSourcedOwnerLiveDB(t *testing.T) {
 }
 
 // TestProviderCrossCheckFailsClosedToTheHumanGateLiveDB: a required plan cross-check of a
-// provider-bound lead cannot get a checker (the lane is refused), and the lead's "checker
+// provider-bound lead whose owner selected a Claude source and no Codex source cannot get a checker
+// (checkerLaneDecision: Refused; with a Codex source it would be Provider, see
+// TestCheckerLaneProviderFreezesTheCodexSourceLiveDB), and the lead's "checker
 // unavailable" report is the non-pass that forces the human gate: the run parks at
 // awaiting_approval with auto_approve cleared, never an auto-approval. The same report from a
 // vendor lead whose checker family is usable stays refused (the attestation is the provider rule's).
