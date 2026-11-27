@@ -76,6 +76,7 @@ CREATE TRIGGER codex_usage_samples_immutable_trg BEFORE UPDATE ON codex_usage_sa
 FOR EACH ROW EXECUTE FUNCTION provider_usage_samples_immutable_owner();
 
 -- +goose Down
+SET LOCAL lock_timeout = '5s';
 DROP TABLE codex_usage_samples;
 DROP TABLE anthropic_usage_samples;
 DROP FUNCTION provider_usage_samples_immutable_owner();
