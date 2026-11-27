@@ -20,7 +20,9 @@ cat > "$WORK/bin/uzi" <<'STUB'
 #!/usr/bin/env bash
 set -eu
 if [ "${1:-}" = repo ] && [ "${2:-}" = list ]; then [ "${UZI_REPO_FAIL:-}" = 1 ] && exit 1; echo "${UZI_REPO_JSON:-[]}"; exit 0; fi
-if [ "${1:-}" = run ] && [ "${2:-}" = list ]; then [ "${UZI_RUN_LIST_FAIL:-}" = 1 ] && exit 1; echo "${UZI_RUNS_JSON:-[]}"; exit 0; fi
+if [ "${1:-}" = run ] && [ "${2:-}" = list ]; then [ "${UZI_RUN_LIST_FAIL:-}" = 1 ] && exit 1
+  if [ -n "${UZI_RUN_LIST_FAIL_ONCE:-}" ] && [ ! -e "$UZI_RUN_LIST_FAIL_ONCE" ]; then : > "$UZI_RUN_LIST_FAIL_ONCE"; exit 1; fi
+  echo "${UZI_RUNS_JSON:-[]}"; exit 0; fi
 # cobra prints the parent help (rc 0) for any admin subcommand; the verb line exists only on a new CLI.
 if [ "${1:-}" = admin ] && [ "${2:-}" = --help ]; then printf 'Available Commands:\n  review       x\n'; [ -z "${UZI_ADMIN_RW:-}" ] || printf '  run-writers  y\n'; exit 0; fi
 if [ "${1:-}" = admin ] && [ "${2:-}" = run-writers ]; then [ "${UZI_WRITERS_RC:-0}" -eq 0 ] || exit "$UZI_WRITERS_RC"; printf '%s\n' "$UZI_WRITERS_OUT"; exit 0; fi
@@ -1072,6 +1074,11 @@ unset UZI_ADMIN_RW
 export HEAD_N="$WORK/head-n" HEAD_SEQ='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
 rm -f "$HEAD_N"; wo_watch moved 14
 grep -qxF 'RESULT=head_changed from=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa to=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' "$WORK/wo-moved.out" || fail 'held watch missed a head move'
+# A head seen while uzi is unreadable is still the baseline: A (lookup fails), then B.
+rm -f "$HEAD_N"
+rc=0; UZI_RUN_LIST_FAIL_ONCE="$WORK/fail-once" bash "$SCRIPT" test/repo 42 --writers-only 0 3 --max-unknown 3 > "$WORK/wo-moved-unknown.out" 2>&1 || rc=$?
+[ "$rc" -eq 14 ] || fail "head move after an unreadable lookup rc=$rc: $(cat "$WORK/wo-moved-unknown.out")"
+grep -qxF 'RESULT=head_changed from=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa to=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' "$WORK/wo-moved-unknown.out" || fail 'unreadable first poll moved the held baseline'
 unset HEAD_SEQ HEAD_N
 UZI_RUN_LIST_FAIL=1 wo_watch unknown 9
 grep -qxF 'CI_FIX_ACTIVE=unknown' "$WORK/wo-unknown.out" || fail 'held watch read an unreadable run list as none'

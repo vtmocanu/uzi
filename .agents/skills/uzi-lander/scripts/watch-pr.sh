@@ -284,6 +284,11 @@ while [ "$i" -lt "$MAX" ]; do
     continue
   fi
   if [ "$pstate" != "OPEN" ]; then echo "RESULT=pr_not_open state=$pstate"; exit 2; fi
+  # The held baseline is the first valid head, recorded before any writer lookup can fail.
+  if [ "$WRITERS_ONLY" -eq 1 ]; then
+    [ -n "$held_head" ] || held_head=$head
+    if [ "$head" != "$held_head" ]; then echo "RESULT=head_changed from=$held_head to=$head"; exit 14; fi
+  fi
   if [ -n "$SINCE" ]; then
     watch_author_activity
     if [ "$unknown" -eq 1 ]; then unknown_streak; else unk_streak=0; fi
@@ -319,8 +324,6 @@ while [ "$i" -lt "$MAX" ]; do
   if [ "$CI_FIX_ACTIVE_COUNT" -gt 0 ]; then echo "RESULT=ci_fix_active"; exit 10; fi
   if [ "$WRITERS_ONLY" -eq 1 ]; then
     if [ "$mrw_active" -gt 0 ]; then echo "RESULT=mr_rework_active"; exit 4; fi
-    [ -n "$held_head" ] || held_head=$head
-    if [ "$head" != "$held_head" ]; then echo "RESULT=head_changed from=$held_head to=$head"; exit 14; fi
     unk_streak=0
     echo "try $i: held head=${head:0:8} writers=none"
     sleep "$INTERVAL"
