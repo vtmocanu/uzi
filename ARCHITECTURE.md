@@ -641,7 +641,7 @@ Decisions) for the full rationale, including the vault-locked staleness
 rule and the failure/backoff semantics; the gauges keep no history themselves,
 but every accepted reading is also copied best effort, after the gauge write,
 into raw five-minute `anthropic_usage_samples` / `codex_usage_samples` rows with
-no default deletion (PRD #4692,
+no default deletion (an opt-in, off-by-default `UZI_HISTORY_RETENTION` sweeper pass can expire them by age, #4695; PRD #4692,
 [prds/done/4692-provider-usage-limit-history.md](prds/done/4692-provider-usage-limit-history.md),
 [docs/provider-usage-history.md](docs/provider-usage-history.md)); user-facing behavior is in
 [docs/rate-limits.md](docs/rate-limits.md).

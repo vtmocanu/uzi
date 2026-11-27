@@ -92,9 +92,17 @@ success time plus that offset, flagged approximate (`rd` true in the projection)
 
 ## Retention and removal
 
-There is no age-based expiry and no sweeper: history is kept until the owner's `users` row is
-deleted, which cascades both tables away. uzi itself never deletes a `users` row (an admin can
-only deactivate a user, which keeps the history), so in practice the history is kept until an
+Age-based expiry is opt-in and off by default. Set `UZI_HISTORY_RETENTION` (a Go duration of at
+least `24h`; see [History retention](configuration.md#history-retention-issue-4695)) and the
+`history_retention` sweeper pass deletes `anthropic_usage_samples` and `codex_usage_samples` rows
+whose `bucket_start` is older than that age. The age applies to these ordinary history rows only;
+the protected records of the other history pages (`pr_history_heads` and `first_merge` events)
+are exempt and keep their repository cascade. Cascades are unchanged: with retention off, history
+is kept until the owner's `users` row is deleted, which cascades both tables away. Deletes by the
+pass are irreversible; a database backup is the only recovery.
+
+uzi itself never deletes a `users` row (an admin can
+only deactivate a user, which keeps the history), so in practice, without retention, the history is kept until an
 operator deletes that row by hand. Deleting or rotating a credential keeps its history, because
 the identity column has no foreign key.
 
@@ -109,14 +117,15 @@ identity-year was measured), and leaves dead rows for autovacuum.
 Rolling the migration back (the Down section of `00547_provider_usage_samples.sql`) drops both
 tables and their history. Take a database backup first; it is the only recovery. Each
 `DROP TABLE` also takes an `ACCESS EXCLUSIVE` lock on `users` (to drop the foreign-key
-triggers), and the Down section sets no lock timeout, so a rollback can wait behind a long reader
-of `users` and block every query on it meanwhile. Run it when the database is quiet.
+triggers). The Down section starts with `SET LOCAL lock_timeout = '5s'`, so a rollback that
+cannot take its locks within 5 seconds fails and rolls back rather than waiting; until then it
+can block queries on `users`. Run it when the database is quiet.
 
 ## Growth
 
 Measured on PostgreSQL 17 (heap plus primary-key index, as grown; one to three runs each on a
 shared host, so indications). A full-cadence identity writes at most 105,120 rows a year, so these are
-upper bounds:
+upper bounds on growth without retention:
 
 | Profile | Bytes per row | 1 identity / year | 10 identities | 100 identities |
 |---|---|---|---|---|
@@ -129,8 +138,8 @@ identity loaded in time order packs a little tighter (about 200, 644 and 2,107 B
 stored out of line; the largest Codex projections are compressed inline (a 4,080-byte projection
 took 1,853 B), so their real size depends on how compressible the data is, and a less
 compressible admissible reading can take more than the largest row measured here.
-The table has one index (the primary key), about 68 to 76% full as grown (90% when loaded in
-time order).
+Each table has one index from the original migration (the primary key), about 68 to 76% full as grown (90% when loaded in
+time order). The retention migrations (00550, 00551) add a second btree on `bucket_start` per table, which these figures do not include.
 
 WAL per copy depends on checkpoints. In a burst of copies across thousands of identities it
 averaged 570 to 617 B (Anthropic), 873 to 902 B (typical Codex) and 2.3 to 2.4 KB (max Codex). At

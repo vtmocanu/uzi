@@ -33,7 +33,7 @@ statement) with `runs.mr_state` and has exactly its durability.
 | `first_merged_at`, `first_merged_source` | The first merge uzi recorded for the PR: the provider's merge time when `first_merged_source` is `provider`, otherwise (`observation_fallback`) the time uzi first recorded the PR as merged. Set once. |
 | `last_changed`, `last_from_state`, `last_to_state`, `last_event_provider_at`, `last_time_source`, `last_bootstrap`, `last_first_merge` | Transport-only: they carry the latest transition to the event insert inside the statement. They are not history; do not read them. |
 
-**`pr_history_events`**: append-only transitions.
+**`pr_history_events`**: append-only transitions (except opt-in age-based expiry, see Retention).
 
 | Column | Meaning |
 |---|---|
@@ -81,9 +81,22 @@ run's earlier MR rather than the current one.
 
 ## Retention
 
-There is no age-based expiry. History rows are deleted only by the repository
-cascade (`ON DELETE CASCADE` from `repos`). Each PR state change inserts one event row (a few hundred bytes) and upserts
-the PR's single head row.
+Age-based expiry is opt-in and off by default. Set `UZI_HISTORY_RETENTION` (a Go
+duration of at least `24h`; see [History retention](configuration.md#history-retention-issue-4695))
+and the `history_retention` sweeper pass deletes ordinary `pr_history_events` rows
+whose `observed_at` is older than that age. Deletes are irreversible.
+
+- **Protected records.** `pr_history_heads` and the `first_merge` events are exempt
+  from the age. They keep the existing repository cascade (`ON DELETE CASCADE` from
+  `repos`), and cascades are unchanged.
+- **A pruned PR can start mid-stream.** Its remaining events begin after the
+  expired ones, and an old PR can show `first_merged_at` on its head with no
+  ordinary events left.
+- **Kept rows grow.** `first_merge` events and heads are never expired, so they
+  grow by one each per merged PR.
+- **Size.** Each PR state change inserts one event row and upserts the PR's single
+  head row. Measured on PostgreSQL 17 after 10,000 PRs with 3 events each: about
+  223 B per event row and about 206 B per head row in total relation size.
 
 ## Delivery semantics
 
