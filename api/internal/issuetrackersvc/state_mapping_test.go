@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/issuetracker"
 	"github.com/vtmocanu/uzi/api/internal/issuetracker/youtracktest"
 )
 
@@ -190,4 +191,66 @@ func TestSetStateMappingRefusesABracedColumnLabel(t *testing.T) {
 	m.Columns[0].LabelName = "In {Progress}"
 	_, err := h.svc.SetStateMapping(context.Background(), h.user, repo, m)
 	wantMappingErr(t, err, KindBadRequest, "brace")
+}
+
+// linkedFakeRepo links a fresh repo of the plain fake harness to projectID, so the driver
+// is the fakeDriver template and the stored project id can be made invalid.
+func linkedFakeRepo(t *testing.T, h *harness, user uuid.UUID, projectID string) uuid.UUID {
+	t.Helper()
+	c, err := h.svc.Connect(context.Background(), user, "youtrack", testHost, testToken("t"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo := h.q.addRepo(user, true)
+	r := h.q.repo(repo)
+	r.linkedConn, r.projectID, r.projectShort = c.ID, projectID, "ABC"
+	return repo
+}
+
+func TestStateMappingMapsAListStatesFailure(t *testing.T) {
+	h := newHarness(t)
+	user := uuid.New()
+	repo := linkedFakeRepo(t, h, user, "0-1")
+	h.template.listStatesErr = errors.New("boom")
+	ctx := context.Background()
+	h.built = nil
+
+	_, err := h.svc.GetStateMapping(ctx, user, repo)
+	if e := wantKind(t, err, KindBadGateway); !strings.HasPrefix(e.Message, "could not list states: ") {
+		t.Errorf("message = %q", e.Message)
+	}
+	_, err = h.svc.SetStateMapping(ctx, user, repo, validMapping())
+	if e := wantKind(t, err, KindBadGateway); !strings.HasPrefix(e.Message, "could not list states: ") {
+		t.Errorf("message = %q", e.Message)
+	}
+	if len(h.built) == 0 {
+		t.Fatal("no driver was built")
+	}
+	for _, o := range h.built {
+		if o.Project != (issuetracker.ProjectRef{}) {
+			t.Errorf("built with Project %+v, want an empty one", o.Project)
+		}
+	}
+	if got := h.q.repo(repo); got.hasStates {
+		t.Error("a mapping was saved after the States could not be listed")
+	}
+}
+
+func TestStateMappingRefusesAStoredInvalidProjectID(t *testing.T) {
+	h := newHarness(t)
+	user := uuid.New()
+	ctx := context.Background()
+	for _, bad := range []string{"", "abc", "0-1/../x", "1-", "0-1\n"} {
+		repo := linkedFakeRepo(t, h, user, bad)
+		// The id is refused before a driver is built, so no request can carry it.
+		h.template.listStatesErr = errors.New("must not be reached")
+		h.built = nil
+		_, err := h.svc.GetStateMapping(ctx, user, repo)
+		wantMappingErr(t, err, KindBadRequest, "invalid project id")
+		_, err = h.svc.SetStateMapping(ctx, user, repo, validMapping())
+		wantMappingErr(t, err, KindBadRequest, "invalid project id")
+		if len(h.built) != 0 {
+			t.Errorf("id %q: a driver was built for an invalid stored project id", bad)
+		}
+	}
 }

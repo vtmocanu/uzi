@@ -1089,6 +1089,17 @@ export interface PipelineStatus {
   synced_at: string;
 }
 
+// A repo's link to an issue tracker project and eligibility tag, as stored at link time.
+export interface RepoIssueTrackerLink {
+  connection_id: string;
+  project_id: string;
+  project_short_name: string;
+  tag_id: string;
+  tag_name: string;
+  // RFC 3339.
+  linked_at: string;
+}
+
 export interface Repo {
   ignored_inferred_capabilities?: string[];
   /** Separate checker consent; absent on older APIs means off. */
@@ -1148,6 +1159,13 @@ export interface Repo {
   // and zero eligible online workers. Drives the Setup chip's info escalation; computed
   // from eligibility, not the sweeper's health text. Set by the list handlers.
   docker_blocked: boolean;
+  // The repo's link to an external issue tracker project (PRD #4173 M6). The key is
+  // absent when the repo is not linked; null is tolerated and reads the same.
+  issue_tracker_link?: RepoIssueTrackerLink | null;
+  // Advisory, absent when false: the repo still awaits its first enable, is not linked,
+  // and an issue tracker allowlist or connection exists, so the link control is offered.
+  // The link service decides and refuses; the web shows its answer.
+  issue_tracker_linkable?: boolean;
   // Caller-scoped GitHub Projects v2 sync-health summary (PRD #576 M2), null/absent
   // when the repo is not linked. Drives the Sync badge tone: linked && healthy → green
   // (ok), linked && !healthy (last_error set) → danger, absent → neutral. Derived from
@@ -1517,8 +1535,8 @@ export interface Card {
   state: string;
   labels: string[];
   // The issue tracker's readable id (e.g. "ABC-12", PRD 4173 M4), set only for a repo linked
-  // to an issue tracker. Shown in place of `#iid`, and a keyed card is eligible by its
-  // issue tracker tag, so the board treats it as uzi's without the `uzi` label.
+  // to an issue tracker. Shown in place of `#iid`. It does not decide eligibility: the
+  // board payload's `eligibility_label` does.
   issue_key?: string;
   // Forge user ids assigned to the issue (PRD #767 M5). The board widens "is this card
   // uzi's to run" to "carries the `uzi` label OR the board's bot is one of these ids",
@@ -1580,6 +1598,10 @@ export interface Board {
   // repo. Optional: an OLD api replica during a rollout skew omits it, which the board
   // treats the same as null (no banner).
   initial_import?: InitialImport | null;
+  // The stored eligibility tag name of a repo linked to an issue tracker (PRD #4173 M6):
+  // an issue is uzi's when its labels include it. Absent on an unlinked repo, where the
+  // configured uzi label decides.
+  eligibility_label?: string;
 }
 
 // InitialImport is a just-enabled repo's first issue import, as the board reports it.
@@ -1637,11 +1659,119 @@ export interface IssueDetail {
   // skew may omit it entirely, which the consumer treats as "no bot" (0), the same as
   // unresolved.
   bot_forge_user_id?: number;
+  // The issue's key ("ABC-12") and the stored eligibility tag name, on a repo linked to
+  // an issue tracker only (PRD #4173 M6); absent on an unlinked repo.
+  issue_key?: string;
+  eligibility_label?: string;
 }
 
 export interface ForgeConfig {
   allowed_base_urls: string[];
   forge_types: string[];
+}
+
+// GET /api/issue-trackers/config (PRD #4173 M6): the operator's issue tracker base URL
+// allowlist (always an array; empty means an operator must set it) and the supported kinds.
+export interface IssueTrackerConfig {
+  allowed_base_urls: string[];
+  kinds: string[];
+}
+
+// An issue tracker connection (PRD #4173 M6, GET/POST /api/issue-trackers/connections).
+// It carries no token field: the token is write-only, sent once in the create body.
+export interface IssueTrackerConnection {
+  id: string;
+  kind: string;
+  base_url: string;
+  account_id: string;
+  account_login: string;
+  // RFC 3339.
+  created_at: string;
+  last_verified_at: string;
+}
+
+// A project the connection's account can see (GET …/connections/{id}/projects).
+export interface IssueTrackerProject {
+  id: string;
+  short_name: string;
+  name: string;
+}
+
+export interface IssueTrackerAccount {
+  id: string;
+  login: string;
+}
+
+// A named group in a tag's sharing settings. users_count is 0 when the issue tracker
+// did not report it, which never counts as members (PRD #4173 D14).
+export interface IssueTrackerGroup {
+  id: string;
+  name: string;
+  all_users: boolean;
+  users_count: number;
+}
+
+export interface IssueTrackerSharing {
+  groups: IssueTrackerGroup[];
+  users: IssueTrackerAccount[];
+}
+
+// A tag with its see (`read`) and apply (`use`) sharing settings and the two link
+// verdicts judged for the connection's account (GET …/connections/{id}/tags).
+export interface IssueTrackerTag {
+  id: string;
+  name: string;
+  owner: IssueTrackerAccount;
+  read: IssueTrackerSharing;
+  use: IssueTrackerSharing;
+  account_can_apply: boolean;
+  others_can_apply: boolean;
+}
+
+// PUT /api/repos/{id}/issue-tracker-link body (PRD #4173 M6). There is no unlink or
+// relink: a refusal is a 409 (400 for a project the connection cannot see) whose text
+// the web shows verbatim.
+export interface IssueTrackerLinkRequest {
+  connection_id: string;
+  project_id: string;
+  tag_id: string;
+}
+
+// The PUT's answer: the stored link, with the repo it belongs to.
+export interface IssueTrackerLinkResult extends RepoIssueTrackerLink {
+  repo_id: string;
+}
+
+// One board column of a linked repo mapped to the State it stands for. A column absent
+// from a mapping is unmapped: a move into it is refused until it is mapped.
+export interface IssueTrackerColumnState {
+  label_name: string;
+  state: string;
+}
+
+// A linked repo's State mapping (GET/PUT /api/repos/{id}/issue-tracker-link/states). The
+// PUT replaces the whole mapping; no two roles may share a State.
+export interface IssueTrackerStateMapping {
+  open_state: string;
+  closed_state: string;
+  columns: IssueTrackerColumnState[];
+}
+
+// A State of the linked project. closable: it may be the closed State (resolved and
+// means done, never "Won't fix"); openable: it may be the open State or a column's.
+export interface IssueTrackerState {
+  name: string;
+  resolved: boolean;
+  archived: boolean;
+  closable: boolean;
+  openable: boolean;
+}
+
+// GET …/issue-tracker-link/states: the saved mapping (null until one is saved) and the
+// project's States.
+export interface IssueTrackerStatesView {
+  mapping: IssueTrackerStateMapping | null;
+  states: IssueTrackerState[];
 }
 
 // AppSettings is the instance-level settings surface (PRD #19). Admin-only. The
@@ -2895,6 +3025,9 @@ export interface Schedule {
   target: ScheduleTarget;
   // Set only for target "issue"; null otherwise.
   issue_iid: number | null;
+  /** The issue tracker key ("ABC-12") of issue_iid on a repo linked to an issue tracker
+   *  (PRD #4173 M6); absent on an unlinked repo and for a schedule with no issue. */
+  issue_key?: string;
   // Sweep label selector; null (empty) ⇒ the PRD label at fire time (Decision 9).
   labels: string[] | null;
   // Stored prompt for target "prompt"; "" otherwise (Decision 10).
@@ -4183,6 +4316,10 @@ export interface Run {
   kind: RunKind;
   /** The worked issue for an issue run; null for a ci_fix or chat run (no issue). */
   issue_iid: number | null;
+  /** The issue tracker key ("ABC-12") of issue_iid on a repo linked to an issue tracker
+   *  (PRD #4173 M6); absent on an unlinked repo and for a run with no issue. Optional for
+   *  older API responses. */
+  issue_key?: string;
   /** Optional for older API responses; task continuation metadata, separate from issue_iid. */
   continued_issue_iid?: number | null;
   issue_title: string;
@@ -4299,7 +4436,7 @@ export interface Run {
    *  issue is no longer cached. Rendered through isHttpsUrl into the #<iid> link. */
   issue_web_url: string | null;
   /** Confirmed issues created by a scheduled prompt; detail read only. */
-  created_issues?: { iid: number; title: string; web_url: string }[];
+  created_issues?: { iid: number; issue_key?: string; title: string; web_url: string }[];
   /** PRD #764 M2: whether the run's issue links a `prds/*.md` file, so the run view can
    *  show a neutral "PRD" presence badge. OPTIONAL for api/web rollout skew: a pre-#764
    *  api pod omits the key, and an absent value reads as no PRD (the badge stays hidden). */
@@ -6108,6 +6245,9 @@ export interface IncidentalFinding {
   dismiss_reason?: string;
   set_via?: string;
   filed_issue_iid?: number;
+  // filed_issue_key is the issue tracker key ("ABC-12") of filed_issue_iid on a repo linked to
+  // an issue tracker (PRD #4173 M6); absent on an unlinked repo.
+  filed_issue_key?: string;
   // filed_issue_url is the stored forge URL a filed coordinate produced (stamped at settle
   // time). It is the DTO-carried source the backlog links "Filed #<iid>" through — present for a
   // backlog-loaded filed row too, not just one filed this session — and is undefined until
@@ -6145,6 +6285,8 @@ export interface IncidentalFindingIssueDraft {
 // (mirrors the handler's createdIssueDTO): only what the click produced.
 export interface IncidentalFindingFiledIssue {
   iid: number;
+  /** The issue tracker key of iid on a linked repo (PRD #4173 M6); absent otherwise. */
+  issue_key?: string;
   web_url: string;
   title: string;
 }
@@ -6375,6 +6517,8 @@ export interface ChatListResponse {
 // human's Create click produced. The card renders its link (https-guarded).
 export interface CreatedIssue {
   iid: number;
+  /** The issue tracker key of iid on a linked repo (PRD #4173 M6); absent otherwise. */
+  issue_key?: string;
   web_url: string;
   title: string;
 }

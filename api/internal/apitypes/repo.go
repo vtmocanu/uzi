@@ -86,6 +86,26 @@ type RepoDTO struct {
 	// and PATCH; other single-repo responses (the admin guardrail override) leave it 0.
 	// Never set by repoToDTO.
 	EnvVarCount int `json:"env_var_count"`
+	// IssueTrackerLink is the repo's link to an external issue tracker project (PRD
+	// #4173 M6), set by repoToDTO from the repo row. Omitted when the repo is not linked, so
+	// an unlinked repo serialises as it did before M6.
+	IssueTrackerLink *RepoIssueTrackerLinkDTO `json:"issue_tracker_link,omitempty"`
+	// IssueTrackerLinkable is advisory: the repo has never been enabled, is not linked, and
+	// the operator set an issue tracker allowlist or the user has a connection, so the web
+	// offers the link control. The link service decides and refuses.
+	// Omitted when false.
+	IssueTrackerLinkable bool `json:"issue_tracker_linkable,omitempty"`
+}
+
+// RepoIssueTrackerLinkDTO is a repo's link to an issue tracker project and eligibility
+// tag, as stored at link time. LinkedAt is RFC 3339.
+type RepoIssueTrackerLinkDTO struct {
+	ConnectionID     string    `json:"connection_id"`
+	ProjectID        string    `json:"project_id"`
+	ProjectShortName string    `json:"project_short_name"`
+	TagID            string    `json:"tag_id"`
+	TagName          string    `json:"tag_name"`
+	LinkedAt         time.Time `json:"linked_at"`
 }
 
 // RepoProjectSyncHealth is the health readout the sync badge reads (PRD #576 M2). It

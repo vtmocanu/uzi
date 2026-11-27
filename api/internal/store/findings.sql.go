@@ -451,6 +451,8 @@ SELECT
     d.user_id                        AS user_id,
     d.repo_id                        AS repo_id,
     r.path_with_namespace            AS repo_path,
+    -- PRD #4173 M6: the linked repo's issue tracker project short name (empty when unlinked), for filed_issue_key.
+    COALESCE(CASE WHEN r.issue_tracker_connection_id IS NOT NULL AND r.issue_tracker_project_short <> '' THEN r.issue_tracker_project_short END, '')::text AS issue_tracker_project_short,
     d.location                       AS location,
     d.status                         AS status,
     d.last_title                     AS last_title,
@@ -486,7 +488,7 @@ WHERE d.user_id = $1
             AND f2.run_id = $4::uuid
       )
   )
-GROUP BY d.id, r.path_with_namespace, latest.id
+GROUP BY d.id, r.path_with_namespace, r.issue_tracker_connection_id, r.issue_tracker_project_short, latest.id
 ORDER BY d.created_at DESC, d.id DESC
 `
 
@@ -498,21 +500,22 @@ type ListFindingsBacklogParams struct {
 }
 
 type ListFindingsBacklogRow struct {
-	DispositionID    uuid.UUID          `json:"disposition_id"`
-	UserID           uuid.UUID          `json:"user_id"`
-	RepoID           uuid.UUID          `json:"repo_id"`
-	RepoPath         string             `json:"repo_path"`
-	Location         string             `json:"location"`
-	Status           string             `json:"status"`
-	LastTitle        string             `json:"last_title"`
-	DismissReason    pgtype.Text        `json:"dismiss_reason"`
-	SetVia           pgtype.Text        `json:"set_via"`
-	FiledIssueIid    pgtype.Int8        `json:"filed_issue_iid"`
-	FiledIssueUrl    string             `json:"filed_issue_url"`
-	ResolvedAt       pgtype.Timestamptz `json:"resolved_at"`
-	GroupOperationID pgtype.UUID        `json:"group_operation_id"`
-	SeenInRuns       int64              `json:"seen_in_runs"`
-	LatestFindingID  pgtype.UUID        `json:"latest_finding_id"`
+	DispositionID            uuid.UUID          `json:"disposition_id"`
+	UserID                   uuid.UUID          `json:"user_id"`
+	RepoID                   uuid.UUID          `json:"repo_id"`
+	RepoPath                 string             `json:"repo_path"`
+	IssueTrackerProjectShort string             `json:"issue_tracker_project_short"`
+	Location                 string             `json:"location"`
+	Status                   string             `json:"status"`
+	LastTitle                string             `json:"last_title"`
+	DismissReason            pgtype.Text        `json:"dismiss_reason"`
+	SetVia                   pgtype.Text        `json:"set_via"`
+	FiledIssueIid            pgtype.Int8        `json:"filed_issue_iid"`
+	FiledIssueUrl            string             `json:"filed_issue_url"`
+	ResolvedAt               pgtype.Timestamptz `json:"resolved_at"`
+	GroupOperationID         pgtype.UUID        `json:"group_operation_id"`
+	SeenInRuns               int64              `json:"seen_in_runs"`
+	LatestFindingID          pgtype.UUID        `json:"latest_finding_id"`
 }
 
 // The per-repo Findings backlog (D7, M4), DISPOSITION-DRIVEN so a filed/dismissed
@@ -569,6 +572,7 @@ func (q *Queries) ListFindingsBacklog(ctx context.Context, arg ListFindingsBackl
 			&i.UserID,
 			&i.RepoID,
 			&i.RepoPath,
+			&i.IssueTrackerProjectShort,
 			&i.Location,
 			&i.Status,
 			&i.LastTitle,

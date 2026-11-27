@@ -41,6 +41,7 @@ import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
 import { formatAgo } from "../lib/rateLimits";
 import { stripUnsafeChars } from "../lib/safeText";
+import { issueRef } from "../lib/issueRef";
 import { useDemoMode } from "../lib/demoMode";
 import { maskRepoPath } from "../lib/demoMask";
 import { Alert, Button, EmptyState, ListSkeleton, PageHeader } from "../components/ui";
@@ -173,7 +174,7 @@ function groupFileMessage(count: number, res: FindingGroupFileResult): string {
   if (res.issue) {
     // The forge issue exists, so no release hint: release is refused once the issue is recorded and
     // would reopen the members (a duplicate issue) while the operation is in flight.
-    const filed = `Filed ${count} ${count === 1 ? "finding" : "findings"} as issue #${res.issue.iid}.`;
+    const filed = `Filed ${count} ${count === 1 ? "finding" : "findings"} as issue ${issueRef(res.issue.iid, res.issue.issue_key)}.`;
     return res.warning || res.phase !== "settled"
       ? `${filed} ${res.warning ?? ""} Operation ${res.operation_id} (${res.phase}).`.replace(/ {2,}/g, " ")
       : filed;

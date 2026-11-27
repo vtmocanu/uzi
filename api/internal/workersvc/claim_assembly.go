@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -22,6 +21,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/issueinput"
+	"github.com/vtmocanu/uzi/api/internal/issuetracker"
 	"github.com/vtmocanu/uzi/api/internal/leadcfg"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
@@ -1634,7 +1634,7 @@ func linkedIssueKey(run store.Run, projectShort pgtype.Text) string {
 	if run.Kind != runkind.Issue || !run.IssueIid.Valid || !projectShort.Valid || projectShort.String == "" {
 		return ""
 	}
-	return projectShort.String + "-" + strconv.FormatInt(run.IssueIid.Int64, 10)
+	return issuetracker.IssueKey(projectShort.String, run.IssueIid.Int64)
 }
 
 // phaseModelsCapability selects the protocol for the run's harness.

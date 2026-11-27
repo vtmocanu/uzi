@@ -389,6 +389,7 @@ function EnablePanel({
                 repoId={r.id}
                 repoPath={pathOf(r)}
                 labels={labels}
+                linked={!!r.issue_tracker_link}
                 onCheckStateChange={(state) => reportCheck(r.id, state)}
               />
             ))}

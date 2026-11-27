@@ -784,6 +784,14 @@ type Client interface {
 	// enabled"): both are the not-linked case for a read the CLI treats as normal
 	// output, never an error.
 	GetProjectSyncStatus(ctx context.Context, repoID string) (ProjectSyncStatus, error)
+	// ListIssueTrackerConnections lists the caller's issue tracker connections:
+	// GET /api/issue-trackers/connections (RequireUser, so a CLI bearer reaches it).
+	ListIssueTrackerConnections(ctx context.Context) ([]IssueTrackerConnection, error)
+	// GetIssueTrackerStates reads a linked repo's State mapping and its project's States:
+	// GET /api/repos/{id}/issue-tracker-link/states. A foreign repo is a 404 (exit 4), a repo
+	// that is not linked, or whose project's State field is run by a state machine or cannot be read as a
+	// plain State field, a 409 (exit 5).
+	GetIssueTrackerStates(ctx context.Context, repoID string) (IssueTrackerStates, error)
 	// ResyncProjectSync re-seeds an already-linked board, picking up newly-added
 	// Status options (PRD #576 M7): POST /api/repos/{id}/github-project-sync/resync.
 	// RequireUser (moved with the status read) so the CLI Bearer is accepted. A

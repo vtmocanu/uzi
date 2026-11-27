@@ -9,6 +9,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	"github.com/vtmocanu/uzi/api/internal/issuesource"
 	"github.com/vtmocanu/uzi/api/internal/issuetracker"
+	"github.com/vtmocanu/uzi/api/internal/issuetrackersvc"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -60,12 +61,21 @@ func writeIssueWriteNotOffered(w http.ResponseWriter, err error) bool {
 
 // writeLinkedMoveError answers a failed card move or State write on a repo linked
 // to an issue tracker (PRD #4173 M5) and reports whether it did. A column or State
-// the driver refused before any request is a 409, and a moved-away issue is a 404
-// (D10); an issue the issue tracker shows as resolved is a 409 too, refused after the
-// reads and before any write. In each the cache is unchanged, so the card snaps back. Any other error
-// is left to the caller's 502.
-func writeLinkedMoveError(w http.ResponseWriter, err error) bool {
+// the driver refused before any write is a 409, and a moved-away issue is a 404
+// (D10); an issue whose State field is run by a state machine is a 409 with the link's
+// project named, and so is one whose State field uzi cannot read as a plain one; an
+// issue the issue tracker shows as resolved is a 409 too, refused after the reads and
+// before any write. In each the cache is unchanged, so the card snaps back. Any other
+// error is left to the caller's 502.
+func writeLinkedMoveError(w http.ResponseWriter, err error, projectShort string) bool {
 	switch {
+	// Both before ColumnMoveRefused, which also matches them and would answer with
+	// the unrelated "map this column" text. httpx.Error JSON-encodes the message, so
+	// the issue id the driver's error carries goes out as an escaped JSON string.
+	case errors.Is(err, issuetracker.ErrStateMachineField):
+		httpx.Error(w, http.StatusConflict, issuetrackersvc.StateMachineRefusal(projectShort))
+	case errors.Is(err, issuetracker.ErrStateFieldUnreadable):
+		httpx.Error(w, http.StatusConflict, issuetrackersvc.StateFieldUnreadableRefusal(projectShort, err))
 	case errors.Is(err, issuetracker.ErrStateNotAllowed):
 		httpx.Error(w, http.StatusConflict, "the target issue tracker State is not allowed for this move")
 	case errors.Is(err, issuetracker.ErrStateMappingUnset):

@@ -121,6 +121,7 @@ func (h *Handler) BulkMarkFindingsDone(w http.ResponseWriter, r *http.Request) {
 	for _, row := range rows {
 		out.Findings = append(out.Findings, findingDispositionDTO(row))
 	}
+	h.stampFindingIssueKeys(r.Context(), out.Findings)
 	httpx.JSON(w, http.StatusOK, out)
 }
 
@@ -154,5 +155,5 @@ func (h *Handler) UndoFindingDisposition(w http.ResponseWriter, r *http.Request)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, findingDispositionDTO(row))
+	httpx.JSON(w, http.StatusOK, h.findingDispositionDTOWithKey(r.Context(), row))
 }

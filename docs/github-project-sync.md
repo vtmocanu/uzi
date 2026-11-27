@@ -15,6 +15,9 @@ projection of it, never the other way round. Only column labels sync
 (`Planned`, `In Progress`, `Human Review`, `Later`, …); other labels (`bug`,
 `autopilot`, …) are never touched.
 
+Not offered on a repo linked to an issue tracker: see
+[Issue trackers](./issue-trackers.md).
+
 ## Forward vs. reverse — why reverse isn't instant
 
 Moving a card in uzi (a drag, or the run lifecycle) sets the linked item's

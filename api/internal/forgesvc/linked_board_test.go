@@ -98,6 +98,8 @@ func TestColumnMoveRefusedNamesOnlyTheDriversRefusals(t *testing.T) {
 		{"column not mapped", issuetracker.ErrColumnNotMapped, true},
 		{"mapping unset", issuetracker.ErrStateMappingUnset, true},
 		{"state not allowed", issuetracker.ErrStateNotAllowed, true},
+		{"state machine field", issuetracker.ErrStateMachineField, true},
+		{"state field unreadable", fmt.Errorf("move: %w", issuetracker.ErrStateFieldUnreadable), true},
 		{"wrapped", fmt.Errorf("move: %w", issuetracker.ErrColumnNotMapped), true},
 		{"write not offered is not a refusal", ErrIssueWriteNotOffered, false},
 		{"moved away is not a refusal", &linkedIssueError{err: &forge.IssueNotFoundError{Err: errors.New("404")}}, false},
@@ -111,7 +113,8 @@ func TestColumnMoveRefusedNamesOnlyTheDriversRefusals(t *testing.T) {
 		})
 	}
 	// IssueWriteSkippable is NOT widened: a refusal keeps its retry marker.
-	for _, e := range []error{issuetracker.ErrColumnNotMapped, issuetracker.ErrStateMappingUnset, issuetracker.ErrStateNotAllowed} {
+	for _, e := range []error{issuetracker.ErrColumnNotMapped, issuetracker.ErrStateMappingUnset, issuetracker.ErrStateNotAllowed,
+		issuetracker.ErrStateFieldUnreadable, issuetracker.ErrStateMachineField} {
 		if IssueWriteSkippable(e) {
 			t.Errorf("IssueWriteSkippable(%v) = true, want false", e)
 		}
@@ -385,6 +388,7 @@ func TestAutoMoveOnALinkedRepoCachesOnlyTheColumn(t *testing.T) {
 func TestAutoMoveOnALinkedRepoLeavesTheCacheOnAFailure(t *testing.T) {
 	for name, cause := range map[string]error{
 		"refused":     issuetracker.ErrColumnNotMapped,
+		"unreadable":  issuetracker.ErrStateFieldUnreadable,
 		"unreachable": errors.New("503"),
 		"moved away":  &forge.IssueNotFoundError{Err: errors.New("404")},
 	} {
@@ -466,6 +470,7 @@ func TestReopenIssueOnALinkedRepoIsOneMoveThenTheCache(t *testing.T) {
 		for name, cause := range map[string]error{
 			"unmapped column": issuetracker.ErrColumnNotMapped,
 			"not allowed":     issuetracker.ErrStateNotAllowed,
+			"unreadable":      issuetracker.ErrStateFieldUnreadable,
 			"unreachable":     errors.New("503"),
 		} {
 			st := &fakeStore{}

@@ -33,7 +33,7 @@ func (y *youTrack) SetIssueState(ctx context.Context, projectID, issueIID int64,
 	if err != nil {
 		return err
 	}
-	w, err := y.resolveIssue(ctx, projectID, issueIID)
+	w, err := y.resolveIssueForStateWrite(ctx, projectID, issueIID)
 	if err != nil {
 		return err
 	}
@@ -76,7 +76,7 @@ func (y *youTrack) moveToColumn(ctx context.Context, projectID, issueIID int64, 
 	if err != nil {
 		return err
 	}
-	w, err := y.resolveIssue(ctx, projectID, issueIID)
+	w, err := y.resolveIssueForStateWrite(ctx, projectID, issueIID)
 	if err != nil {
 		return err
 	}
@@ -95,7 +95,7 @@ func (y *youTrack) writeState(ctx context.Context, w ytIssue, s State) error {
 		query:  url.Values{"fields": {"id"}},
 		body: map[string]any{"customFields": []any{map[string]any{
 			"name":  y.stateField,
-			"$type": "StateIssueCustomField",
+			"$type": plainStateType,
 			"value": map[string]string{"id": s.ID},
 		}}},
 		limit: objectBytes,
@@ -125,4 +125,144 @@ func (y *youTrack) checkTargetState(ctx context.Context, name string, closing bo
 		return State{}, y.red.sentinel(ErrStateNotAllowed, 0, "the state is not allowed in this role: "+quoteName(name))
 	}
 	return State{}, y.red.sentinel(ErrStateNotAllowed, 0, "the project's state bundle has no such state: "+quoteName(name))
+}
+
+// stateMachineType is the $type YouTrack gives a State field that a
+// state-machine workflow runs.
+const stateMachineType = "StateMachineIssueCustomField"
+
+// plainStateType is the $type of a State field uzi can write directly.
+const plainStateType = "StateIssueCustomField"
+
+// stateKind is how an issue's response describes its State field.
+type stateKind int
+
+const (
+	// stateFieldUnreadable: no entry of the State field's name has a plain
+	// $type, or one has another or no $type. Nothing may be written.
+	stateFieldUnreadable stateKind = iota
+	// stateFieldPlain: the State field is one uzi can write directly.
+	stateFieldPlain
+	// stateFieldMachine: a state machine runs the State field.
+	stateFieldMachine
+)
+
+// stateFieldKind classifies the State field in w, which must have been read
+// with customFields(name,$type). Fields of another name are ignored. Any entry
+// of the State field's name typed as a state machine decides machine; else at
+// least one plain entry and none of another or empty type is plain; anything
+// else, including no entry, is unreadable.
+func (y *youTrack) stateFieldKind(w ytIssue) stateKind {
+	plain := false
+	unknown := false
+	for _, f := range w.CustomFields {
+		if f.Name != y.stateField {
+			continue
+		}
+		switch f.Type {
+		case stateMachineType:
+			return stateFieldMachine
+		case plainStateType:
+			plain = true
+		default:
+			unknown = true
+		}
+	}
+	if plain && !unknown {
+		return stateFieldPlain
+	}
+	return stateFieldUnreadable
+}
+
+// unreadableDetail names the issue for ErrStateFieldUnreadable: its readable
+// id, or its id when that is empty. quoteName bounds the length.
+func unreadableDetail(w ytIssue) string {
+	if w.IDReadable == "" {
+		return "issue " + quoteName(w.ID)
+	}
+	return "issue " + quoteName(w.IDReadable)
+}
+
+// resolveIssueForStateWrite is resolveIssue for a State write. Its one GET also
+// asks for customFields(name,$type). An issue whose State field a state machine
+// runs is ErrStateMachineField, and one whose response does not list the State
+// field as a plain StateIssueCustomField only (stateFieldKind) is
+// ErrStateFieldUnreadable, before any write and with no fallback.
+func (y *youTrack) resolveIssueForStateWrite(ctx context.Context, projectID, issueIID int64) (ytIssue, error) {
+	w, err := y.resolveIssueFields(ctx, projectID, issueIID, issueFields+","+stateCheckFields)
+	if err != nil {
+		return ytIssue{}, err
+	}
+	switch y.stateFieldKind(w) {
+	case stateFieldMachine:
+		return ytIssue{}, y.red.sentinel(ErrStateMachineField, 0, "")
+	case stateFieldUnreadable:
+		return ytIssue{}, y.red.sentinel(ErrStateFieldUnreadable, 0, unreadableDetail(w))
+	}
+	return w, nil
+}
+
+// stateCheckFields is what the State-write read adds to issueFields, and what
+// CheckStateField reads of each sampled issue besides its id and project.
+const stateCheckFields = "customFields(name,$type)"
+
+// CheckStateField implements Driver. It reads the first page of the project's
+// issues (pageSize items, the listing's query) asking only for each issue's
+// ids, project and its State custom field's name and type, and never writes.
+// A sampled issue of the project run by a state machine is
+// ErrStateMachineField, which wins; else one that does not list the State
+// field as a plain StateIssueCustomField only (stateFieldKind) is
+// ErrStateFieldUnreadable, naming the first such issue. An issue of another project is ignored, so the ref's id decides, not
+// only its short name. A non-empty page with no issue of the project is an
+// error, since nothing was checked.
+func (y *youTrack) CheckStateField(ctx context.Context, project ProjectRef) error {
+	if err := ValidProjectRef(project); err != nil {
+		return err
+	}
+	if project == (ProjectRef{}) {
+		return y.fail("youtrack: no project to check")
+	}
+	query := url.Values{
+		"query":        {issueQuery(project.ShortName, forge.ListIssuesOptions{})},
+		"fields":       {"id,idReadable,project(id)," + stateCheckFields},
+		"customFields": {y.stateField},
+	}
+	var sampled, inProject, found bool
+	var unreadableAt string
+	err := ytPages(ctx, y, []string{"issues"}, query, func(page []ytIssue) bool {
+		sampled = len(page) > 0
+		for _, w := range page {
+			if w.Project == nil || w.Project.ID != project.ID {
+				continue
+			}
+			inProject = true
+			switch y.stateFieldKind(w) {
+			case stateFieldMachine:
+				found = true
+			case stateFieldUnreadable:
+				if unreadableAt == "" {
+					unreadableAt = unreadableDetail(w)
+				}
+			}
+			if found {
+				break
+			}
+		}
+		return true
+	})
+	if err != nil {
+		return err
+	}
+	if found {
+		return y.red.sentinel(ErrStateMachineField, 0, "")
+	}
+	if unreadableAt != "" {
+		return y.red.sentinel(ErrStateFieldUnreadable, 0, unreadableAt)
+	}
+	if sampled && !inProject {
+		// A page of issues, none of them in the project: the stored short name
+		// no longer names it, so nothing was checked and that is no pass.
+		return y.fail("youtrack: the sampled issues are not in the linked project")
+	}
+	return nil
 }

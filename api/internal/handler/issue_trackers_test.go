@@ -33,7 +33,9 @@ func issueTrackerTestRouter() http.Handler {
 	return h.Routes(lim, lim, lim, lim, lim, lim, lim, lim, lim, lim, lim)
 }
 
-// Every issue tracker route is session-only: no cookie is a 401 whatever the method.
+// Every issue tracker route refuses a request with no credential: no cookie and no token is a
+// 401 whatever the method. Two reads (the connection list and a repo's State mapping read) also
+// accept a CLI token (PRD #4173 M6); the other routes stay session-only.
 func TestIssueTrackerRoutesRefuseARequestWithoutASession(t *testing.T) {
 	router := issueTrackerTestRouter()
 	for _, rt := range issueTrackerRoutes {

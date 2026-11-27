@@ -14,7 +14,7 @@ import (
 func createdIssueRows(issues []apitypes.CreatedIssueDTO) [][]string {
 	rows := make([][]string, 0, len(issues))
 	for _, issue := range issues {
-		cell := "Created issue #" + strconv.FormatInt(issue.IID, 10)
+		cell := "Created issue " + issueRef(issue.IID, issue.IssueKey)
 		if title := cellText(issue.Title); title != "" {
 			cell += " " + title
 		}

@@ -100,6 +100,14 @@ import type {
   ForgeConfig,
   ForgeConnection,
   HealthDoc,
+  IssueTrackerConfig,
+  IssueTrackerConnection,
+  IssueTrackerLinkRequest,
+  IssueTrackerLinkResult,
+  IssueTrackerProject,
+  IssueTrackerStateMapping,
+  IssueTrackerStatesView,
+  IssueTrackerTag,
   HostedConfig,
   IncidentalFinding,
   IncidentalFindingBacklog,
@@ -1143,6 +1151,59 @@ const realApi = {
     request<{ repos: Repo[] }>(
       "GET",
       `/forge/connections/${connectionId}/projects`,
+    ),
+
+  // Issue tracker connections (PRD #4173 M6). Session-only, except the list, which a
+  // CLI token can read too. The token is write-only: it travels only in the create
+  // body and no response carries it. Reconnecting with the same base URL replaces it.
+  issueTrackerConfig: () =>
+    request<IssueTrackerConfig>("GET", "/issue-trackers/config"),
+  listIssueTrackerConnections: () =>
+    request<{ connections: IssueTrackerConnection[] }>(
+      "GET",
+      "/issue-trackers/connections",
+    ),
+  createIssueTrackerConnection: (kind: string, baseUrl: string, token: string) =>
+    request<{ connection: IssueTrackerConnection }>(
+      "POST",
+      "/issue-trackers/connections",
+      { kind, base_url: baseUrl, token },
+    ),
+  deleteIssueTrackerConnection: (id: string) =>
+    request<null>(
+      "DELETE",
+      `/issue-trackers/connections/${encodeURIComponent(id)}`,
+    ),
+  listIssueTrackerProjects: (id: string) =>
+    request<{ projects: IssueTrackerProject[] }>(
+      "GET",
+      `/issue-trackers/connections/${encodeURIComponent(id)}/projects`,
+    ),
+  listIssueTrackerTags: (id: string) =>
+    request<{ tags: IssueTrackerTag[] }>(
+      "GET",
+      `/issue-trackers/connections/${encodeURIComponent(id)}/tags`,
+    ),
+  // Link a never-enabled repo to one issue tracker project and eligibility tag. Session
+  // only; the link is permanent (no unlink or relink).
+  linkRepoToIssueTracker: (repoId: string, body: IssueTrackerLinkRequest) =>
+    request<{ link: IssueTrackerLinkResult }>(
+      "PUT",
+      `/repos/${encodeURIComponent(repoId)}/issue-tracker-link`,
+      body,
+    ),
+  // A linked repo's State mapping and its project's States. The GET also takes a CLI
+  // token; the PUT is session-only and replaces the whole mapping.
+  getIssueTrackerStates: (repoId: string) =>
+    request<IssueTrackerStatesView>(
+      "GET",
+      `/repos/${encodeURIComponent(repoId)}/issue-tracker-link/states`,
+    ),
+  putIssueTrackerStates: (repoId: string, mapping: IssueTrackerStateMapping) =>
+    request<{ mapping: IssueTrackerStateMapping }>(
+      "PUT",
+      `/repos/${encodeURIComponent(repoId)}/issue-tracker-link/states`,
+      mapping,
     ),
 
   listRepos: () => request<{ repos: Repo[] }>("GET", "/repos"),

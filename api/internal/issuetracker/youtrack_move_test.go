@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"slices"
 	"strings"
 	"testing"
@@ -388,25 +389,63 @@ func TestStateChecksRunBeforeTheIssueIsRead(t *testing.T) {
 	}
 }
 
-func TestOnlyTheListingAsksForCustomFields(t *testing.T) {
+// TestOnlyTheListingAndTheStateWriteResolveAskForCustomFields pins where custom
+// fields are read: the listing, and the one GET that resolves the issue of a
+// State write, which asks for customFields(name,$type) to refuse a State field
+// that is not plain. Every other per-issue request asks for none.
+func TestOnlyTheListingAndTheStateWriteResolveAskForCustomFields(t *testing.T) {
 	y, srv := columnDriver(t, nil)
 	n := srv.SeedIssue("t", "")
 	ctx := context.Background()
+	noCustomFields := func(what string) {
+		t.Helper()
+		for _, r := range srv.Requests() {
+			if r.Method == http.MethodGet && strings.HasPrefix(r.Path, "/api/issues/") || r.Method == http.MethodPost && r.Path == "/api/issues" {
+				if strings.Contains(r.RawQuery, "customFields") {
+					t.Errorf("%s: %s %s asked for custom fields: %s", what, r.Method, r.Path, r.RawQuery)
+				}
+			}
+		}
+	}
 	srv.ResetRequests()
 	if _, err := y.GetIssue(ctx, testProjectID, n); err != nil {
-		t.Fatal(err)
-	}
-	if err := y.MoveToColumn(ctx, testProjectID, n, forge.ColumnMove{Column: "In Progress"}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := y.CreateIssue(ctx, testProjectID, "c", "", nil); err != nil {
 		t.Fatal(err)
 	}
-	for _, r := range srv.Requests() {
-		if r.Method == http.MethodGet && strings.HasPrefix(r.Path, "/api/issues/") || r.Method == http.MethodPost && r.Path == "/api/issues" {
-			if strings.Contains(r.RawQuery, "customFields") {
-				t.Errorf("%s %s asked for custom fields: %s", r.Method, r.Path, r.RawQuery)
+	noCustomFields("GetIssue and CreateIssue")
+	// In order: closing the issue first would make the move fail as resolved.
+	for _, tc := range []struct {
+		name string
+		call func() error
+	}{
+		{"MoveToColumn", func() error {
+			return y.MoveToColumn(ctx, testProjectID, n, forge.ColumnMove{Column: "In Progress"})
+		}},
+		{"SetIssueState", func() error { return y.SetIssueState(ctx, testProjectID, n, forge.StateClosed) }},
+	} {
+		name := tc.name
+		srv.ResetRequests()
+		if err := tc.call(); err != nil {
+			t.Fatal(err)
+		}
+		resolves := 0
+		for _, r := range srv.Requests() {
+			if r.Method != http.MethodGet || !strings.HasPrefix(r.Path, "/api/issues/") {
+				continue
 			}
+			resolves++
+			q, err := url.ParseQuery(r.RawQuery)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.HasSuffix(q.Get("fields"), ",customFields(name,$type)") || q.Has("customFields") {
+				t.Errorf("%s resolve GET fields = %q, want issueFields plus customFields(name,$type)", name, q.Get("fields"))
+			}
+		}
+		if resolves != 1 {
+			t.Errorf("%s sent %d issue GETs, want 1", name, resolves)
 		}
 	}
 	srv.ResetRequests()

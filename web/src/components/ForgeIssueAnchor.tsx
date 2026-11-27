@@ -10,12 +10,14 @@ export function ForgeIssueAnchor({
   webUrl,
   iid,
   label,
+  text,
   className,
   fallbackClassName,
 }: {
   webUrl: string | null | undefined;
   iid: number;
   label: string; // used as both aria-label and title on the anchor
+  text?: string; // the visible reference, "#<iid>" unless given (a linked repo shows its issue key)
   className?: string; // anchor path (https url)
   fallbackClassName?: string; // non-https plain-#iid span path
 }) {
@@ -29,10 +31,10 @@ export function ForgeIssueAnchor({
         title={label}
         className={`inline-flex items-center gap-0.5${className ? ` ${className}` : ""}`}
       >
-        #{iid}
+        {text ?? <>#{iid}</>}
         <ExternalLinkIcon className="h-3 w-3" />
       </a>
     );
   }
-  return <span className={fallbackClassName}>#{iid}</span>;
+  return <span className={fallbackClassName}>{text ?? <>#{iid}</>}</span>;
 }
