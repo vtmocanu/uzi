@@ -780,7 +780,10 @@ func run() error {
 	// Project a successful uzi-originated column move onto a linked GitHub Projects
 	// v2 Status (PRD #364 M5), best-effort. The same service backs the drag handler.
 	lifecycle.SetProjector(projectSync)
-	wsvc.SetLifecycle(lifecycle)
+	// Usage fold (#4700 M2): the lifecycle also kicks a per-run materialization on a terminal
+	// status; the returned sweeper pass is the safety net registered with sweeper.New below.
+	usageFolder := store.NewUsageFolder(pool, store.UsageFolderOptions{})
+	usageFoldPass := wireUsageFolder(wsvc, lifecycle, usageFolder)
 	// Admin-health loop-beat: the run-lifecycle reconciler is one of the four loops (M2).
 	lifecycle.SetBeat(func() { healthBeats.Beat("lifecycle") })
 	healthBeats.Register("lifecycle", lifecycle.Interval())
@@ -1108,6 +1111,12 @@ func run() error {
 			Name: "worker_capacity_samples",
 			Run:  capacitySampler.Pass,
 		},
+		// Usage fold safety net (#4700 M2): registered LAST so a slow fold lane (it can spend up to
+		// its 5 s parent deadline per tick) delays no other extra pass. sweeper.Engine.runOnce
+		// runs every extra pass BEFORE the run-liveness Sweep (Boot included), so the fold pass
+		// can still delay that sweep: by its 5 s parent deadline plus a detached cleanup rollback
+		// that runs after it (at most 2 s, store.usageFolderRollbackTimeout), so about 7 s.
+		usageFoldPass,
 	)
 	// Admin-health loop-beat: the run-liveness sweeper is one of the four loops (PRD #1484
 	// M2). Registered before Boot so the loops check has its baseline from api start.
@@ -1812,12 +1821,27 @@ func run() error {
 	// holding a pooled connection does not make the deferred pool.Close wait that long. Budget: the
 	// HTTP drain above is up to 10 s; the prerequisite drain runs concurrently for up to 5 s,
 	// so 10 s + max(17 s, 5 s) stays inside the default 30 s Kubernetes
-	// termination grace (the chart sets none). A generation that does not return even then (stuck
+	// termination grace (the chart sets none). The usage-fold drain (usageFolder.Wait, bounded by
+	// usageFolderShutdownBudget = 5 s) runs concurrently with this drain, so it also sits under
+	// the 17 s term and adds nothing to the sum. A generation that does not return even then (stuck
 	// outside a context-aware call) is left behind, and is not lost silently: SubmitJobResult
 	// committed a generation_pending refusal row for each generated file with the result, and only
 	// storing the file (or recording its failure) removes it, so an abandoned one (this bound, a
 	// SIGKILL, a crash) stays visible as generation_pending.
+	// Usage-fold kicks (best-effort): drained concurrently with the generated-output drain, bounded
+	// so a stuck materialization cannot hang shutdown. A kick cut short, or a terminal write after
+	// the folder closes, leaves its run for the sweeper pass of the next process.
+	foldWaitCtx, foldWaitCancel := context.WithTimeout(context.Background(), usageFolderShutdownBudget)
+	foldDrained := make(chan struct{})
+	go func() {
+		defer close(foldDrained)
+		if err := usageFolder.Wait(foldWaitCtx); err != nil {
+			slog.Warn("shutdown: usage fold kicks still in flight at the drain deadline", "error", err)
+		}
+	}()
 	generatedDrained, prerequisiteErr := drainShutdownWork(wsvc.DrainPrerequisiteClosures, wsvc.DrainGeneratedOutputs)
+	<-foldDrained
+	foldWaitCancel()
 	if !generatedDrained {
 		slog.Warn("shutdown: generated job outputs still in flight at the drain deadline")
 	}
@@ -1834,6 +1858,10 @@ func run() error {
 }
 
 const prerequisiteShutdownBudget = 5 * time.Second
+
+// usageFolderShutdownBudget bounds the wait for in-flight usage-fold kicks at shutdown,
+// matching the sibling drain budget above.
+const usageFolderShutdownBudget = 5 * time.Second
 
 // drainShutdownWork joins the prerequisite drain alongside the existing generated-output
 // drain. Call after HTTP shutdown and before pool.Close. Each callback owns its bounded
