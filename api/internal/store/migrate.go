@@ -344,6 +344,20 @@ const CheckpointRetentionLockClass int32 = 0x757A6372 // "uzcr"
 // other class here; TestProductTokenMintLockClassMatchesSQL's source enumeration covers it.
 const WorkerCapacitySampleLockClass int32 = 0x757A7763 // "uzwc"
 
+// AnalyticsPrecomputeLockClass is the class half of the two-int advisory lock
+// (AnalyticsPrecomputeLockClass, 0) that makes the background build of the stored analytics
+// documents (issue #4771) single-flight across API replicas: a replica that cannot take it skips
+// the tick.
+//
+// SESSION-scoped and try-only, like WorkerCapacitySampleLockClass: taken with
+// pg_try_advisory_lock on one hijacked pool connection (OpenAnalyticsPrecomputeSession) that the
+// build keeps for its whole run, so the lock ends with that connection. Unlock is proven
+// (pg_advisory_unlock must return true) only on an idle session, and the connection is closed
+// either way, never returned to a pool. The objid is fixed at 0: one lock for the whole build.
+// Two-int space, disjoint from every other class here; TestProductTokenMintLockClassMatchesSQL's
+// source enumeration covers it.
+const AnalyticsPrecomputeLockClass int32 = 0x757A6170 // "uzap"
+
 // StoredFilesLockClass is the class half of the two-int advisory lock pair that serializes
 // admission to the stored-file quotas (PRD #1909 D4): job files and recovery-archive uploads both
 // take it, through LockStoredFiles (storedfiles.go), before summing the retained bytes and
