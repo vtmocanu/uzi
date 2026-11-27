@@ -4,9 +4,18 @@
 -- Issue #4695: the history_retention sweeper pass trims anthropic_usage_samples with an age predicate on bucket_start.
 -- This btree serves the anthropic_usage_samples retention delete (DeleteExpiredAnthropicUsageSamples), whose age predicate is bucket_start < cutoff.
 -- Plan-flip evidence: the delete's inner page read, once the table statistics went stale after a
--- drain or churn, switched to a Seq Scan (1,107 ms against 5 ms with an Index Scan in the measured case) even with this
--- btree present; the statement therefore also carries ORDER BY s.bucket_start so the planner reads the
--- page in index order. BRIN failed after churn on every table, so btree is the choice.
+-- drain or churn, switched to a Seq Scan (1,107 ms against 5 ms with an Index Scan), measured on
+-- codex_usage_samples with autovacuum disabled; similar whole-heap near-empty reads were seen on
+-- anthropic_usage_samples and worker_capacity_samples. The btree was present in that case, so the
+-- statement also carries ORDER BY s.bucket_start to make the planner read the page in index order.
+-- Why btree and not BRIN: BRIN (autosummarize on) was measured at 1,000,000 rows against the
+-- statement as shipped, with ORDER BY, after dropping this btree. BRIN cannot supply the ORDER BY,
+-- so the read needs a Bitmap Heap Scan plus a sort over every candidate row. A warm 90% backlog
+-- batch took a median 212 ms (max 234 ms, 27 MB on-disk sort) against a 300 ms statement timeout,
+-- and the compressed backlog drain hit 1 statement timeout (57014, slowest batch 321 ms). The
+-- 4,400-tick churn had no timeouts (slowest batch 223 ms), and a near-empty tick after it read
+-- about 19,900 blocks in 172 ms. The earlier runs of the statement without ORDER BY reached about
+-- 3,660 of 4,400 churn ticks before the wall cap, with no timeouts. The backlog drain fails, so btree.
 -- Build concurrently so the table stays writable. goose v3.29.0 (migration_sql.go:70-86) runs a
 -- NO TRANSACTION migration's statements one by one and calls InsertVersionNoTx only after they all
 -- returned, so the version is recorded only after the concurrent build returned a valid index; the

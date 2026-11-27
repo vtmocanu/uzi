@@ -94,9 +94,16 @@ type DeleteExpiredPRHistoryEventsParams struct {
 //
 // ORDER BY s.<expiry column> in the inner SELECT is load-bearing (issue #4695 plan-flip evidence):
 // without it, after a drain or churn leaves the table statistics stale, the planner chose a
-// Seq Scan for the page read (1,107 ms against 5 ms) even with the btree on the expiry column;
-// the ORDER BY lets the planner satisfy LIMIT from that index in expiry order, an Index Scan, and
+// Seq Scan for the page read (1,107 ms against 5 ms), measured on codex_usage_samples with
+// autovacuum disabled; similar whole-heap near-empty reads were seen on anthropic_usage_samples
+// and worker_capacity_samples. No flip was observed on pr_history_events. The ORDER BY lets the
+// planner satisfy LIMIT from the btree on the expiry column in expiry order, an Index Scan, and
 // it removes the oldest rows first. The indexes are created by migrations 00549 to 00552.
+//
+// Without a valid index on the expiry column the ORDER BY forces an unbounded sort of all expired
+// rows, because LockRows sits between Limit and Sort and the limit cannot stop the sort early. So
+// the index must not be dropped, and an INVALID one (a failed concurrent build) makes retention
+// time out until the next boot rebuilds it.
 func (q *Queries) DeleteExpiredPRHistoryEvents(ctx context.Context, arg DeleteExpiredPRHistoryEventsParams) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteExpiredPRHistoryEvents, arg.Cutoff, arg.BatchSize)
 	if err != nil {

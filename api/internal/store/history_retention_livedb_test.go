@@ -699,12 +699,44 @@ func (p *hrPlan) find(nodeType, relation string) bool {
 // hrGenericPlan pins the plan shape of the four delete statements under force_generic_plan: the
 // outer DELETE must be a Tid Scan on the target table, the inner page read a LockRows over an
 // Index Scan (or Index Only Scan) on the table's retention time index from migrations 00549 to
-// 00552, which the ORDER BY on the expiry column lets the planner use. The table is large enough
-// (40,000 rows, 5% expired) that the planner prefers the index over a sort of a scan. Production runs each delete once on a fresh hijacked connection, so it uses a custom
-// plan; the generic plan checked here is a conservative safety pin (it is what a long-lived
-// pooled connection would reach after five executions), not a path the pass takes. The plan is
-// explained inside a rolled-back transaction.
+// 00552, which the ORDER BY on the expiry column lets the planner use. Under force_generic_plan the
+// cutoff is a parameter, so the planner costs it with default selectivity and the fixture's expired
+// fraction plays no part; what the test pins is the plan shape, the migrations' index names and the
+// partial predicate of the pr_history_events index. The stale-statistics custom-plan flip (a Seq Scan
+// once a drain leaves the statistics stale) is not covered here; only the evidence harness
+// (history_retention_evidence_livedb_test.go) measures it. Production runs each delete once on a fresh
+// hijacked connection, so it uses a custom plan; the generic plan checked here is a conservative
+// safety pin (it is what a long-lived pooled connection would reach after five executions), not a
+// path the pass takes. The plan is explained inside a rolled-back transaction.
 func hrGenericPlan(t *testing.T, f *hrFx) {
+	// The four migration indexes exist, are valid btrees on the expiry column, and only the
+	// pr_history_events one is partial on NOT first_merge.
+	for _, table := range hrTables {
+		var def string
+		var valid bool
+		err := f.pool.QueryRow(f.ctx, `SELECT i.indexdef, x.indisvalid
+		        FROM pg_indexes i JOIN pg_class c ON c.relname = i.indexname
+		        JOIN pg_index x ON x.indexrelid = c.oid
+		        WHERE i.schemaname = current_schema() AND i.tablename = $1 AND i.indexname = $2`,
+			string(table), hrRetentionIndex[table]).Scan(&def, &valid)
+		if err != nil {
+			t.Fatalf("%s: index %s not found: %v", table, hrRetentionIndex[table], err)
+		}
+		if !valid {
+			t.Errorf("%s: index %s is not valid", table, hrRetentionIndex[table])
+		}
+		if want := " USING btree (" + hrExpiryColumn(table) + ")"; !strings.Contains(def, want) {
+			t.Errorf("%s: indexdef %q lacks %q", table, def, want)
+		}
+		hasPred := strings.Contains(def, " WHERE ")
+		if table == store.HistoryRetentionPRHistoryEvents {
+			if !strings.HasSuffix(def, " WHERE (NOT first_merge)") {
+				t.Errorf("%s: indexdef %q is not partial on WHERE (NOT first_merge)", table, def)
+			}
+		} else if hasPred {
+			t.Errorf("%s: indexdef %q carries an unexpected predicate", table, def)
+		}
+	}
 	for _, table := range hrTables {
 		f.seed(table, 2000, hrBase)
 		f.seed(table, 38000, hrBase.Add(48*time.Hour))
