@@ -1,5 +1,6 @@
 import { forgePlatform } from "../lib/forgeNoun";
 import { runKindLabel } from "../lib/runKind";
+import { issueRef } from "../lib/issueRef";
 import { ForgeIssueAnchor } from "./ForgeIssueAnchor";
 
 // RunIssueRef renders a run's originating issue reference (PRD #411, Design
@@ -10,6 +11,7 @@ import { ForgeIssueAnchor } from "./ForgeIssueAnchor";
 // The board-card forge anchor (Board.tsx) is the visual model for branch 2.
 export function RunIssueRef({
   issueIid,
+  issueKey,
   issueWebUrl,
   kind,
   forgeType,
@@ -18,6 +20,9 @@ export function RunIssueRef({
   tone = "default",
 }: {
   issueIid: number | null;
+  // The issue tracker key ("ABC-12") of a run on a repo linked to an issue tracker (PRD 4173
+  // M6): shown and named in place of "#<iid>".
+  issueKey?: string | null;
   issueWebUrl: string | null;
   kind: string;
   forgeType: string | null;
@@ -53,7 +58,11 @@ export function RunIssueRef({
   }
 
   // Branches 2 & 3: cached issue → guarded forge link, or plain #iid when no valid https url.
-  const label = `Open issue #${issueIid} on ${forgePlatform(forgeType)}`;
+  const ref = issueRef(issueIid, issueKey);
+  // A keyed run's URL is the issue tracker's issue, so the label must not name a forge.
+  const label = issueKey
+    ? `Open issue ${ref} in the issue tracker`
+    : `Open issue ${ref} on ${forgePlatform(forgeType)}`;
   // Branch 2 colour: default forces text-faint with a hover-to-brand affordance; inherit
   // reads the parent colour and uses a warn-safe hover:underline (no non-warn colour).
   const anchorTone = inherit
@@ -64,6 +73,7 @@ export function RunIssueRef({
       webUrl={issueWebUrl}
       iid={issueIid}
       label={label}
+      text={issueKey ? ref : undefined}
       className={`${anchorTone}${raised ? " relative z-10" : ""}${
         className ? ` ${className}` : ""
       }`}

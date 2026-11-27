@@ -110,6 +110,12 @@ var d7UntrustedFields = []string{
 	"Target",
 	"IssueTitle",
 	"IssueDescription",
+	// IssueKey / FiledIssueKey are the issue tracker key ("ABC-12") of a linked repo's issue
+	// (PRD #4173 M6): issue-tracker-authored text (S4) drawn on the board row, the detail
+	// crumb and the worker detail run list only through m.renderer.Plain with the
+	// tuiIssueKeyCells cap, then issueRef.
+	"IssueKey",
+	"FiledIssueKey",
 	// IssueWebURL is the forge-authored issue URL drawn as an OSC-8 hyperlink target via
 	// oscLink; it must reach a draw only inside a sanitizeTTY(...) call (issueLink does so).
 	"IssueWebURL",

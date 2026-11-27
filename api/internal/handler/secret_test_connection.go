@@ -58,7 +58,9 @@ func (h *Handler) anthropicHistoryRecorder() anthropicUsageHistory {
 
 // copyAnthropicHistory copies an accepted test reading into the usage history, best effort,
 // under one 250 ms context derived from the request (never the probe context). It logs a
-// fixed message with a fixed category and the token id, never error text.
+// fixed message with a fixed category and the token id, never error text. A timeout logs "outcome
+// unknown": PostgreSQL may have committed the sample before the client gave up. error and skipped
+// log "not recorded".
 func (h *Handler) copyAnthropicHistory(ctx context.Context, p store.UpsertRateLimitsParams) {
 	rec := h.anthropicHistoryRecorder()
 	if rec == nil {
@@ -76,7 +78,10 @@ func (h *Handler) copyAnthropicHistory(ctx context.Context, p store.UpsertRateLi
 	case n == 0:
 		category = "skipped"
 	}
-	if category != "" {
+	switch category {
+	case "timeout":
+		slog.Warn("test connection: usage history copy outcome unknown", "category", category, "secret", p.UserSecretID.String())
+	case "error", "skipped":
 		slog.Warn("test connection: usage history copy not recorded", "category", category, "secret", p.UserSecretID.String())
 	}
 }

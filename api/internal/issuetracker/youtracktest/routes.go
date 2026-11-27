@@ -286,6 +286,10 @@ func (s *Server) listIssues(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "Bad Request", "unsupported query")
 		return
 	}
+	if s.m.listFailure != 0 {
+		writeError(w, s.m.listFailure, http.StatusText(s.m.listFailure), "injected by FailIssueListing")
+		return
+	}
 	p := s.m.projectByShort(proj[1])
 	var floor int64
 	if upd != nil {
@@ -305,10 +309,27 @@ func (s *Server) listIssues(w http.ResponseWriter, r *http.Request) {
 	}
 	slices.SortStableFunc(matched, func(a, b *issue) int { return int(a.updated - b.updated) })
 	items := make([]map[string]any, 0, len(matched))
+	only := r.URL.Query()["customFields"]
 	for _, i := range matched {
-		items = append(items, s.m.issueJSON(i))
+		items = append(items, onlyCustomFields(s.m.issueJSON(i), only))
 	}
 	writePage(w, r, spec, items)
+}
+
+// onlyCustomFields restricts an issue's customFields to the names a request's
+// customFields parameter lists, as YouTrack does; no parameter keeps them all.
+func onlyCustomFields(it map[string]any, names []string) map[string]any {
+	if len(names) == 0 {
+		return it
+	}
+	kept := []map[string]any{}
+	for _, cf := range it["customFields"].([]map[string]any) {
+		if slices.Contains(names, cf["name"].(string)) {
+			kept = append(kept, cf)
+		}
+	}
+	it["customFields"] = kept
+	return it
 }
 
 // listTagIssues lists every issue carrying the tag, across all projects, newest
@@ -422,7 +443,10 @@ func (s *Server) updateIssue(w http.ResponseWriter, r *http.Request) {
 		if cf.Value.ID != "" {
 			v = s.m.stateByID(cf.Value.ID)
 		}
-		if cf.Name != s.m.stateField || cf.Type != "StateIssueCustomField" || v == nil {
+		// A value write to a state-machine field, or to a State the issue lists
+		// in a non-plain shape (absent or untyped), answers 400 here. That is
+		// this fake's own choice: YouTrack documents no answer for either.
+		if cf.Name != s.m.stateField || cf.Type != "StateIssueCustomField" || v == nil || i.project.stateMachine || i.stateShape != StateFieldPlain {
 			writeError(w, http.StatusBadRequest, "Bad Request", "unsupported custom field update")
 			return
 		}

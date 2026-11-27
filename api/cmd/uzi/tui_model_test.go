@@ -809,7 +809,7 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 			Milestones: []apitypes.Milestone{{ID: "m1", Title: nasty}}, MilestonesInProgress: []string{"m1"},
 			HealthReason: &hostileHealthReason, CurrentActivity: &hostileActivity}},
 		{RunDTO: apitypes.RunDTO{ID: "77777777-2222", Kind: "issue", Status: "running", IssueTitle: nasty,
-			IssueIID: &hostileIID, IssueWebURL: &hostileURL}},
+			IssueIID: &hostileIID, IssueWebURL: &hostileURL, IssueKey: nasty}},
 	}}
 	board := tuiTestModel(t, fake, "")
 	next, _ := board.Update(boardRunsMsg{reqID: board.board.waitID, runs: fake.Runs})

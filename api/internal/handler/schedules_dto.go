@@ -38,6 +38,12 @@ func (h *Handler) repoPathFor(ctx context.Context, s store.RunSchedule) string {
 // rather than failing the response, mirroring the run-DTO enrichment.
 func (h *Handler) scheduleDTOWithLabel(ctx context.Context, s store.RunSchedule, repoPath string) apitypes.ScheduleDTO {
 	dto := h.scheduleDTO(s, repoPath)
+	// PRD #4173 M6: the issue tracker key of an issue schedule's issue on a linked repo. The
+	// pure scheduleDTO has no store, so the project short name is read here, only for a
+	// schedule that names an issue. A fire result's candidates stay on #iid (persisted JSON).
+	if s.IssueIid.Valid {
+		dto.IssueKey = issueKeyFromShort(h.linkedProjectShorts(ctx, s.RepoID)[s.RepoID], s.IssueIid.Int64)
+	}
 	if dto.CredentialOverride != nil && s.CredentialOverrideSecretID.Valid {
 		if meta, err := h.q.GetUserSecretMetaByID(ctx, store.GetUserSecretMetaByIDParams{
 			ID:     uuid.UUID(s.CredentialOverrideSecretID.Bytes),

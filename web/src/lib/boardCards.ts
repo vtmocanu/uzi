@@ -42,8 +42,16 @@ export const SELF_IMPROVE_LABEL = "uzi-self-improve";
  * render filter, the runnable marker, the solid-vs-quiet treatment and the
  * Start-vs-Promote affordance, so the button state matches what a Start would do.
  *
- * A card with a non-empty `issue_key` is also uzi's: the linked sync caches only issues
- * that carry the link's eligibility tag, so its presence is the eligibility signal.
+ * On a repo linked to an issue tracker the payload carries `eligibilityLabel` (the stored
+ * eligibility tag name), and the rule is exactly "the labels include it" (PRD 4173 M6): the
+ * configured `uzi` label and a bot assignment do not count there, and neither does the
+ * card's `issue_key`, which every linked issue carries.
+ *
+ * Without `eligibilityLabel` a card with a non-empty `issue_key` is still uzi's, as on M5:
+ * an older api that predates the field already serves linked cards with a key and a custom
+ * eligibility tag, and the linked sync caches only issues carrying that tag, so the key is
+ * the eligibility signal there (rolling-deploy skew, PR #4757 review). A plain repo's cards
+ * carry no key, so the rule below applies to them unchanged.
  *
  * `botForgeUserID > 0` guards an unresolved bot id (mirrors the server's `@bot_id>0` /
  * M2's `botID<=0` guard): a 0/absent id must never mark every assigned card runnable.
@@ -58,11 +66,11 @@ export function isUziCard(
   card: Pick<Card, "labels" | "assignee_ids" | "issue_key">,
   uziLabel: string,
   botForgeUserID: number | undefined,
+  eligibilityLabel?: string,
 ): boolean {
-  const botId = botForgeUserID ?? 0;
-  // A card the linked sync cached carries an issue_key and is eligible by its issue tracker
-  // tag (a stored name that may differ from the configured uzi label), so it needs no label.
+  if (eligibilityLabel) return card.labels.includes(eligibilityLabel);
   if (card.issue_key) return true;
+  const botId = botForgeUserID ?? 0;
   return card.labels.includes(uziLabel) || (botId > 0 && (card.assignee_ids ?? []).includes(botId));
 }
 
@@ -89,8 +97,9 @@ export function canPromote(
   card: Pick<Card, "labels" | "assignee_ids" | "closed">,
   uziLabel: string,
   botForgeUserID: number | undefined,
+  eligibilityLabel?: string,
 ): boolean {
-  return !card.closed && !isUziCard(card, uziLabel, botForgeUserID) && !isSelfImproveTracker(card);
+  return !card.closed && !isUziCard(card, uziLabel, botForgeUserID, eligibilityLabel) && !isSelfImproveTracker(card);
 }
 
 /**
@@ -114,9 +123,10 @@ export function visibleCards<T extends Pick<Card, "labels" | "assignee_ids" | "c
   uziLabel: string,
   botForgeUserID: number,
   showAll: boolean,
+  eligibilityLabel?: string,
 ): T[] {
-  if (!showAll) return cards.filter((c) => isUziCard(c, uziLabel, botForgeUserID));
-  return cards.filter((c) => isUziCard(c, uziLabel, botForgeUserID) || (!isSelfImproveTracker(c) && !c.closed));
+  if (!showAll) return cards.filter((c) => isUziCard(c, uziLabel, botForgeUserID, eligibilityLabel));
+  return cards.filter((c) => isUziCard(c, uziLabel, botForgeUserID, eligibilityLabel) || (!isSelfImproveTracker(c) && !c.closed));
 }
 
 /**
@@ -130,12 +140,14 @@ export function visibleCards<T extends Pick<Card, "labels" | "assignee_ids" | "c
  * remains, tests `String(iid).includes(remainder)` — so `#42` matches iid 429 and 142,
  * a substring match by design (a partial issue number is a useful search).
  */
-export function matchesQuery(card: Pick<Card, "iid" | "title" | "labels">, q: string): boolean {
+export function matchesQuery(card: Pick<Card, "iid" | "title" | "labels" | "issue_key">, q: string): boolean {
   const trimmed = q.trim();
   if (trimmed === "") return true;
   const needle = trimmed.toLowerCase();
   if (card.title.toLowerCase().includes(needle)) return true;
   if (card.labels.some((l) => l.toLowerCase().includes(needle))) return true;
+  // The issue key ("ABC-12") of a repo linked to an issue tracker, matched like the title.
+  if (card.issue_key && card.issue_key.toLowerCase().includes(needle)) return true;
   const iidQuery = trimmed.startsWith("#") ? trimmed.slice(1) : trimmed;
   return iidQuery !== "" && String(card.iid).includes(iidQuery);
 }

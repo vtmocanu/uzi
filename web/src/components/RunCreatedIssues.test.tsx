@@ -87,3 +87,11 @@ it("strips terminal sequences, controls, bidi, format and line separators and es
   expect(container.querySelector("img")).toBeNull();
   expect(container.textContent).toBe("Created issue #8Ared<img src=x>B");
 });
+
+it("labels a created issue by its issue key when it has one (PRD 4173 M6)", () => {
+  render(<RunCreatedIssues issues={[
+    { iid: 41, issue_key: "ABC-41", title: "Keyed", web_url: "https://youtrack.example.com/issue/ABC-41" },
+    { iid: 42, title: "Plain", web_url: "https://forge.example/group/repo/-/issues/42" },
+  ]} />);
+  expect(screen.getAllByRole("link").map(l => l.textContent)).toEqual(["Created issue ABC-41", "Created issue #42"]);
+});

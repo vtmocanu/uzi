@@ -122,6 +122,8 @@ UZI_SEED_PASSWORD='replace-with-a-unique-admin-password'
 
 # The forge that uzi may connect to. This tutorial covers GitHub.
 FORGE_ALLOWED_BASE_URLS=https://github.com
+# Optional: YouTrack base URLs for issue tracker connections (see issue-trackers.md).
+# ISSUE_TRACKER_ALLOWED_BASE_URLS=https://youtrack.example.com
 
 # --- Set these as shown ---
 

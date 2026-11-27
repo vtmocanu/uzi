@@ -7,6 +7,7 @@ import type {
 } from "../../lib/api";
 import { daysAgo, minsAgo, minsAhead } from "./time";
 import { mockRepos } from "./forge";
+import { mockLinkedRepo } from "./issueTrackers";
 import { mockWorkers } from "./workers";
 import { SAMPLE_PLAN } from "./plans";
 
@@ -406,7 +407,8 @@ function demoJudge(r: Run): Pick<RunListItem, "judge_verdict" | "judge_todo_coun
 }
 
 export function runListItem(r: Run, ownerEmail?: string): RunListItem {
-  const repo = mockRepos.find((x) => x.id === r.repo_id);
+  // The linked repo exists only under the issue-tracker scenarios, as do its runs.
+  const repo = [...mockRepos, mockLinkedRepo].find((x) => x.id === r.repo_id);
   const worker = mockWorkers.find((w) => w.id === r.worker_id);
   const usage = demoRunUsage(r);
   return {

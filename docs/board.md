@@ -16,6 +16,9 @@ carry their latest agent run, so the board doubles as a run tracker: it
 moves issues automatically as a run progresses and refreshes itself, without
 a manual reload.
 
+On a repo linked to an issue tracker, columns map to issue tracker States, not
+labels, and search matches the issue key: see [Issue trackers](./issue-trackers.md).
+
 ## Columns
 
 - **Backlog** (implicit): issues carrying none of the configured column

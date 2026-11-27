@@ -11,6 +11,7 @@
   "dismiss_reason": "x",
   "set_via": "x",
   "filed_issue_iid": 1,
+  "filed_issue_key": "x",
   "filed_issue_url": "x",
   "resolved_at": "2020-01-02T03:04:05Z",
   "evidence_preview": "x",

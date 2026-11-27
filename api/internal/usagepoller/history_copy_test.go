@@ -327,6 +327,11 @@ func TestHistoryCopyOnlyWhenWritten(t *testing.T) {
 	}
 }
 
+const (
+	histNotRecorded    = "usage history copy not recorded"
+	histOutcomeUnknown = "usage history copy outcome unknown"
+)
+
 // A failing, declining or timing-out recorder changes nothing else, and its diagnostic is fixed
 // text: a category and the row id, never the error.
 func TestHistoryCopyFailureChangesNothingElse(t *testing.T) {
@@ -334,10 +339,13 @@ func TestHistoryCopyFailureChangesNothingElse(t *testing.T) {
 		name     string
 		h        *recordingHistory
 		category string
+		msg      string // the per-category message (issue #4755)
+		notMsg   string // the other category's message, which must be absent
 	}{
-		{"error", &recordingHistory{err: errors.New("SECRET-ERROR-TEXT dsn=postgres://u:p@h")}, "error"},
-		{"zero rows", &recordingHistory{n: 0}, "skipped"},
-		{"timeout", &recordingHistory{block: true}, "timeout"},
+		{"error", &recordingHistory{err: errors.New("SECRET-ERROR-TEXT dsn=postgres://u:p@h")}, "error", histNotRecorded, histOutcomeUnknown},
+		{"zero rows", &recordingHistory{n: 0}, "skipped", histNotRecorded, histOutcomeUnknown},
+		// A timeout can land after PostgreSQL committed the sample, so its outcome is unknown.
+		{"timeout", &recordingHistory{block: true}, "timeout", histOutcomeUnknown, histNotRecorded},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			u, st, e := earlyFireFixture(t, true)
@@ -366,8 +374,11 @@ func TestHistoryCopyFailureChangesNothingElse(t *testing.T) {
 				t.Fatal("backoff was not cleared")
 			}
 			out := buf.String()
-			if !strings.Contains(out, "usage history copy not recorded") || !strings.Contains(out, "category="+tc.category) || !strings.Contains(out, u.String()) {
-				t.Fatalf("diagnostic missing category %q or the row id: %s", tc.category, out)
+			if !strings.Contains(out, tc.msg) || !strings.Contains(out, "category="+tc.category) || !strings.Contains(out, u.String()) {
+				t.Fatalf("diagnostic missing %q, category %q or the row id: %s", tc.msg, tc.category, out)
+			}
+			if strings.Contains(out, tc.notMsg) {
+				t.Fatalf("category %q logged %q: %s", tc.category, tc.notMsg, out)
 			}
 			if strings.Contains(out, "SECRET-ERROR-TEXT") || strings.Contains(out, "postgres://") {
 				t.Fatalf("the diagnostic leaked error text: %s", out)

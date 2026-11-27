@@ -890,7 +890,18 @@ func TestRepoDTOTags(t *testing.T) {
 		// blocked by the Docker-allowlist gap right now" bool, from eligibility directly.
 		"docker_blocked",
 		// PRD #4416: how many environment variables the repo has (enabled and disabled).
-		"env_var_count")
+		"env_var_count",
+		// PRD #4173 M6: issue_tracker_link / issue_tracker_linkable are omitempty, so an
+		// unlinked, non-linkable repo carries neither (the pre-M6 bytes); the populated
+		// case is pinned below.
+	)
+	assertTags(t, "RepoDTO(linked)", RepoDTO{IssueTrackerLink: &RepoIssueTrackerLinkDTO{}, IssueTrackerLinkable: true},
+		"id", "connection_id", "forge_project_id", "path_with_namespace", "web_url",
+		"default_branch", "enabled", "repo_skills_enabled", "agent_source_default", "repo_claudemd_enabled", "repo_devbox_opt_in",
+		"code_cross_check_guidance", "cross_check_repo_instructions_enabled",
+		"repo_fold_improve_uzi_backlog", "required_capabilities", "ignored_inferred_capabilities",
+		"pipeline", "guardrail_override", "guardrail_blocked", "docker_allowlisted", "docker_blocked",
+		"env_var_count", "issue_tracker_link", "issue_tracker_linkable")
 }
 
 func TestGuardrailOverrideDTOTags(t *testing.T) {

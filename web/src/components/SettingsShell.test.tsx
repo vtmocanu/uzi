@@ -66,6 +66,7 @@ describe("SettingsShell tabs", () => {
       "Models",
       "Run defaults",
       "Forge",
+      "Issue trackers",
       "Access",
       "Memory",
       "Appearance",
@@ -133,8 +134,8 @@ describe("SettingsShell tabs", () => {
     writes.length = 0;
     fireEvent.click(screen.getByRole("link", { name: "Appearance" }));
     expect(current("Appearance")).toBe("page");
-    // Appearance is the seventh tab (660-770): 412px past the row's right edge.
-    expect(writes).toEqual([{ el: row, value: 412 }]);
+    // Appearance is the eighth tab (770-880): 522px past the row's right edge.
+    expect(writes).toEqual([{ el: row, value: 522 }]);
     expect(windowScroll).not.toHaveBeenCalled();
   });
 

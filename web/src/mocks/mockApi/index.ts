@@ -11,6 +11,7 @@ import { oauthApi } from "./oauth";
 import { productTokensApi } from "./productTokens";
 import { egressProfilesApi } from "./egressProfiles";
 import { forgeApi } from "./forge";
+import { issueTrackersApi } from "./issueTrackers";
 import { judgeApi } from "./judge";
 import { memoryApi } from "./memory";
 import { findingsApi } from "./findings";
@@ -58,6 +59,9 @@ export const mockApi = {
   ...agentsApi,
 
   ...forgeApi,
+
+  // ── Issue tracker connections (PRD #4173 M6) ────────────────────────────────
+  ...issueTrackersApi,
 
   // ── Egress profiles / site lists (PRD #1906 M1w) ─────────────────────────────
   ...egressProfilesApi,

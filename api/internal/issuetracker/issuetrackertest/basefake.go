@@ -104,3 +104,8 @@ func (*BaseFake) ListTags(context.Context) ([]issuetracker.Tag, error) {
 func (*BaseFake) ListStates(context.Context, string) ([]issuetracker.State, error) {
 	return nil, notStubbed("ListStates")
 }
+
+// CheckStateField implements issuetracker.Driver.
+func (*BaseFake) CheckStateField(context.Context, issuetracker.ProjectRef) error {
+	return notStubbed("CheckStateField")
+}

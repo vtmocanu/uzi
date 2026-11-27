@@ -63,6 +63,8 @@ type liveHarness struct {
 	// so a test can pause a link or reconnect between its tracker check and its transaction.
 	afterVerify atomic.Pointer[func()]
 	nextProject atomic.Int64
+	// stateFieldErr is what every driver's CheckStateField returns; nil is a plain State field.
+	stateFieldErr error
 }
 
 func newLiveHarness(t *testing.T) *liveHarness {
@@ -97,6 +99,7 @@ func newLiveHarness(t *testing.T) *liveHarness {
 		func(_ issuetracker.Kind, o issuetracker.Options) (issuetracker.Driver, error) {
 			d := &liveDriver{h: h}
 			d.opts, d.projects, d.tags = o, h.projects, h.tags
+			d.stateFieldErr = h.stateFieldErr
 			return d, nil
 		}).UseTransactions(pool, func(tx pgx.Tx) Querier { return q.WithTx(tx) })
 	h.svc.log = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -187,6 +190,22 @@ func TestLinkRepoLiveDB(t *testing.T) {
 		r := h.repoRow(repo)
 		if r.IssueTrackerConnectionID.Bytes != h.conn || r.IssueTrackerProjectShort.String != "UZI" || r.EligibilityTagName.String != "uzi-ready" || !r.AwaitingFirstEnable {
 			t.Fatalf("row = %+v", r)
+		}
+	})
+	t.Run("a project whose State field is a state machine is refused and the repo stays unlinked", func(t *testing.T) {
+		h := newLiveHarness(t)
+		h.stateFieldErr = issuetracker.ErrStateMachineField
+		repo := h.freshRepo()
+		e := wantKind(t, h.link(repo), KindConflict)
+		if e.Message != StateMachineRefusal("UZI") {
+			t.Fatalf("message = %q", e.Message)
+		}
+		if r := h.repoRow(repo); r.IssueTrackerConnectionID.Valid || r.IssueTrackerProjectID.Valid || !r.AwaitingFirstEnable {
+			t.Fatalf("row after a refused link = %+v", r)
+		}
+		h.stateFieldErr = nil
+		if err := h.link(repo); err != nil {
+			t.Fatalf("a plain-State link after the refusal: %v", err)
 		}
 	})
 	t.Run("relink is refused and changes nothing", func(t *testing.T) {

@@ -42,6 +42,12 @@ const (
 type project struct {
 	id, shortName, name string
 	next                int64 // last number handed out in this project
+	// stateMachine makes the project's State field one a state-machine
+	// workflow runs, so its issues render the state-machine shape.
+	stateMachine bool
+	// extraMachineField, when set, adds a second custom field of that name,
+	// run by a state machine, to the project's issues. Inert when empty.
+	extraMachineField string
 }
 
 type user struct{ id, login string }
@@ -108,6 +114,23 @@ type stateValue struct {
 	ordinal       int
 }
 
+// StateFieldShape is how an issue's response presents its State custom field.
+// The non-plain shapes are THIS FAKE'S OWN: YouTrack documents neither. They
+// model a State field the connection's token cannot read (for example
+// restricted visibility), so a driver can be tested against a response it must
+// refuse to write a State through.
+type StateFieldShape string
+
+const (
+	// StateFieldPlain lists the State as a typed StateIssueCustomField (or, in a
+	// state-machine project, as a StateMachineIssueCustomField).
+	StateFieldPlain StateFieldShape = ""
+	// StateFieldAbsent lists no State entry in the issue's customFields.
+	StateFieldAbsent StateFieldShape = "absent"
+	// StateFieldUntyped lists a State entry that has no "$type" key.
+	StateFieldUntyped StateFieldShape = "untyped"
+)
+
 type issue struct {
 	id          string
 	project     *project
@@ -122,9 +145,26 @@ type issue struct {
 	tags        []string // tag ids, oldest first
 	comments    []*comment
 	activities  []*activity
+	// stateShape is how the issue's State field is listed. A shape other than
+	// plain overrides the project's state-machine shape.
+	stateShape StateFieldShape
+	// idReadableSet makes issueJSON serve idReadableOverride as "idReadable",
+	// even when it is empty. Only the wire value changes: lookups and aliases
+	// keep using readable().
+	idReadableSet      bool
+	idReadableOverride string
 }
 
 func (i *issue) readable() string { return fmt.Sprintf("%s-%d", i.project.shortName, i.number) }
+
+// wireReadable is the "idReadable" the issue is served with: readable(), unless
+// a test overrode it. Nothing that resolves an issue may use it.
+func (i *issue) wireReadable() string {
+	if i.idReadableSet {
+		return i.idReadableOverride
+	}
+	return i.readable()
+}
 
 // model is the in-memory YouTrack state. Server.mu guards every field.
 type model struct {
@@ -137,6 +177,8 @@ type model struct {
 	clock      int64
 	seq        int64
 	textSeq    int64 // separate from seq so recording text activities shifts no other id
+	// listFailure, when non-zero, is the status the issues listing answers.
+	listFailure int
 }
 
 func newModel() *model {
@@ -341,7 +383,7 @@ func (m *model) issueJSON(i *issue) map[string]any {
 		"customFields":    m.customFieldsJSON(i),
 		"$type":           "Issue",
 		"id":              i.id,
-		"idReadable":      i.readable(),
+		"idReadable":      i.wireReadable(),
 		"numberInProject": i.number,
 		"summary":         i.summary,
 		"description":     i.description,
@@ -354,9 +396,10 @@ func (m *model) issueJSON(i *issue) map[string]any {
 	}
 }
 
-// customFieldsJSON is the issue's custom fields: its State, under the current
-// name of the State field and of the State value, as YouTrack lists it.
-func (m *model) customFieldsJSON(i *issue) []map[string]any {
+// issueStateValue is the State value issue i holds, whatever shape it is
+// listed in: its recorded value, or for a resolved issue with none the first
+// resolved one (so it never reads as open), or else the first state.
+func (m *model) issueStateValue(i *issue) *stateValue {
 	v := m.stateByID(i.stateID)
 	if v == nil && i.resolved != nil {
 		// A resolved issue with no recorded State value reads as the first
@@ -370,11 +413,46 @@ func (m *model) customFieldsJSON(i *issue) []map[string]any {
 	} else if v == nil && len(m.states) > 0 {
 		v = &m.states[0]
 	}
+	return v
+}
+
+// customFieldsJSON is the issue's custom fields: its State, under the current
+// name of the State field and of the State value, as YouTrack lists it.
+func (m *model) customFieldsJSON(i *issue) []map[string]any {
+	v := m.issueStateValue(i)
 	var value any
 	if v != nil {
-		value = map[string]any{"$type": "StateBundleElement", "name": v.name}
+		value = map[string]any{"$type": "StateBundleElement", "name": v.name, "id": v.id}
 	}
-	return []map[string]any{{"$type": "StateIssueCustomField", "name": m.stateField, "value": value}}
+	if i.stateShape == StateFieldAbsent {
+		// No State entry at all; the extra state-machine field, if set, stays,
+		// so a driver cannot take any machine field for the State.
+		fields := []map[string]any{}
+		if n := i.project.extraMachineField; n != "" {
+			fields = append(fields, map[string]any{
+				"$type": "StateMachineIssueCustomField", "name": n, "id": "94-" + i.id, "value": value,
+			})
+		}
+		return fields
+	}
+	if i.stateShape == StateFieldUntyped {
+		return []map[string]any{{"name": m.stateField, "value": value}}
+	}
+	if i.project.stateMachine {
+		// The documented state-machine shape: the value, plus the events that
+		// can fire from it.
+		return []map[string]any{{
+			"$type": "StateMachineIssueCustomField", "name": m.stateField, "id": "92-" + i.id, "value": value,
+			"possibleEvents": []map[string]any{{"$type": "Event", "id": "93-" + i.id, "presentation": "Start progress"}},
+		}}
+	}
+	fields := []map[string]any{{"$type": "StateIssueCustomField", "name": m.stateField, "value": value}}
+	if n := i.project.extraMachineField; n != "" {
+		fields = append(fields, map[string]any{
+			"$type": "StateMachineIssueCustomField", "name": n, "id": "94-" + i.id, "value": value,
+		})
+	}
+	return fields
 }
 
 // userJSON is the wire user for a login. A login the fake does not know is

@@ -1831,6 +1831,42 @@ func (q *Queries) ListLatestRunsForRepo(ctx context.Context, repoID uuid.UUID) (
 	return items, nil
 }
 
+const listLinkedIssueTrackerProjectShorts = `-- name: ListLinkedIssueTrackerProjectShorts :many
+SELECT r.id, r.issue_tracker_project_short::text AS project_short
+FROM repos r
+WHERE r.id = ANY($1::uuid[])
+  AND r.issue_tracker_connection_id IS NOT NULL
+  AND r.issue_tracker_project_short <> ''
+`
+
+type ListLinkedIssueTrackerProjectShortsRow struct {
+	ID           uuid.UUID `json:"id"`
+	ProjectShort string    `json:"project_short"`
+}
+
+// The issue tracker project short name of each LINKED repo among @ids (PRD #4173 M6): the
+// piece the issue key of a run, schedule or finding on that repo is built from. An unlinked
+// or unknown repo is absent from the result, so a caller reads "absent" as "no key".
+func (q *Queries) ListLinkedIssueTrackerProjectShorts(ctx context.Context, ids []uuid.UUID) ([]ListLinkedIssueTrackerProjectShortsRow, error) {
+	rows, err := q.db.Query(ctx, listLinkedIssueTrackerProjectShorts, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListLinkedIssueTrackerProjectShortsRow{}
+	for rows.Next() {
+		var i ListLinkedIssueTrackerProjectShortsRow
+		if err := rows.Scan(&i.ID, &i.ProjectShort); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listMRWatchCandidates = `-- name: ListMRWatchCandidates :many
 WITH latest AS (
     SELECT DISTINCT ON (r.issue_iid)

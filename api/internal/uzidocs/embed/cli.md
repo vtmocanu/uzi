@@ -2152,6 +2152,30 @@ All five support `--json` (a top-level array for the lists, one object for a
 detail), for agents. The human table's PR/MR noun follows the repo's forge
 (GitLab says MR).
 
+## Issue trackers from the CLI: `uzi issue-tracker` and `uzi repo issue-tracker-states`
+
+Two read-only verbs show how a repo is wired to an issue tracker (see
+[Issue trackers](./issue-trackers.md)). Connecting and linking are web-only.
+
+```sh
+uzi issue-tracker list                     # your issue tracker connections
+uzi repo issue-tracker-states group/proj   # a linked repo's State mapping
+```
+
+- **`uzi issue-tracker list`** shows each connection's kind, base URL, account,
+  created and last verified time.
+- **`uzi repo issue-tracker-states <repo>`** takes the repo by path or id. A path
+  resolves only for a repo `uzi repo list` shows; a repo is linked before it is
+  first enabled, so a repo not yet enabled needs its id, shown in the Map States panel on the web Repos page.
+  It shows the open and closed States, each mapped board column's State, and the
+  project's States with whether each can close or open an issue. It ends a
+  mapping with "Columns not listed are unmapped: a move into one is refused
+  until it is mapped."; map them with "Map States" in the web.
+
+Both support `--json`. On a repo linked to an issue tracker, the CLI and TUI show
+an issue's key (`ABC-12`) instead of `#number` in run, schedule, finding and
+created-issue output; `uzi schedule` fire output and continued issues still show `#number`.
+
 ## Watching runs live: `uzi tui`
 
 ```sh

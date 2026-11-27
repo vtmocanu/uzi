@@ -493,6 +493,7 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/forge/connections/{id}/projects", limForge},
 	// PRD #4173 M4: the issue tracker connection list reads only the store; projects and tags
 	// call the issue tracker, so they ride the per-user forge budget.
+	{"GET", "/api/issue-trackers/config", noLimiter},
 	{"GET", "/api/issue-trackers/connections/", noLimiter},
 	{"GET", "/api/issue-trackers/connections/{id}/projects", limForge},
 	{"GET", "/api/issue-trackers/connections/{id}/tags", limForge},

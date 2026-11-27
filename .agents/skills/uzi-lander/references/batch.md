@@ -135,8 +135,9 @@ current `main` with one `main` CI per batch, fixing forward. Releases still gate
 - **After each batch**: one `main` CI run; the next batch may merge while it runs. Red: rerun a
   known flake, or fix forward / revert the culprit in parallel. A second unresolved red pauses merges.
 - **Single, never batched**: trust-boundary PRs (own CI plus `e2e.yml` on the exact head).
-- **Main CI**: keep the newest main CI, KinD and CodeQL runs. After a newer main push,
-  use `S/ci-lane.sh plan` to inspect older runs, then `apply --log FILE` to force-cancel
+- **Main CI**: keep the newest main CI, KinD and CodeQL runs. Let running main-push
+  CI and KinD finish, as their workflow concurrency policy does. After a newer main
+  push, use `S/ci-lane.sh plan` to inspect older runs, then `apply --log FILE` to force-cancel
   eligible runs and verify the outcome. An older main run is eligible only if
   the descendant at the current tip has a replacement for the same workflow
   that is active or completed with success, failure, or a timeout. A skip-CI

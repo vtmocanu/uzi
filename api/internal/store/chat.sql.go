@@ -1598,7 +1598,10 @@ func (q *Queries) ListChatRunsForUser(ctx context.Context, userID uuid.UUID) ([]
 }
 
 const listCreatedIssuesForRun = `-- name: ListCreatedIssuesForRun :many
-SELECT p.repo_id, p.created_issue_iid::bigint AS iid, p.title, repo.web_url, c.forge_type
+SELECT p.repo_id, p.created_issue_iid::bigint AS iid, p.title,
+       (CASE WHEN repo.issue_tracker_connection_id IS NULL THEN repo.web_url ELSE '' END)::text AS web_url, c.forge_type,
+       -- PRD #4173 M6: the linked repo's project short name (empty when unlinked), for the created issue's key.
+       COALESCE(CASE WHEN repo.issue_tracker_connection_id IS NOT NULL AND repo.issue_tracker_project_short <> '' THEN repo.issue_tracker_project_short END, '')::text AS issue_tracker_project_short
 FROM runs r
 JOIN issue_proposals p ON p.run_id = r.id AND p.repo_id = r.repo_id
 JOIN repos repo ON repo.id = p.repo_id
@@ -1616,15 +1619,18 @@ type ListCreatedIssuesForRunParams struct {
 }
 
 type ListCreatedIssuesForRunRow struct {
-	RepoID    uuid.UUID `json:"repo_id"`
-	Iid       int64     `json:"iid"`
-	Title     string    `json:"title"`
-	WebUrl    string    `json:"web_url"`
-	ForgeType string    `json:"forge_type"`
+	RepoID                   uuid.UUID `json:"repo_id"`
+	Iid                      int64     `json:"iid"`
+	Title                    string    `json:"title"`
+	WebUrl                   string    `json:"web_url"`
+	ForgeType                string    `json:"forge_type"`
+	IssueTrackerProjectShort string    `json:"issue_tracker_project_short"`
 }
 
 // Detail-only metadata for confirmed issues from an owned scheduled prompt run.
 // Bind both ownership boundaries and the proposal's exact run/repo; no credentials.
+// PRD #4173 M6: a linked repo's issue lives in the issue tracker, not on the code forge, so its
+// forge web_url is blanked: forge URL + tracker number would open an unrelated forge issue.
 func (q *Queries) ListCreatedIssuesForRun(ctx context.Context, arg ListCreatedIssuesForRunParams) ([]ListCreatedIssuesForRunRow, error) {
 	rows, err := q.db.Query(ctx, listCreatedIssuesForRun, arg.RunID, arg.RepoID, arg.UserID)
 	if err != nil {
@@ -1640,6 +1646,7 @@ func (q *Queries) ListCreatedIssuesForRun(ctx context.Context, arg ListCreatedIs
 			&i.Title,
 			&i.WebUrl,
 			&i.ForgeType,
+			&i.IssueTrackerProjectShort,
 		); err != nil {
 			return nil, err
 		}

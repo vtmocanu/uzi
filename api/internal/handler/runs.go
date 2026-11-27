@@ -129,6 +129,7 @@ func (h *Handler) ListRuns(w http.ResponseWriter, r *http.Request) {
 			RepoPath:   row.RepoPath.String, // "" for a repo-less job run (PRD #1908)
 			WorkerName: textPtrValue(row.WorkerName.Valid, row.WorkerName.String),
 		}
+		stampRunIssueKey(&item.RunDTO, row.IssueTrackerProjectShort)
 		item.HarnessDecision = harnessDecisionForViewer(row.Run, user)
 		item.ForgeType = row.ForgeType.String // "" for a repo-less job run; per-run MR/PR noun (PRD #65 D2)
 		// PRD #411: the joined forge issue web URL, nil for issue-less/uncached runs.
@@ -170,15 +171,17 @@ const adminRunDebugRefusal = "admin run debug reads require the server flag UZI_
 // adminRunRow is the common shape of one /admin/runs row, mapped explicitly from both list
 // queries (ListActiveRunsAll and ListRunsAdminDebug) so one builder decorates either.
 type adminRunRow struct {
-	Run                   store.Run
-	RepoPath, WorkerName  pgtype.Text
-	OwnerEmail            string
-	ForgeType             pgtype.Text
-	IssueWebURL           pgtype.Text
-	PriorityClass         string
-	HasLivePlanCrossCheck bool
-	HasLiveCodeCrossCheck bool
-	HasAvailableCapture   bool
+	Run                  store.Run
+	RepoPath, WorkerName pgtype.Text
+	OwnerEmail           string
+	ForgeType            pgtype.Text
+	IssueWebURL          pgtype.Text
+	// IssueTrackerProjectShort is the project short name of a linked repo, "" otherwise; it feeds issue_key.
+	IssueTrackerProjectShort string
+	PriorityClass            string
+	HasLivePlanCrossCheck    bool
+	HasLiveCodeCrossCheck    bool
+	HasAvailableCapture      bool
 }
 
 // AdminListRuns returns the newest 500 non-terminal runs across all users, excluding
@@ -204,7 +207,7 @@ func (h *Handler) AdminListRuns(w http.ResponseWriter, r *http.Request) {
 	for _, row := range rows {
 		common = append(common, adminRunRow{
 			Run: row.Run, RepoPath: row.RepoPath, WorkerName: row.WorkerName, OwnerEmail: row.OwnerEmail,
-			ForgeType: row.ForgeType, IssueWebURL: row.IssueWebUrl, PriorityClass: row.PriorityClass,
+			ForgeType: row.ForgeType, IssueWebURL: row.IssueWebUrl, IssueTrackerProjectShort: row.IssueTrackerProjectShort, PriorityClass: row.PriorityClass,
 			HasLivePlanCrossCheck: row.HasLivePlanCrossCheck, HasLiveCodeCrossCheck: row.HasLiveCodeCrossCheck,
 		})
 	}
@@ -275,7 +278,7 @@ func (h *Handler) adminRunDebugListRuns(w http.ResponseWriter, r *http.Request) 
 	for _, row := range rows {
 		common = append(common, adminRunRow{
 			Run: row.Run, RepoPath: row.RepoPath, WorkerName: row.WorkerName, OwnerEmail: row.OwnerEmail,
-			ForgeType: row.ForgeType, IssueWebURL: row.IssueWebUrl, PriorityClass: row.PriorityClass,
+			ForgeType: row.ForgeType, IssueWebURL: row.IssueWebUrl, IssueTrackerProjectShort: row.IssueTrackerProjectShort, PriorityClass: row.PriorityClass,
 			HasLivePlanCrossCheck: row.HasLivePlanCrossCheck, HasLiveCodeCrossCheck: row.HasLiveCodeCrossCheck,
 			HasAvailableCapture: row.HasAvailableCapture,
 		})
@@ -345,6 +348,7 @@ func (h *Handler) buildAdminRunList(r *http.Request, rows []adminRunRow, withLan
 		item.ForgeType = row.ForgeType.String // "" for a repo-less job run; per-run MR/PR noun (PRD #65 D2)
 		// PRD #411: the joined forge issue web URL, nil for issue-less/uncached runs.
 		item.IssueWebURL = textPtrValue(row.IssueWebURL.Valid, row.IssueWebURL.String)
+		stampRunIssueKey(&item.RunDTO, row.IssueTrackerProjectShort)
 		applyRevising(&item.RunDTO, revising[row.Run.ID]) // nil map => false (issue #750)
 		item.CurrentActivity = activity[row.Run.ID]       // nil map => null (PRD #1064)
 		item.CrossCheckActive = crossCheckActive(row.HasLivePlanCrossCheck, row.HasLiveCodeCrossCheck)

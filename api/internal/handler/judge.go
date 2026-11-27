@@ -485,7 +485,7 @@ func (h *Handler) RerunJudge(w http.ResponseWriter, r *http.Request) {
 		writeRerunJudgeError(w, err)
 		return
 	}
-	httpx.JSON(w, http.StatusAccepted, h.createdRunBody(r.Context(), runToDTO(judge, h.runPriorityClass(r.Context(), judge), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)))
+	httpx.JSON(w, http.StatusAccepted, h.createdRunBody(r.Context(), h.runDTO(r.Context(), judge)))
 }
 
 // writeRerunJudgeError maps RerunJudge's refusals to an HTTP status (extracted so each arm is testable).

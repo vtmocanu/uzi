@@ -134,6 +134,16 @@ JOIN forge_connections c ON c.id = r.connection_id
 WHERE c.user_id = $1 AND r.enabled = true
 ORDER BY r.path_with_namespace ASC;
 
+-- name: ListLinkedIssueTrackerProjectShorts :many
+-- The issue tracker project short name of each LINKED repo among @ids (PRD #4173 M6): the
+-- piece the issue key of a run, schedule or finding on that repo is built from. An unlinked
+-- or unknown repo is absent from the result, so a caller reads "absent" as "no key".
+SELECT r.id, r.issue_tracker_project_short::text AS project_short
+FROM repos r
+WHERE r.id = ANY(@ids::uuid[])
+  AND r.issue_tracker_connection_id IS NOT NULL
+  AND r.issue_tracker_project_short <> '';
+
 -- name: GetRepoForUser :one
 -- issue_source_locked (PRD #4173 D13): the project was linked to an issue tracker before it was
 -- removed and this row is not linked. Every refusal of an operation that reads, imports or

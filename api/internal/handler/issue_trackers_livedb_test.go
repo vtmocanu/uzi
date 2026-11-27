@@ -48,6 +48,9 @@ func (*itDriver) ListProjects(context.Context) ([]issuetracker.Project, error) {
 	return []issuetracker.Project{{ID: "0-1", ShortName: "UZI", Name: "Uzi\u202e"}}, nil
 }
 
+// CheckStateField answers that the project's State field is a plain one.
+func (*itDriver) CheckStateField(context.Context, issuetracker.ProjectRef) error { return nil }
+
 func (*itDriver) ListTags(context.Context) ([]issuetracker.Tag, error) {
 	all := issuetracker.Group{ID: "675-0", Name: "All Users", AllUsers: true}
 	return []issuetracker.Tag{

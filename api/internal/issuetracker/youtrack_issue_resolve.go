@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"net/url"
-	"strconv"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
 )
@@ -22,6 +21,11 @@ import (
 // several writes (UpdateIssueLabels, one per tag) can land more than one. That window
 // is documented (PRD #4173 D10), not closed.
 func (y *youTrack) resolveIssue(ctx context.Context, projectID, issueIID int64) (ytIssue, error) {
+	return y.resolveIssueFields(ctx, projectID, issueIID, issueFields)
+}
+
+// resolveIssueFields is resolveIssue reading the given fields.
+func (y *youTrack) resolveIssueFields(ctx context.Context, projectID, issueIID int64, fields string) (ytIssue, error) {
 	p, err := y.requireProject(projectID)
 	if err != nil {
 		return ytIssue{}, err
@@ -29,12 +33,12 @@ func (y *youTrack) resolveIssue(ctx context.Context, projectID, issueIID int64) 
 	if issueIID <= 0 {
 		return ytIssue{}, &forge.IssueNotFoundError{Err: y.fail("youtrack: issue number %d is out of range", issueIID)}
 	}
-	readable := p.ShortName + "-" + strconv.FormatInt(issueIID, 10)
+	readable := IssueKey(p.ShortName, issueIID)
 	var w ytIssue
 	status, _, err := y.do(ctx, ytCall{
 		method: http.MethodGet,
 		path:   []string{"issues", readable},
-		query:  url.Values{"fields": {issueFields}},
+		query:  url.Values{"fields": {fields}},
 		limit:  objectBytes,
 		prov:   forge.ResponseIssueSuccess,
 	}, &w)

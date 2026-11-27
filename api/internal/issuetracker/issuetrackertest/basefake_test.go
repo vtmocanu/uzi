@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/issuetracker"
 )
 
 // Calling every method keeps each one reachable for `deadcode -test`, since the
@@ -36,9 +37,10 @@ func TestBaseFakeMethodsNotStubbed(t *testing.T) {
 		{"ListProjects", func(b *BaseFake) error { _, err := b.ListProjects(ctx); return err }},
 		{"ListTags", func(b *BaseFake) error { _, err := b.ListTags(ctx); return err }},
 		{"ListStates", func(b *BaseFake) error { _, err := b.ListStates(ctx, "p"); return err }},
+		{"CheckStateField", func(b *BaseFake) error { return b.CheckStateField(ctx, issuetracker.ProjectRef{}) }},
 	}
-	if len(methods) != 16 {
-		t.Fatalf("expected 16 methods, got %d", len(methods))
+	if len(methods) != 17 {
+		t.Fatalf("expected 17 methods, got %d", len(methods))
 	}
 	b := &BaseFake{}
 	for _, m := range methods {

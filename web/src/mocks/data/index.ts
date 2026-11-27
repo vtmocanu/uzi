@@ -10,6 +10,7 @@ export * from "./judge";
 export * from "./secrets";
 export * from "./providers";
 export * from "./forge";
+export * from "./issueTrackers";
 export * from "./boards";
 export * from "./workers";
 export * from "./health";
