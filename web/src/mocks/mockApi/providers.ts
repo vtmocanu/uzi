@@ -56,6 +56,8 @@ export function mockClaudeProviderId(): string | null {
  * The lane state of one engine's selected provider source, for the cross-check consent
  * toggles: "none" (no selection), "usable" (live, key present and enabled) or "unusable"
  * (selected but retired, keyless or key-disabled; a selection survives these changes).
+ * The server's allowlist and invalid-provider refusal reasons are unreachable here: the mock
+ * enforces them at write time, so a stored selection never carries them.
  */
 export function mockSelectedSourceState(engine: "claude" | "codex"): "none" | "usable" | "unusable" {
   const id = engine === "codex" ? codexProviderId : claudeProviderId;

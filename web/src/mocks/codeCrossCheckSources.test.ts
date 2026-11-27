@@ -70,6 +70,37 @@ describe.each(toggles)("%s cross-check toggle and provider sources", (_stage, to
     await expect(toggle(api, true)).rejects.toMatchObject({ status: 409 });
   });
 
+  it("refuses a selected usable Claude source with no Codex source even with vendor credentials", async () => {
+    const { api } = await load();
+    await expect(toggle(api, true)).resolves.toBeDefined();
+    await api.setClaudeProviderSource("prov-gateway");
+    await expect(toggle(api, true)).rejects.toMatchObject({ status: 409 });
+  });
+
+  it("refuses a selected unusable Claude source with no Codex source even with vendor credentials", async () => {
+    const { api } = await load();
+    await api.setClaudeProviderSource("prov-gateway");
+    await api.setProviderKeyEnabled("prov-gateway", false);
+    await expect(toggle(api, true)).rejects.toMatchObject({ status: 409 });
+  });
+
+  it("refuses a selected usable Codex source with no Claude source and no vendor Anthropic token", async () => {
+    const { api, secrets } = await load();
+    const { provider } = await api.createProvider({
+      engine: "codex",
+      name: "codex-gw",
+      base_url: "https://gateway.example.com/v1",
+      auth_style: "bearer",
+      model_map: { default: { model: "gw" } },
+    });
+    await api.putProviderKey(provider.id, "c".repeat(24));
+    await api.setCodexProviderSource(provider.id);
+    for (let i = secrets.length - 1; i >= 0; i--) {
+      if (secrets[i].kind === "anthropic_token") secrets.splice(i, 1);
+    }
+    await expect(toggle(api, true)).rejects.toMatchObject({ status: 409 });
+  });
+
   it("keeps the no-source rule: the vendor credentials decide", async () => {
     const { api, secrets } = await load();
     await expect(toggle(api, true)).resolves.toBeDefined();

@@ -1398,11 +1398,17 @@ function validateModelSettingsBody(body: Record<string, unknown>): ModelSettings
 // (PRD #4574 M2): each half follows its lane decision. A selected usable provider source makes
 // the engine usable (even with no vendor credential); a selected but unusable source refuses
 // (even when the vendor credential is usable); with no selected source the vendor credential
-// decides.
+// decides. The Codex half is stricter: with no selected Codex source, any selected Claude source
+// (usable or not) refuses regardless of the vendor Codex credential (the server's
+// checkerLaneDecision returns Refused for a Claude source without a Codex source).
 function bothHarnessesUsable(): boolean {
   const half = (engine: "claude" | "codex", vendorUsable: boolean): boolean => {
     const source = mockSelectedSourceState(engine);
-    return source === "none" ? vendorUsable : source === "usable";
+    if (source === "none") {
+      if (engine === "codex" && mockSelectedSourceState("claude") !== "none") return false;
+      return vendorUsable;
+    }
+    return source === "usable";
   };
   return half("claude", hasAnthropicToken(secrets)) &&
     half("codex", isCodexUsable(secrets, userSettings.codex_account_mode));
