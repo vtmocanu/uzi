@@ -15,7 +15,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// Issue #4700 (migration 00543): the run_usage writers in this package (foldUsageFrames for
+// Issue #4700 (migration 00549): the run_usage writers in this package (foldUsageFrames for
 // result frames, progress notes and summary passes, and RefoldRunUsage) must mark the run's
 // stored fold stale. Skipped unless UZI_TEST_DATABASE_URL is set (./e2e/run-store-it.sh).
 

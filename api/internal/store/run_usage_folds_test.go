@@ -14,11 +14,11 @@ import (
 	"testing"
 )
 
-// Issue #4700 enforcement: run_usage fold freshness (migration 00543) holds only while EVERY
+// Issue #4700 enforcement: run_usage fold freshness (migration 00549) holds only while EVERY
 // run_usage writer first calls fn_run_usage_fold_lock for the run it writes. There are no
 // triggers on run_usage, so this test is the guard. It checks, without a database:
 //
-//	(i)   every SQL statement in queries/*.sql, and in migrations numbered above 00543, that
+//	(i)   every SQL statement in queries/*.sql, and in migrations numbered above 00549, that
 //	      writes run_usage carries an fn_run_usage_fold_lock CTE the statement reads from;
 //	(ii)  no non-test Go file outside the sqlc output embeds raw SQL writing run_usage;
 //	(iii) the generated UpsertRunUsage / DeleteRunUsage methods are called only from the
@@ -207,11 +207,11 @@ func TestRunUsageWritersTakeFoldLock_SQL(t *testing.T) {
 		}
 		for _, st := range sqlStatements(string(b), false) {
 			if unguardedRunUsageWrite(st) {
-				t.Errorf("%s: statement writes run_usage without calling fn_run_usage_fold_lock (see the manual DML rule in migration 00543): %q", base, strings.TrimSpace(st))
+				t.Errorf("%s: statement writes run_usage without calling fn_run_usage_fold_lock (see the manual DML rule in migration 00549): %q", base, strings.TrimSpace(st))
 			}
 		}
 	}
-	t.Logf("%d query statements (%d run_usage writers), %d migrations above 00543", scanned, writers, later)
+	t.Logf("%d query statements (%d run_usage writers), %d migrations above 00549", scanned, writers, later)
 }
 
 // apiGoFiles lists the non-test Go files under api/ outside the sqlc output.

@@ -842,7 +842,7 @@ func TestUsageFolderLaneQueryErrorAfterRetryDoesNotBackOffLiveDB(t *testing.T) {
 }
 
 // What this proves: with sequential scans disabled and the generic plan forced, the missing-lane
-// query's window over runs is planned through idx_runs_usage_fold_missing (migration 00544), i.e.
+// query's window over runs is planned through idx_runs_usage_fold_missing (migration 00550), i.e.
 // the index exists and the query's predicate implies the partial index. It does NOT prove the
 // default planner picks that plan: at this fixture's scale a sequential scan is legitimately
 // cheaper. The window size MUST stay a SQL literal (asserted below as text): as a parameter the

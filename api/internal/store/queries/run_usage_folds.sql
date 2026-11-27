@@ -1,4 +1,4 @@
--- Issue #4700: run_usage fold materializer and refold lock (migration 00543). The Go
+-- Issue #4700: run_usage fold materializer and refold lock (migration 00549). The Go
 -- driver is MaterializeRunUsageFolds (run_usage_folds.go); these statements are its steps
 -- and are deliberately SEPARATE statements, see the invariants documented there.
 
@@ -26,7 +26,7 @@ LIMIT @lim::int;
 -- Missing lane: eligible runs with no state row, newest first, by a keyset cursor over
 -- (created_at DESC, id DESC): the next page is the rows strictly before (@c, @cid). The query
 -- looks at one WINDOW of the 2000 eligible runs after the cursor (an index range scan of
--- idx_runs_usage_fold_missing, migration 00544) and returns up to @lim candidates from it
+-- idx_runs_usage_fold_missing, migration 00550) and returns up to @lim candidates from it
 -- (window_end = false), plus one extra row (window_end = true) that is the OLDEST run of the
 -- window and carries the window's size in window_rows. The folder moves its cursor to the last
 -- candidate when @lim came back, else to the window_end row, and a window smaller than 2000
@@ -49,7 +49,7 @@ UNION ALL
 -- name: LockRunForUsageRefold :one
 -- First statement of RefoldRunUsage's transaction: takes the runs row FOR UPDATE (not FOR NO
 -- KEY UPDATE) before the refold touches run_usage. Every run_usage writer holds the runs row
--- FOR KEY SHARE until its transaction ends (fn_run_usage_fold_lock, migration 00543), and FOR
+-- FOR KEY SHARE until its transaction ends (fn_run_usage_fold_lock, migration 00549), and FOR
 -- UPDATE conflicts with that, so the refold waits out every in-flight writer HERE, before
 -- DeleteRunUsage's statement snapshot is taken. A weaker FOR NO KEY UPDATE does not conflict
 -- with KEY SHARE: the refold's delete would then block inside its own statement on the

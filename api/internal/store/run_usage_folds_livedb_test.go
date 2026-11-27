@@ -20,7 +20,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
-// Issue #4700, migration 00543: the materialized per-(run, model) usage fold, its freshness
+// Issue #4700, migration 00549: the materialized per-(run, model) usage fold, its freshness
 // state, the write-path lock (fn_run_usage_fold_lock) and MaterializeRunUsageFolds. Every
 // test skips without UZI_TEST_DATABASE_URL (run via ./e2e/run-store-it.sh). Races are
 // synchronised with open transactions, the materializer's step hook and a bounded poll of

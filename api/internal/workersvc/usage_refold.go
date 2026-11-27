@@ -51,7 +51,7 @@ func RefoldRunUsage(ctx context.Context, pool *pgxpool.Pool, q *store.Queries, r
 	qtx := q.WithTx(tx)
 
 	// Issue #4700: the runs row is the master lock of the run_usage fold-freshness protocol
-	// (migration 00543). Take it FOR UPDATE before the first run_usage write: that waits out
+	// (migration 00549). Take it FOR UPDATE before the first run_usage write: that waits out
 	// every in-flight writer (each holds the row FOR KEY SHARE) before DeleteRunUsage's
 	// statement snapshot is taken, so the delete sees every row they committed, and it
 	// serialises this refold against a concurrent run delete and other refolds. No row means

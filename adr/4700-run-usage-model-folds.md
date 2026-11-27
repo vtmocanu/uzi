@@ -9,7 +9,7 @@
 ## Decision summary
 
 A materialized per-(run, model) fold of `run_usage_model_totals` now exists
-(`run_usage_model_folds`, migration `00543`), with a per-run freshness row
+(`run_usage_model_folds`, migration `00549`), with a per-run freshness row
 (`run_usage_fold_state`). `AnalyticsAllSpend` reads the stored fold for a **fresh terminal**
 run and folds every other run live. Writers invalidate the fold through a lock function,
 and a sweeper pass plus a terminal-status kick keep it fresh.
@@ -21,8 +21,8 @@ because the cost is in building the post-fold Spend document over about 117k run
 reading the fold. The owner decided to land the fold and keep the 400 refusal unchanged.
 Re-enabling all-time is a separate issue, if wanted, aimed at the post-fold document.
 
-Migration numbers `00543` and `00544` are drafts; they are renumbered above the live head
-at landing.
+The schema lands as migrations `00549` and `00550` (drafted as 00543 and 00544 and renumbered
+above the live head at landing).
 
 ## Context
 
@@ -38,7 +38,7 @@ include. The rest of this ADR is that freshness protocol and what it costs.
 
 ## Design
 
-### Schema (migration 00543, 00544)
+### Schema (migration 00549, 00550)
 
 - `run_usage_fold_state(run_id PK, stale boolean default true, folded_at)`, with a partial
   index `WHERE stale`. There is **no FK to `runs`**: the state row must be creatable while
@@ -51,7 +51,7 @@ include. The rest of this ADR is that freshness protocol and what it costs.
   `ON CONFLICT DO UPDATE ... WHERE NOT stale`, so the row is locked even when it is already
   stale.
 - There are **no triggers on `run_usage`**: a per-row trigger would tax every live upsert.
-- `00544` adds a partial index on `runs (created_at DESC, id DESC)` for terminal, non-chat,
+- `00550` adds a partial index on `runs (created_at DESC, id DESC)` for terminal, non-chat,
   `usage_refolded` runs, built with `CREATE INDEX CONCURRENTLY` (`NO TRANSACTION`), so the
   materializer's missing lane is an index range scan of at most 2000 entries.
 
@@ -247,7 +247,7 @@ admin all-users was up to about 4 to 5% slower, within the 10% control threshold
 - WAL: +11 to 66 B per write on active runs in the claim shape; a bare upsert on an existing
   key measured +108 to 109 B; a fresh-to-stale flip 276 to 416 B per transaction (one write)
   or about 330 B (five writes); +6.1 kB per refolded run.
-- The one-time legacy refold's `UPDATE runs` loses HOT updates because `00544`'s predicate
+- The one-time legacy refold's `UPDATE runs` loses HOT updates because `00550`'s predicate
   covers `usage_refolded`.
 - Materializer: no p99 cost; p99.9 3.4 to 5.9 ms on runs being folded.
 

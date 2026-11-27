@@ -60,7 +60,7 @@ func runUsageFoldStepDone(ctx context.Context, step string) {
 // materializer creating the row. At most MaxRunUsageFoldBatch ids are accepted per call.
 //
 // Everything runs in ONE explicit READ COMMITTED transaction, and every step is its own
-// statement (see the migration 00543 header for the lock protocol). Invariants this code
+// statement (see the migration 00549 header for the lock protocol). Invariants this code
 // must keep:
 //
 //   - Steps (b) and (d) are SEPARATE statements, never merged into one. Under READ
