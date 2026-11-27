@@ -255,8 +255,8 @@ type AnalyticsFlowOutcomes struct {
 // AnalyticsFlowFunnelDisclosure counts runs whose approval evidence is incomplete:
 // HistoricalApprovalOnly (no eligible receipt for the current revision and at least one older
 // revision with exactly one eligible receipt; independent of the approval ranking),
-// AmbiguousCurrent (more than one eligible receipt for the current revision; a run whose only
-// older evidence is ambiguous is counted in neither) and
+// AmbiguousCurrent (more than one eligible receipt for the current revision; a run with no
+// eligible current receipt whose only older evidence is ambiguous is counted in neither) and
 // LegacyEvidence (a run with any NULL-binding or unbound approve_plan receipt, even when it
 // also has human proof for the current plan; the approval classification still ranks that
 // human proof first).

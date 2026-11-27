@@ -566,8 +566,8 @@ never null.
     current revision and at least one older revision with exactly one eligible
     receipt; it is a disclosure counter, independent of the `approval` ranking.
     `ambiguous_current` counts runs with more than one eligible receipt for the
-    current revision. A run whose only older evidence is ambiguous is counted
-    in neither. `legacy_evidence` counts an `issue` or `self_improve` run with
+    current revision. A run with no eligible current receipt whose only older
+    evidence is ambiguous is counted in neither. `legacy_evidence` counts an `issue` or `self_improve` run with
     any no-binding or `unbound` `approve_plan` receipt, even when the run also
     has timed pairs or current human proof. These counts are not additive with
     each other, with `approval.unknown` or with plan response `unknown`: a run
@@ -627,12 +627,14 @@ Plan response, the funnel and the approval classification share these rules:
 - **Ambiguity.** More than one eligible receipt for the same run and revision
   is ambiguous evidence for that revision: it proves nothing about it.
   Receipts that are not eligible never make a revision ambiguous. Reporting
-  differs by surface: `plan_response` reports the pair as `ambiguous`;
-  `approval` follows the ranking below (current-revision ambiguity is
-  `ambiguous`; older-revision ambiguity counts as `ambiguous` only when no
-  older revision has a unique receipt, and otherwise the run takes the next
-  reason that applies in the ranking); the funnel's `ambiguous_current` counts only
-  current-revision ambiguity.
+  differs by surface: `plan_response` reports the pair as `ambiguous`.
+  `approval` follows the [ranking](#approval-evidence) below: current-revision
+  ambiguity, or older-revision ambiguity when no older revision has a unique
+  receipt, meets the condition for the `ambiguous` reason, but the run takes
+  the first reason in the ranking that applies, so current human proof and
+  `auto_approve_configured` still rank ahead. The funnel's
+  [`ambiguous_current`](#flow) disclosure counts only current-revision
+  ambiguity.
 - **Current revision.** Human proof for a run is exactly one eligible receipt
   for the run's current gate revision. This is evidence only: an older
   revision with exactly one eligible receipt is historical approval evidence,

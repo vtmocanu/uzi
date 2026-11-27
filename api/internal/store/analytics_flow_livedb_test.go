@@ -1018,8 +1018,9 @@ func TestAnalyticsFlowOlderRevisionApprovalLiveDB(t *testing.T) {
 				d := f.flow(call).Doc
 				un := tc.reasons
 				unTotal := un.Ambiguous + un.LegacyUnbound + un.HistoricalApprovalOnly + un.NoEvidence
-				if d.Approval.Human != 0 || d.Approval.Unknown.Reasons != un || d.Approval.Unknown.Total != unTotal {
-					t.Errorf("%s approval = %+v, want human 0 unknown %+v total %d", scope, d.Approval, un, unTotal)
+				if d.Approval.Human != 0 || d.Approval.AutoApproveConfigured != 0 || d.Approval.Total != unTotal ||
+					d.Approval.Unknown.Reasons != un || d.Approval.Unknown.Total != unTotal {
+					t.Errorf("%s approval = %+v, want human 0 auto 0 total %d unknown %+v", scope, d.Approval, unTotal, un)
 				}
 				if d.DeliveryFunnel.Disclosure != tc.disc {
 					t.Errorf("%s disclosure = %+v, want %+v", scope, d.DeliveryFunnel.Disclosure, tc.disc)

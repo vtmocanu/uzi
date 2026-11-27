@@ -191,8 +191,8 @@ fr AS MATERIALIZED (
     LEFT JOIN LATERAL (SELECT oc.outcome FROM run_outcome_classes oc WHERE oc.run_id = c.id OFFSET 0) o ON true
     -- Per-run receipt aggregate as a probe of idx_run_user_inputs_run_id: a join against a cohort-wide
     -- GROUP BY CTE is re-read once per run under a generic plan.
-    -- Eligible receipts are counted per revision (g.n): more than one on a revision proves nothing about it,
-    -- so an older revision is historical approval (hist_ok) only with exactly one, else ambiguous (hist_amb).
+    -- Eligible receipts are counted per revision (g.n): an older revision with exactly one is historical
+    -- approval (hist_ok), one with more than one proves nothing (hist_amb), and one with none is in neither.
     LEFT JOIN LATERAL (
         SELECT COALESCE(max(g.n) FILTER (WHERE g.rev = c.gate_revision), 0) AS cur_n,
                count(*) FILTER (WHERE g.rev < c.gate_revision AND g.n = 1) AS hist_ok,
@@ -1576,8 +1576,8 @@ fr AS MATERIALIZED (
     LEFT JOIN LATERAL (SELECT oc.outcome FROM run_outcome_classes oc WHERE oc.run_id = c.id OFFSET 0) o ON true
     -- Per-run receipt aggregate as a probe of idx_run_user_inputs_run_id: a join against a cohort-wide
     -- GROUP BY CTE is re-read once per run under a generic plan.
-    -- Eligible receipts are counted per revision (g.n): more than one on a revision proves nothing about it,
-    -- so an older revision is historical approval (hist_ok) only with exactly one, else ambiguous (hist_amb).
+    -- Eligible receipts are counted per revision (g.n): an older revision with exactly one is historical
+    -- approval (hist_ok), one with more than one proves nothing (hist_amb), and one with none is in neither.
     LEFT JOIN LATERAL (
         SELECT COALESCE(max(g.n) FILTER (WHERE g.rev = c.gate_revision), 0) AS cur_n,
                count(*) FILTER (WHERE g.rev < c.gate_revision AND g.n = 1) AS hist_ok,
