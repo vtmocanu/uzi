@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -366,9 +365,15 @@ func TestPRHistoryBasicsLiveDB(t *testing.T) {
 			if len(es) != 1 {
 				t.Fatalf("round %d: %d events, want 1: %+v", round, len(es), es)
 			}
-			// The event's observed_at depends on which writer inserted first, so it is not pinned.
 			if e := es[0]; e.From != nil || e.To != "merged" || e.TimeSource != "observation_fallback" || !e.Bootstrap || !e.FirstMerge {
 				t.Fatalf("round %d: event = %+v, want nil -> merged, observation_fallback, bootstrap, first_merge", round, e)
+			}
+			// Either writer may insert first, so the event carries one of the two submitted observations.
+			if e := es[0]; !e.ObservedAt.Equal(obsA) && !e.ObservedAt.Equal(obsB) {
+				t.Fatalf("round %d: event observed_at = %s, want %s or %s", round, prhTm(&e.ObservedAt), prhTm(&obsA), prhTm(&obsB))
+			}
+			if e := es[0]; e.ProviderAt != nil {
+				t.Fatalf("round %d: event provider_at = %s, want nil (no provider time submitted)", round, prhTm(e.ProviderAt))
 			}
 			fx.assertMRState(a, "merged")
 			fx.assertMRState(b, "merged")
@@ -1001,20 +1006,19 @@ func TestPRHistoryPrelockedDeleteOrderLiveDB(t *testing.T) {
 	}
 }
 
-// prhDeadlockTimeout reads SHOW deadlock_timeout.
-func prhDeadlockTimeout(ctx context.Context, t *testing.T, pool *pgxpool.Pool) time.Duration {
-	t.Helper()
-	var s string
-	if err := pool.QueryRow(ctx, `SHOW deadlock_timeout`).Scan(&s); err != nil {
-		t.Fatal(err)
-	}
-	d, err := time.ParseDuration(strings.TrimSpace(s))
-	if err != nil {
-		t.Fatalf("parse deadlock_timeout %q: %v", s, err)
-	}
-	return d
-}
-
+// TestPRHistoryCrossCheckChildDeleteDeadlockLiveDB races a watcher observation against a repo
+// delete and checks both victim choices. Each case sets explicit per-transaction
+// deadlock_timeout values with SET LOCAL, so victim selection and every wait are bounded and
+// independent of the server's deadlock_timeout.
+//
+// Privilege: deadlock_timeout is a superuser-only (PGC_SUSET) parameter, so SET LOCAL needs a
+// superuser connection or the SET privilege on it (PostgreSQL 15+, including 17:
+// GRANT SET ON PARAMETER deadlock_timeout TO <role>). Without it the test fails at the SET, not
+// at the lock race. Developers without that privilege can run ./e2e/run-store-it.sh, whose
+// throwaway database connects as the image's superuser role.
+//
+// The test also assumes the server does not set lock_timeout, statement_timeout,
+// idle_in_transaction_session_timeout or transaction_timeout below a few seconds.
 func TestPRHistoryCrossCheckChildDeleteDeadlockLiveDB(t *testing.T) {
 	// setup builds: lead issue run (non-cross_check), a completed cross_check child with mr_iid set and
 	// the connection owner as user, a cross_checks row linking them, and a repo with enabled=false.
@@ -1064,9 +1068,12 @@ func TestPRHistoryCrossCheckChildDeleteDeadlockLiveDB(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()
 		f := fx.f
-		dt := prhDeadlockTimeout(ctx, t, f.pool)
+		// Both actors use the same short session deadlock_timeout, so the wait below is bounded
+		// whatever the server's deadlock_timeout is.
+		const dt = time.Second
+		const dtSetting = "1s"
 
-		txA := begin(ctx, t, f.pool, "")
+		txA := begin(ctx, t, f.pool, dtSetting)
 		defer prhRollback(txA)
 		pidA := prhPID(ctx, t, txA)
 		var one int
@@ -1074,7 +1081,7 @@ func TestPRHistoryCrossCheckChildDeleteDeadlockLiveDB(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		txB := begin(ctx, t, f.pool, "")
+		txB := begin(ctx, t, f.pool, dtSetting)
 		defer prhRollback(txB)
 		pidB := prhPID(ctx, t, txB)
 		doneB := make(chan prhRes, 1)
@@ -1089,6 +1096,9 @@ func TestPRHistoryCrossCheckChildDeleteDeadlockLiveDB(t *testing.T) {
 		}()
 		defer prhJoin(cancel, finished)()
 		prhWaitBlocked(ctx, t, f.pool, pidB, pidA)
+		// The sleep must exceed B's deadlock_timeout. PostgreSQL runs a waiter's deadlock check once,
+		// when that waiter's own deadlock_timeout expires, so B's single check has passed (no cycle)
+		// before A starts waiting. A's check then finds the cycle, and A is the victim.
 		time.Sleep(2*dt + 500*time.Millisecond)
 
 		nA, errA := observeChild(ctx, txA, fx)
