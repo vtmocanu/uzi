@@ -879,6 +879,11 @@ func run() error {
 		BackgroundGrace:         cfg.WorkerBackgroundGrace,
 	})
 
+	capacitySampler, err := workersvc.NewCapacitySampler(pool, cfg.WorkerHeartbeatStale)
+	if err != nil {
+		return err
+	}
+
 	sweep := sweeper.New(wsvc, cfg.SweepInterval,
 		sweeper.Pass{
 			Name: "vault_browser_slots_expired",
@@ -1094,6 +1099,14 @@ func run() error {
 		sweeper.Pass{
 			Name: "notification_slack_redeliver",
 			Run:  redeliverer.Pass,
+		},
+		// Worker capacity samples (issue #4693): record at most one row per worker per
+		// five-minute bucket, under a cross-replica session advisory lock and a 2 s total
+		// deadline (up to 4 batches of 1000 per tick). Always registered: once every worker
+		// is sampled for the bucket it is one statement inserting nothing.
+		sweeper.Pass{
+			Name: "worker_capacity_samples",
+			Run:  capacitySampler.Pass,
 		},
 	)
 	// Admin-health loop-beat: the run-liveness sweeper is one of the four loops (PRD #1484

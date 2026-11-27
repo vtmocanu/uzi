@@ -2418,6 +2418,24 @@ type WorkerActiveRun struct {
 	CooldownUntil        pgtype.Timestamptz `json:"cooldown_until"`
 }
 
+type WorkerCapacitySample struct {
+	WorkerID             uuid.UUID          `json:"worker_id"`
+	BucketStart          pgtype.Timestamptz `json:"bucket_start"`
+	UserID               uuid.UUID          `json:"user_id"`
+	ObservedAt           pgtype.Timestamptz `json:"observed_at"`
+	Freshness            string             `json:"freshness"`
+	LastHeartbeatAt      pgtype.Timestamptz `json:"last_heartbeat_at"`
+	WorkerKind           string             `json:"worker_kind"`
+	Ephemeral            bool               `json:"ephemeral"`
+	IsolatedLane         bool               `json:"isolated_lane"`
+	MaxConcurrentRuns    pgtype.Int4        `json:"max_concurrent_runs"`
+	MaxCrossCheckSlots   pgtype.Int4        `json:"max_cross_check_slots"`
+	Attribution          string             `json:"attribution"`
+	OrdinaryActive       pgtype.Int4        `json:"ordinary_active"`
+	CrossCheckLaneActive pgtype.Int4        `json:"cross_check_lane_active"`
+	ChatActive           pgtype.Int4        `json:"chat_active"`
+}
+
 type WorkerCordonEvent struct {
 	ID         uuid.UUID          `json:"id"`
 	OwnerID    uuid.UUID          `json:"owner_id"`
