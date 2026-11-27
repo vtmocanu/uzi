@@ -111,14 +111,18 @@ func crossCheckCandidateInput(cc store.CrossCheck, semantic ...*apitypes.Semanti
 }
 
 // singleFamilyCheckerCustody is the checker's credential custody rule (PRD #2149 D3,
-// PRD #2460): a child holds only its OWN family's credential. A codex child carries Codex
-// credentials and no Anthropic token; a claude child carries the Anthropic token and no
-// Codex credentials. Any other harness, or a child holding both or neither, is refused,
-// so a checker can never act as the lead's family.
+// PRD #2460): a child holds only its OWN family's credential. A codex child carries no
+// Anthropic token and EXACTLY ONE Codex credential source: the vendor Codex block, or (PRD
+// #4574 M2) a provider binding whose engine is codex. A claude child carries the Anthropic
+// token and no Codex credentials. Any other harness, or a child holding both or neither,
+// is refused, so a checker can never act as the lead's family.
 func singleFamilyCheckerCustody(harness string, payload *ClaimPayload) bool {
 	switch harness {
 	case string(HarnessCodex):
-		return payload.Secrets.Codex != nil && payload.Secrets.AnthropicOAuthToken == ""
+		if payload.Secrets.AnthropicOAuthToken != "" || (payload.Secrets.Provider != nil && payload.Secrets.Provider.Engine != harnessCodex) {
+			return false
+		}
+		return (payload.Secrets.Codex != nil) != (payload.Secrets.Provider != nil)
 	case string(HarnessClaude):
 		// PRD #4320 module 5: a checker child never holds a provider binding (cross-check has no
 		// provider support until PRD #4322); assembleClaim refuses a provider-bound child first.

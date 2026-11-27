@@ -7,8 +7,8 @@ import (
 	"testing"
 )
 
-// PRD #4574 M1: every claim, placement, demand, wake and reap site carries the Codex judge clause
-// inside its Codex provider arm, each in its own operand form. The forms are read from the
+// PRD #4574 M1 and M2: every claim, placement, demand, wake and reap site carries the Codex judge
+// clause and the Codex checker clause (kind 'cross_check') inside its Codex provider arm, each in its own operand form. The forms are read from the
 // generated SQL constants (what the database receives), so a regenerated or hand-edited query that
 // drops or reshapes one is named individually. No database is needed.
 func TestCodexProviderJudgeCapabilityClauseFormsPinned(t *testing.T) {
@@ -38,9 +38,9 @@ func TestCodexProviderJudgeCapabilityClauseFormsPinned(t *testing.T) {
 
 	// Positional parameters renumber with every sqlc run; the claimant's array must be the same
 	// parameter in all three operands of the clause.
-	claimRe := regexp.MustCompile(`\(r\.harness = 'codex' AND 'codex_provider_v1' = ANY\((\$\d+::text\[\])\) AND \(r\.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY\((\$\d+::text\[\])\)\)\)`)
+	claimRe := regexp.MustCompile(`\(r\.harness = 'codex' AND 'codex_provider_v1' = ANY\((\$\d+::text\[\])\) AND \(r\.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY\((\$\d+::text\[\])\)\) AND \(r\.kind <> 'cross_check' OR 'codex_provider_checker_v1' = ANY\((\$\d+::text\[\])\)\)\)`)
 	m := claimRe.FindStringSubmatch(constant(runtime, "claimRun"))
-	if m == nil || m[1] != m[2] {
+	if m == nil || m[1] != m[2] || m[1] != m[3] {
 		t.Errorf("ClaimRun claimant arm lacks the Codex judge clause over one parameter: %v", m)
 	}
 
@@ -49,14 +49,14 @@ func TestCodexProviderJudgeCapabilityClauseFormsPinned(t *testing.T) {
 		want             int
 		squashed         bool
 	}{
-		{"claimRun", runtime, "(r.harness = 'codex' AND 'codex_provider_v1' = ANY(p.protocol_capabilities) AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(p.protocol_capabilities)))", 1, false},
-		{"countOnlineWorkersClaimableForRun", runtime, "(run.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities) AND (run.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities)))", 1, false},
-		{"listSaturationQueuedRunsForEphemeral", runtime, "(r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities) AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities)))", 2, false},
-		{"listStaleHibernationWakes", hibernation, "WHEN 'codex' THEN 'codex_provider_v1' = ANY(w.protocol_capabilities) AND 'codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities) AND 'codex_runtime_v3' = ANY(w.protocol_capabilities) AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities))", 1, true},
-		{"lockReapableEphemeralWorkers", hosted, "(r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities) AND 'codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities) AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities)))", 1, true},
-		{"deleteLockedEphemeralWorkers", hosted, "(r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities) AND 'codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities) AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities)))", 1, true},
+		{"claimRun", runtime, "(r.harness = 'codex' AND 'codex_provider_v1' = ANY(p.protocol_capabilities) AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(p.protocol_capabilities)) AND (r.kind <> 'cross_check' OR 'codex_provider_checker_v1' = ANY(p.protocol_capabilities)))", 1, false},
+		{"countOnlineWorkersClaimableForRun", runtime, "(run.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities) AND (run.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities)) AND (run.kind <> 'cross_check' OR 'codex_provider_checker_v1' = ANY(w.protocol_capabilities)))", 1, false},
+		{"listSaturationQueuedRunsForEphemeral", runtime, "(r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities) AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities)) AND (r.kind <> 'cross_check' OR 'codex_provider_checker_v1' = ANY(w.protocol_capabilities)))", 2, false},
+		{"listStaleHibernationWakes", hibernation, "WHEN 'codex' THEN 'codex_provider_v1' = ANY(w.protocol_capabilities) AND 'codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities) AND 'codex_runtime_v3' = ANY(w.protocol_capabilities) AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities)) AND (r.kind <> 'cross_check' OR 'codex_provider_checker_v1' = ANY(w.protocol_capabilities))", 1, true},
+		{"lockReapableEphemeralWorkers", hosted, "(r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities) AND 'codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities) AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities)) AND (r.kind <> 'cross_check' OR 'codex_provider_checker_v1' = ANY(w.protocol_capabilities)))", 1, true},
+		{"deleteLockedEphemeralWorkers", hosted, "(r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities) AND 'codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities) AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities)) AND (r.kind <> 'cross_check' OR 'codex_provider_checker_v1' = ANY(w.protocol_capabilities)))", 1, true},
 		// The health count takes the run kind as its own parameter ($3 after user and engine).
-		{"countOnlineWorkersSatisfyingProvider", runtime, "'codex_runtime_v3' = ANY(w.protocol_capabilities) AND ($3::text <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities)))", 1, true},
+		{"countOnlineWorkersSatisfyingProvider", runtime, "'codex_runtime_v3' = ANY(w.protocol_capabilities) AND ($3::text <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities)) AND ($3::text <> 'cross_check' OR 'codex_provider_checker_v1' = ANY(w.protocol_capabilities)))", 1, true},
 	} {
 		sql := constant(tc.src, tc.query)
 		if tc.squashed {
@@ -78,6 +78,9 @@ func TestCodexProviderJudgeCapabilityClauseFormsPinned(t *testing.T) {
 		clauses := strings.Count(sql, "'codex_provider_judge_v1' = ANY(")
 		if arms != clauses {
 			t.Errorf("%s has %d Codex provider arms but %d judge clauses", name, arms, clauses)
+		}
+		if checkers := strings.Count(sql, "'codex_provider_checker_v1' = ANY("); arms != checkers {
+			t.Errorf("%s has %d Codex provider arms but %d checker clauses", name, arms, checkers)
 		}
 	}
 }

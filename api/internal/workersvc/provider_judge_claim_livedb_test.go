@@ -710,3 +710,32 @@ func TestProviderJudgeClaimSignalScrubsKeyBeforeClipLiveDB(t *testing.T) {
 		t.Fatalf("a key prefix reached the claim: %+v", m)
 	}
 }
+
+// TestQueuedReasonNoCodexProviderCheckerCapableWorkerLiveDB pins which free-text reason a queued
+// provider-bound Codex cross_check child reads when no online worker advertises
+// codex_provider_checker_v1 (PRD #4574 M2): the generic reasonNoProviderCapableWorker, through the
+// provider rung (CountOnlineWorkersSatisfyingProvider with the run's kind), not reasonNoCrossCheckWorker.
+// It clears once a capable worker is online.
+func TestQueuedReasonNoCodexProviderCheckerCapableWorkerLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	row := func(runID [16]byte) store.ListActiveRunsForHealthRow {
+		return store.ListActiveRunsForHealthRow{ID: runID, UserID: e.userID, Status: "queued", Health: healthOK, Harness: harnessCodex, Kind: runkind.CrossCheck,
+			ModelProviderKeyMode: pgtype.Text{String: "user_key", Valid: true}}
+	}
+	run := e.seedQueuedRun(t, nil, nil)
+	w := e.seedWorker(t, append([]string{capability.CrossCheckV1}, pjCodexBaseCaps...))
+	got := svc.queuedReason(e.ctx, time.Now(), row(run), thWithLimit(testCustodyLimit))
+	if got != reasonNoProviderCapableWorker {
+		t.Fatalf("queuedReason with only codex_provider_v1 workers = %q, want %q", got, reasonNoProviderCapableWorker)
+	}
+	e.exec(t, `UPDATE workers SET protocol_capabilities = $2 WHERE id = $1`, w, append([]string{capability.CrossCheckV1}, pjCodexJudgeCaps()...))
+	// The judge capability alone does not satisfy a checker.
+	if got := svc.queuedReason(e.ctx, time.Now(), row(run), thWithLimit(testCustodyLimit)); got != reasonNoProviderCapableWorker {
+		t.Fatalf("queuedReason with a judge-capable worker = %q, want %q", got, reasonNoProviderCapableWorker)
+	}
+	e.exec(t, `UPDATE workers SET protocol_capabilities = $2 WHERE id = $1`, w, append(append([]string{capability.CrossCheckV1}, pjCodexBaseCaps...), capability.CodexProviderCheckerV1))
+	if got := svc.queuedReason(e.ctx, time.Now(), row(run), thWithLimit(testCustodyLimit)); got == reasonNoProviderCapableWorker {
+		t.Fatalf("queuedReason with a checker-capable worker = %q, want no provider capability reason", got)
+	}
+}
