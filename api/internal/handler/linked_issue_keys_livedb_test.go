@@ -203,14 +203,28 @@ func TestRunPayloadsCarryTheLinkedIssueKeyLiveDB(t *testing.T) {
 		t.Error("the linked run is missing from the admin active list")
 	}
 
-	// Created issues ride the run detail of a scheduled prompt run.
-	for id, wantFor := range map[uuid.UUID]string{f.linkedPromptRun: f.key(12), f.plainPromptRun: ""} {
-		run := f.get(f.h.GetRun, "/api/runs/x", map[string]string{"id": id.String()})["run"].(map[string]any)
+	// Created issues ride the run detail of a scheduled prompt run. A linked repo's created
+	// issue lives in the issue tracker, so it carries no code forge URL: the forge URL with the
+	// tracker's number would open an unrelated forge issue (PR #4757 review). The plain repo's
+	// created issue keeps its forge URL.
+	for _, tc := range []struct {
+		run     uuid.UUID
+		key     string
+		wantURL string
+	}{
+		{f.linkedPromptRun, f.key(12), ""},
+		{f.plainPromptRun, "", "https://forge.test/g/plain/-/issues/12"},
+	} {
+		run := f.get(f.h.GetRun, "/api/runs/x", map[string]string{"id": tc.run.String()})["run"].(map[string]any)
 		issues, _ := run["created_issues"].([]any)
 		if len(issues) != 1 {
 			t.Fatalf("created_issues = %v, want one", run["created_issues"])
 		}
-		wantIssueKey(t, "created issue", issues[0].(map[string]any), "issue_key", wantFor)
+		issue := issues[0].(map[string]any)
+		wantIssueKey(t, "created issue", issue, "issue_key", tc.key)
+		if got, _ := issue["web_url"].(string); got != tc.wantURL {
+			t.Errorf("created issue web_url = %q, want %q", got, tc.wantURL)
+		}
 	}
 }
 

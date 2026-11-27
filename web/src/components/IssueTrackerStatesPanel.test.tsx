@@ -88,6 +88,30 @@ describe("IssueTrackerStatesPanel", () => {
     });
   });
 
+  // PR #4757 review: column state lookups must not reach Object.prototype members.
+  it("renders and saves with columns named like Object.prototype members left unmapped", async () => {
+    mockApi.getBoard.mockResolvedValue({ board: board(["toString", "constructor", "__proto__", "Ready"]) });
+    mockApi.putIssueTrackerStates.mockImplementation(async (_id, mapping) => ({ mapping }));
+    renderPanel();
+    await screen.findByLabelText("toString");
+    for (const name of ["toString", "constructor", "__proto__"]) {
+      expect(select(name).value).toBe("");
+      expect(within(rowOf(name)).getByText(UNMAPPED)).toBeTruthy();
+    }
+
+    fireEvent.change(select("Open"), { target: { value: "Open" } });
+    fireEvent.change(select("Closed"), { target: { value: "Fixed" } });
+    fireEvent.change(select("Ready"), { target: { value: "Submitted" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save States" }));
+
+    await screen.findByText("State mapping saved.");
+    expect(mockApi.putIssueTrackerStates).toHaveBeenCalledWith("repo-1", {
+      open_state: "Open",
+      closed_state: "Fixed",
+      columns: [{ label_name: "Ready", state: "Submitted" }],
+    });
+  });
+
   it("shows the saved mapping and uses given columns without reading the board", async () => {
     mockApi.getIssueTrackerStates.mockResolvedValue({
       mapping: { open_state: "Open", closed_state: "Fixed", columns: [{ label_name: "Doing", state: "Review" }] },

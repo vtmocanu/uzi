@@ -55,7 +55,9 @@ export function IssueTrackerStatesPanel({
   const [loadError, setLoadError] = useState("");
   const [openState, setOpenState] = useState("");
   const [closedState, setClosedState] = useState("");
-  const [columnStates, setColumnStates] = useState<Record<string, string>>({});
+  // A Map, not a plain object: a column named `toString` or `constructor` must not read the
+  // inherited Object.prototype member (PR #4757 review).
+  const [columnStates, setColumnStates] = useState<Map<string, string>>(() => new Map());
   const [saving, setSaving] = useState(false);
   const [saveError, setSaveError] = useState("");
   const [saved, setSaved] = useState(false);
@@ -85,8 +87,8 @@ export function IssueTrackerStatesPanel({
           }
         }
         if (!live) return;
-        const byLabel: Record<string, string> = {};
-        for (const c of view.mapping?.columns ?? []) byLabel[c.label_name] = c.state;
+        const byLabel = new Map<string, string>();
+        for (const c of view.mapping?.columns ?? []) byLabel.set(c.label_name, c.state);
         setOpenState(view.mapping?.open_state ?? "");
         setClosedState(view.mapping?.closed_state ?? "");
         setColumnStates(byLabel);
@@ -105,7 +107,7 @@ export function IssueTrackerStatesPanel({
   if (openState) usedBy.set(openState, "the open State");
   if (closedState) usedBy.set(closedState, "the closed State");
   for (const label of loaded?.columns ?? []) {
-    const st = columnStates[label];
+    const st = columnStates.get(label);
     if (st) usedBy.set(st, `column ${stripUnsafeChars(label)}`);
   }
   const takenElsewhere = (name: string, mine: string) => name !== mine && usedBy.has(name);
@@ -129,8 +131,8 @@ export function IssueTrackerStatesPanel({
       open_state: openState,
       closed_state: closedState,
       columns: loaded.columns
-        .filter((label) => columnStates[label])
-        .map((label) => ({ label_name: label, state: columnStates[label] })),
+        .filter((label) => columnStates.get(label))
+        .map((label) => ({ label_name: label, state: columnStates.get(label) ?? "" })),
     };
     try {
       await api.putIssueTrackerStates(repoId, mapping);
@@ -162,7 +164,7 @@ export function IssueTrackerStatesPanel({
   const anyStale =
     !isOffered(openState, "open") ||
     !isOffered(closedState, "closed") ||
-    (loaded?.columns ?? []).some((label) => !isOffered(columnStates[label] ?? "", "open"));
+    (loaded?.columns ?? []).some((label) => !isOffered(columnStates.get(label) ?? "", "open"));
 
   return (
     <section
@@ -230,7 +232,7 @@ export function IssueTrackerStatesPanel({
             </MappingRow>
 
             {loaded.columns.map((label, i) => {
-              const value = columnStates[label] ?? "";
+              const value = columnStates.get(label) ?? "";
               const id = `${ids}-col-${i}`;
               return (
                 <MappingRow
@@ -249,7 +251,7 @@ export function IssueTrackerStatesPanel({
                     id={id}
                     value={value}
                     disabled={saving}
-                    onChange={(e) => edit(() => setColumnStates((prev) => ({ ...prev, [label]: e.target.value })))}
+                    onChange={(e) => edit(() => setColumnStates((prev) => new Map(prev).set(label, e.target.value)))}
                   >
                     <option value="">Unmapped</option>
                     {staleOption(value, "open")}

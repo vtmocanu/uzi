@@ -83,12 +83,21 @@ describe("isUziCard", () => {
     expect(isUziCard(card(["uzi"], false, []), "uzi", undefined)).toBe(true);
   });
 
-  // PRD 4173 M6 (replaces the M4 rule "a keyed card is uzi's"): a key rides every card of a
-  // linked repo, so it decides nothing; the stored eligibility tag does.
-  it("does not count a card as uzi's because it carries an issue_key", () => {
+  // PR #4757 review: an M5 api serves linked cards with a key and a custom eligibility tag but
+  // no eligibility_label. During a rolling deploy the M6 web must keep showing them, as M5 did.
+  it("without an eligibility label (an M5 payload), counts a keyed card as uzi's", () => {
+    const keyed = { ...card(["Team Ready"]), issue_key: "ABC-12" };
+    expect(isUziCard(keyed, "uzi", NO_BOT)).toBe(true);
+    expect(canPromote(keyed, "uzi", NO_BOT)).toBe(false);
+    expect(visibleCards([keyed], "uzi", NO_BOT, false)).toEqual([keyed]);
+  });
+
+  // With the label present (an M6 payload) the key decides nothing; the stored tag does.
+  it("with an eligibility label (an M6 payload), does not count a keyed card without the tag", () => {
     const keyed = { ...card(["Bug"]), issue_key: "ABC-12" };
-    expect(isUziCard(keyed, "uzi", NO_BOT)).toBe(false);
-    expect(canPromote(keyed, "uzi", NO_BOT)).toBe(true);
+    expect(isUziCard(keyed, "uzi", NO_BOT, "Team Ready")).toBe(false);
+    expect(canPromote(keyed, "uzi", NO_BOT, "Team Ready")).toBe(true);
+    expect(visibleCards([keyed], "uzi", NO_BOT, false, "Team Ready")).toEqual([]);
   });
 
   it("on a linked repo, is uzi's exactly when its labels include the eligibility label", () => {

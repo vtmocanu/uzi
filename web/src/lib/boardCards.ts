@@ -45,8 +45,13 @@ export const SELF_IMPROVE_LABEL = "uzi-self-improve";
  * On a repo linked to an issue tracker the payload carries `eligibilityLabel` (the stored
  * eligibility tag name), and the rule is exactly "the labels include it" (PRD 4173 M6): the
  * configured `uzi` label and a bot assignment do not count there, and neither does the
- * card's `issue_key`, which every linked issue carries. An unset or empty `eligibilityLabel`
- * is an unlinked repo, where the rule below applies unchanged.
+ * card's `issue_key`, which every linked issue carries.
+ *
+ * Without `eligibilityLabel` a card with a non-empty `issue_key` is still uzi's, as on M5:
+ * an older api that predates the field already serves linked cards with a key and a custom
+ * eligibility tag, and the linked sync caches only issues carrying that tag, so the key is
+ * the eligibility signal there (rolling-deploy skew, PR #4757 review). A plain repo's cards
+ * carry no key, so the rule below applies to them unchanged.
  *
  * `botForgeUserID > 0` guards an unresolved bot id (mirrors the server's `@bot_id>0` /
  * M2's `botID<=0` guard): a 0/absent id must never mark every assigned card runnable.
@@ -58,13 +63,13 @@ export const SELF_IMPROVE_LABEL = "uzi-self-improve";
  * predicate falls back to label-only rather than throwing on `undefined.includes`.
  */
 export function isUziCard(
-  // issue_key stays in the Pick so test literals carrying a key type-check; it decides nothing here.
   card: Pick<Card, "labels" | "assignee_ids" | "issue_key">,
   uziLabel: string,
   botForgeUserID: number | undefined,
   eligibilityLabel?: string,
 ): boolean {
   if (eligibilityLabel) return card.labels.includes(eligibilityLabel);
+  if (card.issue_key) return true;
   const botId = botForgeUserID ?? 0;
   return card.labels.includes(uziLabel) || (botId > 0 && (card.assignee_ids ?? []).includes(botId));
 }

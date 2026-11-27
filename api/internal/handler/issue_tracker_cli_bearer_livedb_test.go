@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"net/http"
 	"testing"
 	"time"
@@ -36,6 +37,18 @@ func TestIssueTrackerCLIBearerReachesOnlyTheTwoReadsLiveDB(t *testing.T) {
 		if rec := bearerReq(router, http.MethodGet, path, ""); rec.Code != http.StatusUnauthorized {
 			t.Errorf("no-credential GET %s = %d, want 401", path, rec.Code)
 		}
+	}
+
+	// Another user's CLI token reaches the route but not this repo's mapping: 404, as with a
+	// cookie (PR #4757 review). The route is open to CLI tokens; the repo ownership check is not.
+	stranger := uuid.New()
+	if _, err := f.pool.Exec(context.Background(), `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+		stranger, "cli-stranger-"+stranger.String()[:8]+"@e2e"); err != nil {
+		t.Fatal(err)
+	}
+	strangerTok := cliMintToken(t, f.pool, stranger, clitoken.ScopeUser)
+	if rec := bearerReq(router, http.MethodGet, "/api/repos/"+repo+"/issue-tracker-link/states", strangerTok); rec.Code != http.StatusNotFound {
+		t.Errorf("another user's Bearer GET states = %d, want 404\nbody: %s", rec.Code, rec.Body.String())
 	}
 
 	for _, tc := range []struct{ method, path string }{
