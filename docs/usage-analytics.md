@@ -46,7 +46,7 @@ bill. Capacity reports no dollars.
 
 | Parameter | Values | Default | Notes |
 |---|---|---|---|
-| `window` | `7d`, `30d`, `90d`, `all` | `30d` | Calendar dates, see [Calendar](#calendar). The admin all-users scope (`user` omitted or `user=all`) has no `all`: Options lists only `7d`, `30d`, `90d` there, and Spend, Reliability, Capacity and Flow reject `window=all` with a 400. Owner and admin `user=<uuid>` keep `all`. Options accepts and ignores `window`. |
+| `window` | `7d`, `30d`, `90d`, `all` | `30d` | Calendar dates, see [Calendar](#calendar). The admin all-users scope (`user` omitted or `user=all`) has no `all`: Options lists only `7d`, `30d`, `90d` there, and Spend, Reliability, Capacity, Quality and Flow reject `window=all` with a 400. Owner and admin `user=<uuid>` keep `all`. Options accepts and ignores `window`. |
 | `tz` | an IANA name | `UTC` | Must be known to both the database and the server. Empty, `Local` and names over 64 characters are invalid. |
 | `repo` | a repo UUID | none | Hyphenated 36-character form only. |
 | `harness` | `claude`, `codex` | none | |
@@ -58,14 +58,14 @@ bill. Capacity reports no dollars.
 - Every invalid value is a 400 naming its parameter (`invalid window`,
   `invalid tz`, ...). The message never echoes the value, SQL or other
   sensitive text.
-- Spend, Reliability, Capacity and Flow on the admin all-users scope with `window=all` are a 400,
+- Spend, Reliability, Capacity, Quality and Flow on the admin all-users scope with `window=all` are a 400,
   `window all not available for all users`. It is answered before any
   analytics database work (authentication runs first) and is not a 503.
 - Repeated and empty parameters are invalid (`invalid <name>`). An unknown
   parameter is a 400 `unknown parameter`. A query string that does not parse
   (a bad percent-encoding or a `;`) is a 400 `invalid query`; it is never
   silently replaced by defaults.
-- `split` or `breakdown` on `/options`, `/capacity` or `/flow`, `split` on
+- `split` or `breakdown` on `/options`, `/capacity`, `/quality` or `/flow`, `split` on
   `/reliability` (it has a breakdown but no split), and `split=user` or
   `breakdown=user` anywhere but an admin all-users response, is `invalid split`
   or `invalid breakdown`. Flow takes only `window`, `tz`, `repo`, `harness`,
