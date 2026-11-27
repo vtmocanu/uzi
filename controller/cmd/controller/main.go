@@ -148,6 +148,7 @@ func main() {
 		MemoryGuardMaxInterventions: cfg.WorkerMemoryGuardMaxInterventions,
 		GoBuildParallelism:          cfg.WorkerGoBuildParallelism,
 		GoMaxProcs:                  cfg.WorkerGoMaxProcs,
+		GoMemLimit:                  cfg.WorkerGoMemLimit,
 		RunCacheCapMaxBytes:         cfg.WorkerRunCacheCapMaxBytes,
 		RunCacheCapFraction:         cfg.WorkerRunCacheCapFraction,
 		CrossCheckSlots:             cfg.WorkerCrossCheckSlots,

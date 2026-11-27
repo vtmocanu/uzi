@@ -257,6 +257,35 @@ describe("Go concurrency defaults (issue #3382)", () => {
     assert.equal(only.GOMAXPROCS, "4");
     assert.equal(Object.hasOwn(only, "GOFLAGS"), false);
   });
+  it("GOMEMLIMIT: buildSdkEnv carries the configured memLimit, absent when unset, toolEnv value loses", () => {
+    assert.equal(Object.hasOwn(buildSdkEnv({ kind: "oauth", token: FAKE_OAUTH }, HOME_DIR), "GOMEMLIMIT"), false);
+    configureGoConcurrency({ memLimit: "6GiB" });
+    assert.equal(buildSdkEnv({ kind: "oauth", token: FAKE_OAUTH }, HOME_DIR).GOMEMLIMIT, "6GiB");
+    const hostileMem = buildSdkEnv({ kind: "oauth", token: FAKE_OAUTH }, HOME_DIR, { PATH: "/nix/bin", GOMEMLIMIT: "1MiB" });
+    assert.equal(hostileMem.GOMEMLIMIT, "6GiB");
+  });
+
+  it("GOMEMLIMIT: an injected run variable wins over the configured memLimit", () => {
+    const prior = process.env.UZI_UID_SPLIT;
+    process.env.UZI_UID_SPLIT = "1";
+    try {
+      configureGoConcurrency({ memLimit: "6GiB" });
+      const cred = { kind: "oauth", token: FAKE_OAUTH } as const;
+      const vars = [{ var_id: "0b8d7a52-91c4-4e0f-8a36-5d2f9c1e7b44", scope: "repo", rev: 1, name: "GOMEMLIMIT", value: "2GiB", secret: false, description: "" }] as const;
+      const injection = { vars: [...vars], set: sdkRunEnvInjected(vars, cred, HOME_DIR, {}) };
+      const env = buildSdkEnv(cred, HOME_DIR, {}, undefined, undefined, undefined, undefined, injection);
+      assert.equal(env.GOMEMLIMIT, "2GiB");
+    } finally {
+      if (prior === undefined) delete process.env.UZI_UID_SPLIT; else process.env.UZI_UID_SPLIT = prior;
+    }
+  });
+
+  it("GOMEMLIMIT: buildCheckEnv carries it, and ignores a host value when unset", () => {
+    assert.equal(Object.hasOwn(buildCheckEnv({ GOMEMLIMIT: "1MiB" }, HOME_DIR), "GOMEMLIMIT"), false);
+    configureGoConcurrency({ memLimit: "512MiB" });
+    assert.equal(buildCheckEnv({ GOMEMLIMIT: "1MiB" }, HOME_DIR).GOMEMLIMIT, "512MiB");
+  });
+
   it("issue #3870: GOTMPDIR is set last when given and absent otherwise; nothing else changes", () => {
     configureGoConcurrency({ buildParallelism: 2, maxProcs: 3 });
     try {

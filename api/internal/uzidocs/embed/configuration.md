@@ -861,17 +861,20 @@ Duration values accept the same Go-style strings used server-side (`15s`, `3s`, 
 
 ### Worker Go concurrency defaults
 
-Two optional settings (issue #3382) cap the Go build and runtime parallelism of
-commands the worker launches. Both are **unset by default**: nothing is rendered
-and no `GOFLAGS` or `GOMAXPROCS` is injected.
+Three optional settings (issue #3382) cap the Go build and runtime parallelism, and
+set a soft memory target, for commands the worker launches. All are **unset by
+default**: nothing is rendered and no `GOFLAGS`, `GOMAXPROCS` or `GOMEMLIMIT` is
+injected.
 
 | Worker environment variable | Helm `workers` key | Default | Meaning |
 |---|---|---|---|
 | `WORKER_GO_BUILD_PARALLELISM` | `goBuildParallelism` | empty | Sets `GOFLAGS=-p=N`: how many packages `go build` and `go test` build or run in parallel. |
 | `WORKER_GO_MAXPROCS` | `goMaxProcs` | empty | Sets `GOMAXPROCS=N`: the Go runtime's CPU parallelism. The `go` command's `-p` defaults to `GOMAXPROCS`, so this also bounds package parallelism when no `-p` is set. |
+| `WORKER_GO_MEMLIMIT` | `goMemLimit` | empty | Sets `GOMEMLIMIT`: a per-process soft memory target for the Go runtime's garbage collector. |
 
-String values (quoted YAML, `--set-string`, and the controller and worker
-environment) must be positive decimal digits up to `2147483647`; surrounding
+For `goBuildParallelism` and `goMaxProcs`, string values (quoted YAML,
+`--set-string`, and the controller and worker environment) must be positive
+decimal digits up to `2147483647`; surrounding
 whitespace is trimmed, empty means unset, and leading zeros are accepted
 (`007` is `7`). Zero, signs, fractions, non-digits and larger values are
 rejected: the chart render fails, the controller refuses to start, or the worker
@@ -882,12 +885,31 @@ canonical decimal (`+1` arrives as `1`; in a values file `0x10` and `1e3` also
 arrive as `16` and `1000`, while `--set` decodes only decimal integers). Quote the
 value in YAML or use `--set-string` to have the spelling checked. There is no general `GOFLAGS` passthrough.
 
+`WORKER_GO_MEMLIMIT` / `goMemLimit` has its own rule: a positive integer from `1`
+to `2147483647` followed by a required unit, `MiB` or `GiB` (for example `6GiB`).
+Only ASCII space, tab, CR and LF are trimmed from both ends; empty means unset;
+leading zeros are stripped (`007GiB` is `7GiB`). Lowercase or other units, signs,
+fractions and a missing unit are rejected. In Helm the value must be a string:
+a typed number has no unit and fails the render. An invalid value makes the chart
+render, the controller or the worker refuse to start.
+
+Precedence: `GOFLAGS` and `GOMAXPROCS` set here always win. `GOMEMLIMIT` instead
+yields to a run variable named `GOMEMLIMIT`, which reaches only lead-lane agent
+Bash (Claude) and Codex commands, including Codex delegated (subagent) commands
+and the worker's Codex Go helpers. Worker checks, JavaScript installs, the
+PR-description helper and non-lead lanes always get the operator value. A
+`GOMEMLIMIT` from a provisioned tool profile does not win: the operator value
+replaces it. The
+validation guarantee is only that a malformed operator value never reaches Go; a
+malformed run variable named `GOMEMLIMIT` still makes Go programs fail to start
+(existing behaviour).
+
 The values apply to the scrubbed environment of Claude commands (native and
 guarded), Codex commands, worker-run checks and JavaScript dependency installs.
-Compose relays both variables from `.env`; hosted workers use the chart keys,
-and the controller receives them as `UZI_WORKER_GO_BUILD_PARALLELISM` and
-`UZI_WORKER_GO_MAXPROCS` and relays them into worker pods. Setting or changing
-either hosted value rolls every hosted worker pod once it holds no non-terminal
+Compose relays all three variables from `.env`; hosted workers use the chart keys,
+and the controller receives them as `UZI_WORKER_GO_BUILD_PARALLELISM`,
+`UZI_WORKER_GO_MAXPROCS` and `UZI_WORKER_GO_MEMLIMIT` and relays them into worker pods. Setting or changing
+any hosted value rolls every hosted worker pod once it holds no non-terminal
 run; compose and self-run workers
 pick it up on restart. Both the controller and the worker image must come from a
 release containing this change; older ones ignore the settings.
@@ -899,11 +921,17 @@ Limits:
 - An explicit `-p` flag, or a command or Taskfile that sets its own `GOFLAGS`,
   replaces `-p=N`. `GOMAXPROCS` still applies, so `goMaxProcs` is the more
   robust knob.
-- It does not cap per-test internal concurrency, child processes or memory, and
-  command code can replace its own environment.
+- It does not cap per-test internal concurrency or child processes, and command
+  code can replace its own environment.
+- `GOMEMLIMIT` is per process, not a total, and covers only Go processes (not
+  Postgres or other non-Go programs). It is a soft GC target, not enforcement: set
+  below a command's live heap it makes the GC thrash, so size it for the heaviest
+  command. Inline overrides such as a Taskfile recipe's own `GOMEMLIMIT=12GiB`
+  (`deadcode:api`) win. Enforcement is the worker memory guard (opt-in
+  `WORKER_MEMORY_GUARD_ENABLED`) or the container limit.
 - On Codex, the worker's own Go helper processes (supervisor, sandbox and
   file-operation helper) launched with the command environment also inherit
-  `GOMAXPROCS`.
+  `GOMAXPROCS` and `GOMEMLIMIT`.
 
 See [Worker setup](./worker-setup.md#3-run-the-worker) for supplying the values
 to a self-run worker.

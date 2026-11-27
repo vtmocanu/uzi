@@ -226,6 +226,10 @@ type Config struct {
 	// not rendered).
 	WorkerGoBuildParallelism int
 	WorkerGoMaxProcs         int
+	// WorkerGoMemLimit is the optional UZI_WORKER_GO_MEMLIMIT, canonical
+	// "<n>MiB" or "<n>GiB", relayed as WORKER_GO_MEMLIMIT. Empty means unset
+	// (the env is not rendered).
+	WorkerGoMemLimit string
 
 	// WorkerRunCacheCapMaxBytes / WorkerRunCacheCapFraction are the optional per-run cache
 	// cap settings (UZI_WORKER_RUN_CACHE_CAP_MAX_BYTES / UZI_WORKER_RUN_CACHE_CAP_FRACTION),
