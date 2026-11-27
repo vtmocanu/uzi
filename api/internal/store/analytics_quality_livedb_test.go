@@ -145,9 +145,19 @@ func TestQualityReworkWitnessScopeLiveDB(t *testing.T) {
 		"repo-filtered":  {Owner: u.User, Now: qualAllNow, Repo: repo},
 		"issue-delivery": {Owner: u.User, Now: qualAllNow, DeliveryKinds: []string{runkind.Issue, runkind.CIFix}},
 	} {
-		r := f.quality(c).Doc.Rework
+		res := f.quality(c)
+		r := res.Doc.Rework
 		if r.ApplicablePRs != 1 || r.UnwitnessedPRs != 1 {
 			t.Errorf("%s: owner applicable %d unwitnessed %d, want 1 and 1", name, r.ApplicablePRs, r.UnwitnessedPRs)
+		}
+		// Totals alone cannot tell which PR was applicable: PR 31 (day 5) is the witnessed
+		// one, PR 32 (day 6) the unwitnessed one.
+		if len(r.Buckets) != len(res.Bounds.BucketStarts) || len(r.Buckets) < 6 {
+			t.Errorf("%s: %d rework buckets, want %d", name, len(r.Buckets), len(res.Bounds.BucketStarts))
+			continue
+		}
+		if r.Buckets[4].PRs != 1 || r.Buckets[5].PRs != 0 {
+			t.Errorf("%s: bucket PRs day5=%d day6=%d, want 1 and 0", name, r.Buckets[4].PRs, r.Buckets[5].PRs)
 		}
 	}
 	// The all-scope statement accepts any user's witness.
@@ -637,6 +647,9 @@ func TestQualityCalendarLiveDB(t *testing.T) {
 	}
 	call := qualityCall{Owner: o.User, Now: now, Zone: zone}
 	res := f.quality(call)
+	if len(res.Doc.CIFix.Buckets) != len(b.BucketStarts) {
+		t.Fatalf("ci_fix buckets = %d, want %d", len(res.Doc.CIFix.Buckets), len(b.BucketStarts))
+	}
 	for i, bk := range res.Doc.CIFix.Buckets {
 		if bk.Runs != 2 {
 			t.Errorf("DST bucket %d (%s..%s) holds %d runs, want 2", i, b.BucketStarts[i], b.BucketEnds[i], bk.Runs)

@@ -228,10 +228,16 @@ func TestAnalyticsQualityStatementScope(t *testing.T) {
 	if len(p.BucketStarts) != len(b.BucketStarts) || len(p.BucketEnds) != len(b.BucketEnds) || len(p.AlwaysSkipOrigins) == 0 {
 		t.Fatalf("statement parameters incomplete: %+v", p)
 	}
-	for _, k := range p.JudgeKinds {
-		if !runkind.JudgeEligible(k) {
-			t.Fatalf("judge kinds carry %q", k)
+	for i := range b.BucketStarts {
+		if !p.BucketStarts[i].Valid || !p.BucketStarts[i].Time.Equal(b.BucketStarts[i]) {
+			t.Errorf("BucketStarts[%d] = %v, want %v", i, p.BucketStarts[i], b.BucketStarts[i])
 		}
+		if !p.BucketEnds[i].Valid || !p.BucketEnds[i].Time.Equal(b.BucketEnds[i]) {
+			t.Errorf("BucketEnds[%d] = %v, want %v", i, p.BucketEnds[i], b.BucketEnds[i])
+		}
+	}
+	if want := []string{runkind.Issue, runkind.CIFix}; !slices.Equal(p.JudgeKinds, want) {
+		t.Fatalf("judge kinds = %v, want %v", p.JudgeKinds, want)
 	}
 	if !slices.Equal(p.DeliveryKinds, runkind.Delivery()) {
 		t.Fatalf("delivery kinds = %v", p.DeliveryKinds)
