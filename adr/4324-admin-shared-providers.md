@@ -52,7 +52,7 @@ CHECKs keep the pair honest and the scopes closed:
 | CHECK | Rule |
 |---|---|
 | `model_providers_shared_mode_check` | `(owner_user_id IS NULL) = (credential_mode IS NOT NULL)` |
-| `model_providers_credential_mode_check` | `credential_mode IN ('per_user_key')` (widened to add `'operator_key'` by #4540 M1, migration 00549 model_providers_operator_mode) |
+| `model_providers_credential_mode_check` | `credential_mode IN ('per_user_key', 'operator_key')` (migration 00549 model_providers_operator_mode widened it from `('per_user_key')` for #4540 M1) |
 | `model_providers_shared_engine_check` | `owner_user_id IS NOT NULL OR engine IN ('claude', 'codex')` (Claude only until #4633 widened it, migration 00536 model_providers_shared_codex_engine) |
 | `model_providers_scope_owner_check` | `scope_owner_id = COALESCE(owner_user_id, nil)`, never NULL |
 | `model_providers_owner_not_nil_check` | no personal owner is the nil UUID |
@@ -257,7 +257,7 @@ Organization-funded (`operator_key`) shared **Claude** definitions, staged only 
 
 ### D3, narrowed
 
-The fence that keeps an operator definition away from recipient paths has two parts: the SQL predicate in the per-user queries (they name `credential_mode = 'per_user_key'`) and the handler check on the key routes. The recipient queries stay `per_user_key`-only, and a test pins their exact text, so a change that widens one fails the build. The `model_providers_credential_mode_check` row of the D3 table now reads `credential_mode IN ('per_user_key', 'operator_key')`, and `model_providers_shared_engine_check` is unchanged.
+Operator definitions are kept out of every recipient path by the recipient SQL predicates (`credential_mode = 'per_user_key'`), pinned by exact-text classifier tests, so a change that widens one fails the build. Separately, the organization-key admin routes refuse per-user-key definitions (409 `provider_not_operator_key`). The `model_providers_credential_mode_check` row of the D3 table now reads `credential_mode IN ('per_user_key', 'operator_key')`, and `model_providers_shared_engine_check` is unchanged.
 
 ### D7, operator rows
 

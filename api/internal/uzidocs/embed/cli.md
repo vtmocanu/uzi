@@ -1364,7 +1364,7 @@ A few worth knowing:
   `not tested` when no Test result is current, otherwise `<auth>/<tools> at <time>`) plus the
   model map; key material is never shown. An unknown
   id or name exits 4 (a personal provider is never shown). `--json` carries the
-  same fields. Read-only and need an `admin_ro` (`uza_`) token; there is no write
+  same fields, as `credential_mode` and `operator_key` (`{present, enabled, set_at, probe}`). Read-only and need an `admin_ro` (`uza_`) token; there is no write
   verb, because creating, editing, retiring and deleting a shared definition, and
   setting, enabling, disabling, deleting or testing its organization key, are
   cookie-only admin writes in the web app (Admin → Shared providers).

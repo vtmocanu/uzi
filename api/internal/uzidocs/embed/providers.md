@@ -439,7 +439,7 @@ definitions work.
 
 - **Create.** In **Admin → Shared providers**, choose the organization-key option when creating a
   Claude definition (the option is not offered for Codex; the API refuses it with a 400). The
-  create form shows a recipient-trust warning and Save stays disabled until you acknowledge it
+  create form shows a recipient-trust warning and the **Create shared provider** button stays disabled until you acknowledge it
   (`acknowledge_recipient_trust: true` in the API; a request without it is refused with a 400).
   The warning says that:
   - recipients who are later granted the key can copy it, so rotating it at the gateway is the only
@@ -459,7 +459,7 @@ definitions work.
 
   | Control | Route | Effect |
   |---|---|---|
-  | Set or replace | `PUT /api/admin/providers/{id}/key` | Stores the key (16 to 4096 printable ASCII characters). A replace makes a new key version, keeps enabled or disabled as it was, and makes the previous Test result read as not tested. Allowed on a retired definition, so a key can be staged before the definition is used. |
+  | Set or replace | `PUT /api/admin/providers/{id}/key` | Stores the key (16 to 4096 printable ASCII characters, excluding space: 0x21 to 0x7E). A replace makes a new key version, keeps enabled or disabled as it was, and makes the previous Test result read as not tested. Allowed on a retired definition, so a key can be staged before the definition is used. |
   | Enable or disable | `PATCH /api/admin/providers/{id}/key/enabled` | Sets `{"enabled": true\|false}`. Changing it makes a new key version, so the previous Test result is hidden. Test is refused while the key is disabled. |
   | Delete | `DELETE /api/admin/providers/{id}/key` | Removes the key and its Test result. |
 
@@ -473,10 +473,13 @@ definitions work.
   the model map, replacing, disabling, enabling or deleting the key, or retiring the definition
   hides it: the page shows the current state, not history. A rename does not hide it. A change made
   after that last check can still let the probe already in flight use the key and endpoint it
-  captured. One Test per definition runs at a time; a second concurrent request is refused with 429.
+  captured. A Test is refused with 429 when another Test of the same definition is running, when 4
+  Tests are already in flight instance-wide, or after 30 Tests per hour for that definition. The web
+  page shows the key controls on retired definitions too (set or replace, enable or disable and delete
+  are allowed there; only Test is refused when the definition is retired).
 - **Audit.** Each key change writes a `provider_audit` line (`admin_key_set`, `admin_key_replace`,
-  `admin_key_enable`, `admin_key_disable`, `admin_key_delete`), and each Test that reaches the
-  decrypt step writes one `admin_test` line with the provider id, key id and version, and an outcome
+  `admin_key_enable`, `admin_key_disable`, `admin_key_delete`), and each Test admitted past the rate
+  limiter (including one that ends `key_unavailable` or `key_read_error` before decrypting) writes one `admin_test` line with the provider id, key id and version, and an outcome
   (for example `probed_recorded`, `refused_not_allowed` or `changed_before_dial`). No line contains
   the key, a header or a response body. A process crash mid-Test writes no line.
 - **Cap and delete.** Organization-funded definitions count toward the same 50-definition cap as
