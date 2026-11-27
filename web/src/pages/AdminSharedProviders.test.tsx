@@ -560,24 +560,71 @@ describe("AdminSharedProviders — organization key card", () => {
   });
 
   it("runs Test and shows its result, naming that it uses the key", async () => {
-    mockApi.adminTestOperatorKey.mockResolvedValue({ probe: { auth_result: "rejected", tool_result: "not_run", probed_at: "2026-11-21T00:00:00Z" } });
+    const probe = { auth_result: "rejected" as const, tool_result: "not_run" as const, probed_at: "2026-11-21T00:00:00Z" };
+    mockApi.adminTestOperatorKey.mockResolvedValue({ probe });
     await renderPage([operator()]);
+    // The result shown is the server's, read back after the Test.
+    mockApi.adminListSharedProviders.mockResolvedValue({ providers: [operator({ operator_key: { present: true, enabled: true, probe } })] });
     expect(screen.getByTestId("test-effect-o1").textContent).toMatch(/up to two small requests.*authentication check.*single-tool check/i);
     fireEvent.click(screen.getByRole("button", { name: "Test organization key for org-gateway" }));
     await waitFor(() => expect(mockApi.adminTestOperatorKey).toHaveBeenCalledWith("o1"));
-    expect((await screen.findByTestId("probe-results-o1")).textContent).toMatch(/Authentication rejected/);
+    await waitFor(() => expect(screen.getByTestId("probe-results-o1").textContent).toMatch(/Authentication rejected/));
   });
 
-  it("drops a shown Test result when a later key write reloads the card without one", async () => {
-    mockApi.adminTestOperatorKey.mockResolvedValue({ probe: { auth_result: "ok", tool_result: "passed", probed_at: "2026-11-21T00:00:00Z" } });
-    mockApi.adminPutOperatorKey.mockResolvedValue({ provider: operator() });
+  const OK_PROBE = { auth_result: "ok" as const, tool_result: "passed" as const, probed_at: "2026-11-21T00:00:00Z" };
+  const withProbe = (over: Partial<AdminSharedProvider> = {}) =>
+    operator({ operator_key: { present: true, enabled: true, probe: OK_PROBE }, ...over });
+
+  // Renders a card, runs a Test, and leaves the server's reloaded read showing the result.
+  async function testedCard() {
+    mockApi.adminTestOperatorKey.mockResolvedValue({ probe: OK_PROBE });
     await renderPage([operator()]);
+    mockApi.adminListSharedProviders.mockResolvedValue({ providers: [withProbe()] });
     fireEvent.click(screen.getByRole("button", { name: "Test organization key for org-gateway" }));
     await waitFor(() => expect(screen.getByTestId("probe-results-o1").textContent).toMatch(/Authentication worked/));
+  }
+
+  it("drops a shown Test result when a later key write reloads the card without one", async () => {
+    mockApi.adminPutOperatorKey.mockResolvedValue({ provider: operator() });
+    await testedCard();
+    mockApi.adminListSharedProviders.mockResolvedValue({ providers: [operator()] });
     fireEvent.change(screen.getByLabelText("Organization key"), { target: { value: "next-key" } });
     fireEvent.click(screen.getByRole("button", { name: "Replace organization key for org-gateway" }));
-    await waitFor(() => expect(mockApi.adminListSharedProviders).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(screen.getByTestId("probe-results-o1").textContent).toMatch(/Not tested yet/));
+  });
+
+  it("shows no stale Test result after Retire, once the server read hides it", async () => {
+    mockApi.adminRetireSharedProvider.mockResolvedValue({ provider: operator({ retired: true }) });
+    await testedCard();
+    mockApi.adminListSharedProviders.mockResolvedValue({ providers: [operator({ retired: true })] });
+    fireEvent.click(screen.getByRole("button", { name: "Retire org-gateway" }));
+    fireEvent.click(screen.getByRole("button", { name: "Retire definition" }));
+    await waitFor(() => expect(screen.getByTestId("test-effect-o1").textContent).toMatch(/A retired definition cannot be tested/));
+    expect(screen.getByTestId("probe-results-o1").textContent).toMatch(/Not tested yet/);
+    expect(screen.getByTestId("probe-results-o1").textContent).not.toMatch(/Authentication worked/);
+  });
+
+  it("shows no stale Test result after a model-map edit makes a new revision", async () => {
+    mockApi.adminPatchSharedProvider.mockResolvedValue({ provider: operator({ current_revision: 2 }) });
+    await testedCard();
+    mockApi.adminListSharedProviders.mockResolvedValue({ providers: [operator({ current_revision: 2 })] });
+    fireEvent.click(screen.getByRole("button", { name: "Edit org-gateway" }));
+    const form = within(screen.getByRole("form", { name: "Edit org-gateway" }));
+    fireEvent.change(form.getByLabelText("Sonnet model"), { target: { value: "gw-large" } });
+    fireEvent.click(form.getByRole("button", { name: "Save changes" }));
+    await waitFor(() => expect(mockApi.adminPatchSharedProvider).toHaveBeenCalled());
+    await waitFor(() => expect(screen.getByTestId("probe-results-o1").textContent).toMatch(/Not tested yet/));
+    expect(screen.getByTestId("probe-results-o1").textContent).not.toMatch(/Authentication worked/);
+  });
+
+  it("does not mention an organization key in the delete copy when none is set", async () => {
+    mockApi.adminDeleteSharedProvider.mockResolvedValue({ deleted: true, deleted_key_count: 0 });
+    await renderPage([operator({ operator_key: { present: false, enabled: false } })]);
+    fireEvent.click(screen.getByRole("button", { name: "Delete org-gateway" }));
+    const box = within(screen.getByRole("group", { name: "Confirm deleting org-gateway" }));
+    expect(box.getByTestId("delete-keys-o1").textContent).not.toMatch(/organization key/i);
+    fireEvent.click(box.getByRole("button", { name: "Delete definition" }));
+    expect(await screen.findByText("org-gateway deleted.")).toBeTruthy();
   });
 
   it("marks organization keys as staged on the card and in the create form", async () => {

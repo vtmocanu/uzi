@@ -257,7 +257,7 @@ Organization-funded (`operator_key`) shared **Claude** definitions, staged only 
 
 ### D3, narrowed
 
-Operator definitions are kept out of every recipient path by the recipient SQL predicates (`credential_mode = 'per_user_key'`), pinned by exact-text classifier tests, so a change that widens one fails the build. Separately, the organization-key admin routes refuse per-user-key definitions (409 `provider_not_operator_key`). The `model_providers_credential_mode_check` row of the D3 table now reads `credential_mode IN ('per_user_key', 'operator_key')`, and `model_providers_shared_engine_check` is unchanged.
+Operator definitions are kept out of every recipient path by the recipient SQL predicates (`credential_mode = 'per_user_key'`), pinned by exact-text classifier tests, so a change that widens one fails the build. Separately, the organization-key routes (set/replace, enable/disable, delete) refuse a per-user-key definition with 409 `provider_not_operator_key`; the admin Test reads operator definitions only, so a per-user-key definition there is a 404. The `model_providers_credential_mode_check` row of the D3 table now reads `credential_mode IN ('per_user_key', 'operator_key')`, and `model_providers_shared_engine_check` is unchanged.
 
 ### D7, operator rows
 

@@ -135,7 +135,8 @@ function operatorView(o: MockOperatorProvider): AdminSharedProvider {
       present: key.present,
       enabled: key.present && key.enabled,
       ...(key.set_at ? { set_at: key.set_at } : {}),
-      ...(key.probe ? { probe: key.probe } : {}),
+      // The server's admin read hides the stored Test result of a retired definition.
+      ...(key.probe && !def.retired ? { probe: key.probe } : {}),
     },
   };
 }

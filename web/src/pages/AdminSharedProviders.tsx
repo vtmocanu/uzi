@@ -291,6 +291,7 @@ function ProviderCard({
   const keys = p.attached_key_count;
   const operatorMode = p.credential_mode === "operator_key";
   // What a delete takes with it, in the words that fit the definition's credential mode.
+  const hasOrgKey = operatorMode && p.operator_key?.present === true;
   const deletes = operatorMode
     ? "its organization key and that key's Test result"
     : `${plural(keys, "personal key", "personal keys")} users attached to it, and their Test results`;
@@ -375,11 +376,10 @@ function ProviderCard({
             <>
               <Button variant="dangerSolid" size="sm" disabled={working || selected > 0} onClick={() => void act(async () => {
                 const r = await api.adminDeleteSharedProvider(p.id);
-                return operatorMode
-                  ? `${name} deleted, with its organization key.`
-                  : `${name} deleted, with ${plural(r.deleted_key_count, "attached key", "attached keys")}.`;
+                if (operatorMode) return hasOrgKey ? `${name} deleted, with its organization key.` : `${name} deleted.`;
+                return `${name} deleted, with ${plural(r.deleted_key_count, "attached key", "attached keys")}.`;
               }, "Failed to delete the shared provider")}>
-                {working ? "Deleting…" : operatorMode ? "Delete definition and key" : "Delete definition and keys"}
+                {working ? "Deleting…" : operatorMode ? (hasOrgKey ? "Delete definition and key" : "Delete definition") : "Delete definition and keys"}
               </Button>
               <Button variant="ghost" size="sm" disabled={working} onClick={onCancel} data-confirm-cancel>Cancel</Button>
             </>
@@ -393,13 +393,17 @@ function ProviderCard({
                 {`${name} can't be deleted yet: ${plural(selected, "user has", "users have")} it selected as their ${ENGINE_LABELS[p.engine]} source. ${p.retired ? "Ask them" : "Retire it, then ask them"} to choose another source.`}
               </p>
               <p data-testid={`delete-keys-${p.id}`} className="text-muted">
-                Once nobody has it selected, deleting it would also delete {deletes}.
+                {operatorMode && !hasOrgKey
+                  ? "Once nobody has it selected, it can be deleted. No organization key is set."
+                  : `Once nobody has it selected, deleting it would also delete ${deletes}.`}
               </p>
             </>
           ) : (
             <>
               <p data-testid={`delete-keys-${p.id}`}>
-                Delete {name}? This also deletes {deletes}. This cannot be undone.
+                {operatorMode && !hasOrgKey
+                  ? `Delete ${name}? This cannot be undone.`
+                  : `Delete ${name}? This also deletes ${deletes}. This cannot be undone.`}
               </p>
               <p data-testid={`delete-selected-${p.id}`} className="text-muted">
                 No user has it selected as their {ENGINE_LABELS[p.engine]} source.
@@ -432,22 +436,16 @@ function OperatorKeyPanel({
   const [testing, setTesting] = useState(false);
   const [error, setError] = useState("");
   const [confirmingDelete, setConfirmingDelete] = useState(false);
-  // The result of a Test run on this card; until then the stored one from the list read. Every
-  // key write clears it, because the server drops the stored result on a write too.
-  const [probe, setProbe] = useState<ProviderProbe | null>(null);
   const confirmRef = useRef<HTMLDivElement>(null);
   const inputId = useId();
-  const shownProbe = probe ?? key.probe ?? null;
+  // Only the server's result is ever shown: a Test reloads the list, and the server hides the
+  // stored result after a key write, a model-map edit or a retire.
+  const shownProbe = key.probe ?? null;
   const testable = key.present && key.enabled && !p.retired;
 
   useEffect(() => {
     if (confirmingDelete) confirmRef.current?.querySelector<HTMLButtonElement>("button[data-confirm-cancel]")?.focus();
   }, [confirmingDelete]);
-
-  const written = async (message: string) => {
-    setProbe(null);
-    await onDone(message);
-  };
 
   const run = async (fn: () => Promise<void>, fallback: string) => {
     setError("");
@@ -469,7 +467,7 @@ function OperatorKeyPanel({
     setDraft("");
     return run(async () => {
       await api.adminPutOperatorKey(p.id, value);
-      await written(`Organization key for ${name} saved.`);
+      await onDone(`Organization key for ${name} saved.`);
     }, "Failed to save the organization key");
   };
 
@@ -540,7 +538,7 @@ function OperatorKeyPanel({
                 disabled={working}
                 onClick={() => void run(async () => {
                   await api.adminSetOperatorKeyEnabled(p.id, !key.enabled);
-                  await written(`Organization key for ${name} ${key.enabled ? "disabled" : "enabled"}.`);
+                  await onDone(`Organization key for ${name} ${key.enabled ? "disabled" : "enabled"}.`);
                 }, "Failed to change the organization key")}
                 aria-label={`${key.enabled ? "Disable" : "Enable"} organization key for ${name}`}
               >
@@ -562,7 +560,9 @@ function OperatorKeyPanel({
                 setTesting(true);
                 try {
                   await run(async () => {
-                    setProbe((await api.adminTestOperatorKey(p.id)).probe);
+                    await api.adminTestOperatorKey(p.id);
+                    // Show the server's stored result, not a copy kept on this card.
+                    await onStale();
                   }, "Failed to test the organization key");
                 } finally {
                   setTesting(false);
@@ -609,7 +609,7 @@ function OperatorKeyPanel({
               <Button variant="dangerSolid" size="sm" disabled={working} onClick={() => void run(async () => {
                 await api.adminDeleteOperatorKey(p.id);
                 setConfirmingDelete(false);
-                await written(`Organization key for ${name} deleted.`);
+                await onDone(`Organization key for ${name} deleted.`);
               }, "Failed to delete the organization key")}>
                 {working ? "Deleting…" : "Delete key"}
               </Button>
