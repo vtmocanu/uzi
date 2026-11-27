@@ -537,8 +537,9 @@ vendor fallback. A provider run's claim carries one `provider` object and no
 `anthropic_oauth_token`; the worker maps it onto the SDK env in `buildSdkEnv`. Issue runs wait out
 a gateway 429 or overload as `limit_wait` (`provider_gateway_limit`) on a 1, 5, 15 minute
 schedule and then for the owner; chat ends the turn instead. Usage is recorded with
-`cost_status='unreported'`. The cross-check and isolated lanes refuse provider-sourced
-owners (`provider_lane_unsupported`), as does a site-list job. An ordinary job (no `egress_profile`) no
+`cost_status='unreported'`. The isolated lane refuses provider-sourced
+owners (`provider_lane_unsupported`), as does a site-list job; the cross-check lane refuses them except for the
+Codex checker rows described below. An ordinary job (no `egress_profile`) no
 longer does (PRD #4322 M1b): `CreateJobRun` freezes the owner's Claude source under the secret-mutation lock
 and validates one canonical job model, its claim carries only the provider binding (no Anthropic token or
 run credential epoch) and needs `claude_provider_job_v1` plus `claude_provider_v1` on a non-Docker worker,
@@ -597,11 +598,27 @@ with the Codex harness capabilities; the api admits the claim only to a worker w
 The issue/task/prompt/self_improve lane, its in-run advice, summary and task-review passes, and
 retries, resume and cold resume use the frozen binding (provider, revision, key `enablement_rev`);
 `mr_rework` and follow-ups inherit it, CI-fix and handoff resolve the owner's current Codex source.
-Interim refusals (`provider_lane_unsupported`, follow-up #4574 M2): the Codex judge half is resolved
-(#4574 M1: a Codex-source owner's judge runs on the provider; earlier skip rows are historical), and
-plan and code cross-check refuse when either side is Codex-provider
-bound (a Claude lead with plan cross-check owned by someone with a Codex source gets a human plan
-gate), and jobs and chat stay Claude-only. The pinned runtime follows redirects and does not bound
+Interim refusals (`provider_lane_unsupported`): the Codex judge half is resolved
+(#4574 M1: a Codex-source owner's judge runs on the provider; earlier skip rows are historical).
+Cross-check (#4574 M2; hosted acceptance #4761 pending): a plan or code checker
+whose engine is Codex runs on the owner's selected, usable Codex source (the Provider lane). One
+`checkerLaneDecision` (`harness_resolver.go`) returns Refused, Vendor or Provider from the lead's
+provider-boundness, the checker engine and the owner's lane sources, under the shared secret-mutation lock
+(the `CheckerLane` origin in `harness_overflow.go`); a Provider decision never resolves to vendor, and a
+selected but unusable source refuses (`provider_source_unusable`). Rows still refused (plan: human gate;
+code: `checker_unavailable`): a Claude checker under a provider-bound lead or a selected Claude source; a
+Codex checker with no Codex source when the lead is provider-bound or a Claude source is selected (CV/XV and
+CP/XV, lifted by a follow-up slice, #4762); and Codex-lead checks for owners with both sources until #4322 M2.
+A claim needs `codex_provider_checker_v1` (migration 00554), a custody of exactly one Codex
+credential source, and every provider-bound checker claim takes the lead lock first, so a provider refusal on
+a checker child settles the check `checker_unavailable` and never parks the child. At code-stage creation the
+lead's worker must advertise the capability (the checker runs there), else the check fails fast; at the plan
+stage the child waits up to its deadline. A same-model guard (`cross_check_same_model.go`, identity functions
+in `api/internal/providers`, pinned by a shared fixture) compares the lead's and checker's resolved model ids
+(and gateway host when both are provider-bound) in claim assembly, reading the lead's reported
+`run_lead_configs` row for the check's generation and phase; same model or unresolved evidence settles
+`checker_unavailable`, and vendor/vendor pairs read nothing new. See [ADR-4320 D9](adr/4320-custom-model-providers.md#codex-engine-prd-4323-2026-11-23)
+and [Cross-check](docs/cross-check.md#checks-on-a-codex-model-provider). Jobs and chat stay Claude-only. The pinned runtime follows redirects and does not bound
 model-response ingestion (accepted, owner decisions 2026-11-19 and 2026-11-22);
 [ADR-4320, Codex engine](adr/4320-custom-model-providers.md#codex-engine-prd-4323-2026-11-23)
 records the claim ordering and recovery model.

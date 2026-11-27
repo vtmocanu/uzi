@@ -89,21 +89,11 @@ func (s *Service) SubmitCodeCrossCheck(ctx context.Context, worker store.Worker,
 	if e = tx.Commit(ctx); e != nil {
 		return result, e
 	}
-	// The retry transaction is settled before recording failure, which takes the
-	// lead lock itself. A frozen provider lead must not reach vendor resolution.
-	if providerBoundRun(owned) {
-		return s.RecordCodeCrossCheckFailure(ctx, worker, leadID, generation, base, head, "checker_unavailable", input)
-	}
-	rq, ok := s.q.(providerLaneSourceReader)
-	if !ok {
-		return result, errHarnessStoreUnavailable
-	}
-	if err := s.refuseProviderLane(ctx, rq, lead.UserID, harness); err != nil {
-		if errors.Is(err, ErrProviderLaneUnsupported) {
-			return s.RecordCodeCrossCheckFailure(ctx, worker, leadID, generation, base, head, "checker_unavailable", input)
-		}
-		return result, err
-	}
+	// Only the immutable retry/recover handling above and the lead's frozen binding are read before
+	// the create transaction. Whether a provider-bound lead (or a selected source) has a checker lane
+	// is decided once, in the create transaction under the shared secret-mutation lock
+	// (checkerLaneDecision); the closure re-asserts this binding against the locked lead.
+	leadProviderBound := providerBoundRun(owned)
 	_, err = s.createRunResolved(ctx, lead.UserID, &harness, func(q Store, resolved resolvedHarness) (store.Run, error) {
 		txq, ok := q.(*store.Queries)
 		if !ok {
@@ -115,8 +105,8 @@ func (s *Service) SubmitCodeCrossCheck(ctx context.Context, worker store.Worker,
 			locked.Harness != lead.Harness || validateCrossCheckContext(locked.IssueTitle, locked.IssueDescription) != nil {
 			return store.Run{}, ErrCrossCheckRefused
 		}
-		if providerBoundRun(locked) {
-			// A provider-bound lead has no checker lane in this slice.
+		if providerBoundRun(locked) != leadProviderBound {
+			// The lane decision was taken over a different lead binding: Refused.
 			return store.Run{}, ErrProviderLaneUnsupported
 		}
 		prior, e := txq.GetCodeCrossCheck(ctx, leadID)
@@ -142,6 +132,11 @@ func (s *Service) SubmitCodeCrossCheck(ctx context.Context, worker store.Worker,
 		if resolved.Harness != harness {
 			return store.Run{}, ErrCrossCheckUnavailable
 		}
+		// Fast-fail for a Provider decision only (the code checker runs on the lead's worker, so that
+		// worker must advertise the provider checker capabilities); a vendor checker is unaffected.
+		if resolved.ProviderSource != nil && !workerSupportsProvider(worker, string(harness), runkind.CrossCheck) {
+			return store.Run{}, ErrCrossCheckUnavailable
+		}
 		contextBytes, e := json.Marshal(map[string]any{"issue_title": locked.IssueTitle, "issue_description": locked.IssueDescription})
 		if e != nil {
 			return store.Run{}, e
@@ -152,7 +147,9 @@ func (s *Service) SubmitCodeCrossCheck(ctx context.Context, worker store.Worker,
 		if e != nil {
 			return store.Run{}, e
 		}
-		child, e := txq.CreateCodeCrossCheckChild(ctx, store.CreateCodeCrossCheckChildParams{ChildID: uuid.New(), ChildHarness: string(harness), LeadRunID: leadID, UserID: locked.UserID, WorkerID: pgconv.UUID(worker.ID), ClaimGeneration: generation, BudgetWallSeconds: budgetWallSeconds})
+		child, e := txq.CreateCodeCrossCheckChild(ctx, store.CreateCodeCrossCheckChildParams{ChildID: uuid.New(), ChildHarness: string(harness), LeadRunID: leadID, UserID: locked.UserID, WorkerID: pgconv.UUID(worker.ID), ClaimGeneration: generation, BudgetWallSeconds: budgetWallSeconds,
+			ModelProviderID: bindingOf(resolved).ProviderID, ModelProviderRevision: bindingOf(resolved).Revision, ModelProviderKeyMode: bindingOf(resolved).KeyMode,
+			ModelProviderKeySecretID: bindingOf(resolved).KeySecret, ModelProviderKeyRev: bindingOf(resolved).KeyRev})
 		if e != nil {
 			if errors.Is(e, pgx.ErrNoRows) {
 				e = ErrCrossCheckUnavailable
@@ -161,12 +158,12 @@ func (s *Service) SubmitCodeCrossCheck(ctx context.Context, worker store.Worker,
 		}
 		result, e = txq.InsertCodeCrossCheck(ctx, store.InsertCodeCrossCheckParams{LeadRunID: leadID, CheckerRunID: child.ID, BaseCommit: base, HeadCommit: head, CandidateDigest: digest, CodeContext: contextBytes, GuidanceText: frozen.GuidanceText.String, RepoInstructionsCommit: frozen.RepoInstructionsCommit, RepoInstructionsEnabled: frozen.RepoInstructionsEnabled, RepoInstructionsText: frozen.RepoInstructionsText.String, DeadlineAt: pgtype.Timestamptz{Time: s.now().Add(timeout), Valid: true}})
 		return child, e
-	}, harnessCreationOrigin{RefuseProviderOwner: true}) // Enforce the engine-aware unsupported-lane selection policy.
+	}, harnessCreationOrigin{CheckerLane: true, LeadProviderBound: leadProviderBound}) // checkerLaneDecision, under the shared secret lock.
 	if errors.Is(err, retry) {
 		return result, nil
 	}
 	if errors.Is(err, ErrNoCredentialForHarness) || errors.Is(err, ErrHarnessCredentialDisabled) || errors.Is(err, ErrCrossCheckUnavailable) ||
-		errors.Is(err, ErrProviderLaneUnsupported) || errors.Is(err, ErrProviderSourceUnusable) {
+		errors.Is(err, ErrProviderLaneUnsupported) || errors.Is(err, errProviderCreateRequiresTx) || errors.Is(err, ErrProviderSourceUnusable) {
 		return s.RecordCodeCrossCheckFailure(ctx, worker, leadID, generation, base, head, "checker_unavailable", input)
 	}
 	if err != nil {

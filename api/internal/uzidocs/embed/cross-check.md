@@ -118,8 +118,12 @@ See [CLI history](./cli.md#cross-check-history) for explicit continuations.
 ## 1. Enable Plan cross-check
 
 In **Settings → Run defaults → Cross-check**, enable **Plan cross-check**.
-It is off by default and requires usable Claude and Codex credentials. The
-setting applies to new eligible runs, not existing runs. On an auto-approved
+It is off by default and requires a usable credential for each family: for
+each of Claude and Codex, a selected, usable [model provider](./providers.md)
+source counts, a selected but unusable source refuses the setting even when
+you also hold that family's vendor credential, and with no source selected the
+vendor credential is checked as before. An owner with a Claude source and no
+Codex source is still refused. The setting applies to new eligible runs, not existing runs. On an auto-approved
 run it covers issue, prompt, self-improvement, CI fix and merge request rework
 plans that reach the auto-approval gate. On a run that is not auto-approved it
 covers issue, prompt and CI fix plans, checked before your review (see
@@ -614,6 +618,72 @@ the run's current attempt has arrived. Before then, or when it never arrives:
 - Activity lands on the checker child run, not the lead. The lead's
   stalled-health warning during a code-check wait is unchanged.
 
+## Checks on a Codex model provider
+
+A Claude lead's plan or code checker runs on your selected, usable Codex
+[model provider](./providers.md#cross-check-on-a-codex-provider) when you have
+one, frozen when the checker is created, with no vendor fallback. A selected
+Codex source that is unusable makes the check unavailable instead of spending
+your vendor Codex credential: the plan takes the human gate and the code stage
+records the checker as unavailable with no verdict. Rows that stay refused, and
+the worker capability this needs, are listed on the providers page. Two
+consequences to know:
+
+- A Claude checker is refused while you have a Claude source or a
+  provider-bound lead, and a Codex lead's check is refused for an owner who has
+  both sources, until the Claude checker lane ships with #4322 M2. An owner with
+  both sources who enables cross-check therefore sees Codex-lead checks end as
+  checker unavailable (the plan goes to the human gate). A Claude source with a
+  vendor Codex checker (no Codex source) stays refused too; that follow-up is
+  tracked in #4762.
+- Gateway models are mapped, so a different checker family does not prove a
+  different model. On an auto-approved run, an unavailable check sends the plan
+  to the human gate. If your Codex gateway maps its model to the same target as
+  your lead, change one side so the models differ: pin the Codex cell under
+  [Settings → Models → Cross-check](./configuration.md#plan-cross-check-model-and-effort-pins)
+  to another key of the Codex provider's model map that maps to a different target, or change the
+  lead's model (a vendor lead: a model whose id differs from the gateway's target; a lead on a Claude
+  provider: another key of its own provider's map with a different target). A Codex cell pinned to a
+  model that is not a key of the Codex provider's model map makes the check unavailable. The Claude
+  cell does not affect this guard.
+
+### The same-model guard
+
+When either side of a check is bound to a provider, the server compares the
+models before delivering any credential:
+
+- **Lead side.** A lead on a provider is identified by the model it requested,
+  resolved through the provider's frozen model map. A vendor lead is identified
+  by the model its CLI reported, else the model it requested. Both come from
+  the lead's reported configuration for the check's own generation and phase
+  (the highest-numbered record).
+- **Checker side.** The checker's resolved model, through its provider's frozen
+  map, and the gateway host.
+- **Comparison.** Exact string equality on model IDs. The same ID is the same
+  model; two provider-bound sides also need the same gateway host to match. If
+  either side cannot be resolved, the check is unavailable. A check with no
+  provider on either side reads nothing extra.
+- **Result.** A match or an unresolved side decides the check unavailable
+  (plan: human gate; code: no verdict), and no credential is delivered. The
+  reason is not shown beyond that; no new gate reason exists.
+
+Accepted limits:
+
+- **Aliases.** A vendor alias is not an exact match for a mapped ID. A vendor
+  lead that requested `opus` and reported nothing else can pass as independent
+  of a checker whose target equals that alias's canonical ID. Different names do
+  not prove independence, and uzi keeps no alias catalog.
+- **Case and hosts.** IDs compare case-sensitively. Two gateways on different
+  hosts always count as different models, even for the same model ID.
+- **Best-effort evidence.** The lead's configuration record is reported by the
+  worker and is best-effort. A missing record fails the check closed
+  (unavailable). A later record that was dropped leaves the guard judging an
+  earlier one, and a truncation record (the worker's per-phase entry budget ran
+out, so the last record carries the latest known values) is used as it stands. A
+  resumed generation with no plan-phase record is unavailable at the plan
+  stage, and the code stage sees only the generation that submitted the code.
+  The records come from your own worker and are trusted like the claim itself.
+
 ## Rolling out Codex-lead checks
 
 Deploy the api and its migration before the workers. A new api adds
@@ -833,8 +903,10 @@ unavailable check is recorded and publication goes ahead; no result blocks it.
 In **Settings → Run defaults → Cross-check**, enable **Code cross-check ·
 Advisory before publication**. The line under it reads "Adds the other model
 family's findings to the merge request; never blocks it". It is off by
-default, independent of **Plan cross-check**, and needs usable Claude and
-Codex credentials (otherwise the server refuses it). The toggle is
+default, independent of **Plan cross-check**, and needs a usable credential
+for each family under the same rule as
+[Plan cross-check](#1-enable-plan-cross-check) (otherwise the server
+refuses it with a 409). The toggle is
 `PUT /api/me/cross-check` with `{"code": true}` or `{"code": false}`; omitted
 fields keep their value. The response warns when no online worker of yours
 can check code on both model families, which needs `cross_check_code_v1`

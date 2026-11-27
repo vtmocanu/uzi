@@ -263,18 +263,18 @@ func TestJudgeLaneFakeCreationAdmission(t *testing.T) {
 
 // A guarded origin that is NOT the judge or the job (the plan and code checkers) keeps refusing any
 // Claude source: neither the judge lane (PRD #4322 M1a) nor the job lane (M1b) may have relaxed
-// RefuseProviderOwner. (Entry-point proofs for the plan and code checker creations are
+// CheckerLane's Claude-checker rule. (Entry-point proofs for the plan and code checker creations are
 // TestProviderCrossCheckFailsClosedToTheHumanGateLiveDB and
 // TestProviderCheckerFrozenLeadBeforeVendorLiveDB; the job lane's own are in
 // TestProviderOwnerGetsNoJobLiveDB.) The JobLane row shows the contrast: the same fake store and
 // selected source fail closed on the transaction, not on the lane.
-func TestRefuseProviderOwnerOriginStillRefusesAClaudeSource(t *testing.T) {
+func TestCheckerLaneOriginStillRefusesAClaudeSource(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		origin harnessCreationOrigin
 		want   error
 	}{
-		{"checker origin", harnessCreationOrigin{RefuseProviderOwner: true}, ErrProviderLaneUnsupported},
+		{"checker origin", harnessCreationOrigin{CheckerLane: true}, ErrProviderLaneUnsupported},
 		{"job origin", harnessCreationOrigin{JobLane: true}, errProviderCreateRequiresTx},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

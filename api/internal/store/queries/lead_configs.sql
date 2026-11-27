@@ -93,3 +93,20 @@ SELECT c.run_id, c.claim_generation, c.phase, c.phase_entry, c.seq, c.harness,
  WHERE c.run_id = @run_id::uuid
  ORDER BY c.claim_generation DESC, CASE c.phase WHEN 'plan' THEN 0 ELSE 1 END, c.seq
  LIMIT 257;
+
+-- name: GetRunLeadConfigForGeneration :one
+-- The highest-seq lead-config row of one run, claim generation and phase (PRD #4574 M2, the
+-- same-model guard's lead evidence). Unlike ListLatestRunLeadConfig it never falls back to another
+-- generation: a check is judged against the generation it was submitted at. No row yields no rows
+-- (pgx.ErrNoRows), which the guard treats as Unresolved. Phase is 'plan' for the plan stage and
+-- 'implement' for the code stage.
+SELECT c.run_id, c.claim_generation, c.phase, c.phase_entry, c.seq, c.harness,
+       c.requested_model, c.requested_model_source, c.observed_model, c.observed_model_evidence,
+       c.requested_effort, c.requested_effort_mode, c.requested_effort_source,
+       c.observed_effort, c.observed_effort_evidence, c.truncated, c.reported_at
+  FROM run_lead_configs c
+ WHERE c.run_id = @run_id::uuid
+   AND c.claim_generation = @claim_generation::bigint
+   AND c.phase = @phase::text
+ ORDER BY c.seq DESC
+ LIMIT 1;
