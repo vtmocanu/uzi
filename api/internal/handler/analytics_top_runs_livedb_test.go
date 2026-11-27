@@ -119,7 +119,7 @@ func TestAnalyticsSpendTopRunsIdentityLiveDB(t *testing.T) {
 	rv, _ := f.repoOwnedBy(v, "tr-v")
 	at := f.now.Add(-3 * time.Hour)
 
-	short := "a\x01b\tc\nd\x7fe <script>&\"'</script> é 中文 \U0001F600 ‮ rtl"
+	short := "a\x01b\tc\nd\x7fe <script>&\"'</script> é 中文 \U0001F600 \u202e rtl"
 	long := strings.Repeat(short+" ", 20000/len(short)+1)
 	if len(long) < 20000 {
 		t.Fatalf("long title is only %d bytes", len(long))

@@ -84,7 +84,7 @@ func topWantStr(t *testing.T, what string, got *string, want string) {
 }
 
 const (
-	topTitleShort = "a\x01b\tc\nd\x7fe <script>&\"'</script> é 中文 \U0001F600 ‮ rtl"
+	topTitleShort = "a\x01b\tc\nd\x7fe <script>&\"'</script> é 中文 \U0001F600 \u202e rtl"
 	topTitleMasks = "distinctive-inaccessible-title-4776"
 	topTitleJob   = "distinctive-job-title-4776"
 )
