@@ -215,6 +215,8 @@ SELECT
     d.user_id                        AS user_id,
     d.repo_id                        AS repo_id,
     r.path_with_namespace            AS repo_path,
+    -- PRD #4173 M6: the linked repo's issue tracker project short name (empty when unlinked), for filed_issue_key.
+    COALESCE(CASE WHEN r.issue_tracker_connection_id IS NOT NULL AND r.issue_tracker_project_short <> '' THEN r.issue_tracker_project_short END, '')::text AS issue_tracker_project_short,
     d.location                       AS location,
     d.status                         AS status,
     d.last_title                     AS last_title,
@@ -250,7 +252,7 @@ WHERE d.user_id = @user_id
             AND f2.run_id = sqlc.narg('run_id')::uuid
       )
   )
-GROUP BY d.id, r.path_with_namespace, latest.id
+GROUP BY d.id, r.path_with_namespace, r.issue_tracker_connection_id, r.issue_tracker_project_short, latest.id
 ORDER BY d.created_at DESC, d.id DESC;
 
 -- name: CountFindingsByStatusForUser :one

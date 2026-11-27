@@ -9,6 +9,7 @@ import { seedUnifiedProgress } from "./data/unifiedProgress";
 import { mockGatedCheckedMessages } from "./data/planCrossCheckGated";
 import { overviewNextOtherRunOwners, overviewNextOwnAskingMessages, overviewNextRuns } from "./data/overviewNext";
 import { deriveMockProgress, foreignCooldownRun } from "./runProgress";
+import { issueKey } from "../lib/issueTrackerText";
 import { mockScenario } from "./mockScenario";
 import {
   mockAdmin,
@@ -35,6 +36,14 @@ import {
   mockRuns,
   mockSeededMessages,
   mockUnreadableQuestionMessages,
+  issueTrackerScenario,
+  mockLinkedBoard,
+  mockLinkedMapping,
+  mockLinkedRepo,
+  mockLinkedRunId,
+  mockLinkedRunIssue,
+  mockUnmappedMapping,
+  seedsLinkedRepo,
 } from "./data";
 
 export interface MockState {
@@ -256,6 +265,49 @@ function seed(): MockState {
         } : null,
       })),
     });
+  }
+  // ?mock=issue-tracker-linked / issue-tracker-unmapped / issue-tracker-state-machine (PRD #4173 M8): the linked repo's
+  // board with keyed cards placed by its State mapping, and one finished run on ATL-23
+  // (a copy of run-done without its one-off fixtures), so the runs list and the issue page
+  // show issue keys.
+  const issueTracker = issueTrackerScenario(mockScenario());
+  if (seedsLinkedRepo(issueTracker)) {
+    const mapping = issueTracker === "issue-tracker-unmapped" ? mockUnmappedMapping : mockLinkedMapping;
+    const linkedBoard = mockLinkedBoard(mockLinkedRepo, mapping);
+    boards.set(mockLinkedRepo.id, linkedBoard);
+    const done = runs.get("run-done");
+    if (done) {
+      const { completion_pending: _pending, semantic_drift: _drift, ...base } = done;
+      const key = issueKey(mockLinkedRepo.issue_tracker_link?.project_short_name ?? "", mockLinkedRunIssue.n);
+      const seeded = {
+        ...base,
+        id: mockLinkedRunId,
+        repo_id: mockLinkedRepo.id,
+        issue_iid: mockLinkedRunIssue.n,
+        issue_key: key,
+        issue_title: mockLinkedRunIssue.title,
+        issue_description: "Uploads that fail on a weak signal should retry on their own.",
+        branch: `agent/issue-${mockLinkedRunIssue.n}`,
+        mr_web_url: `${mockLinkedRepo.web_url}/-/merge_requests/7`,
+        mr_iid: 7,
+        mr_state: "opened",
+      };
+      runs.set(mockLinkedRunId, seeded);
+      messages.set(mockLinkedRunId, [...mockDoneMessages]);
+      // The ATL-23 card shows that run, as the server's board does for an issue's latest run.
+      const card = linkedBoard.cards.find((c) => c.iid === mockLinkedRunIssue.n);
+      if (card) {
+        card.latest_run = {
+          id: seeded.id, status: seeded.status, mr_iid: seeded.mr_iid, mr_web_url: seeded.mr_web_url,
+          mr_state: seeded.mr_state, failure_reason: seeded.failure_reason, fail_origin: seeded.fail_origin ?? null,
+          stop_kind: seeded.stop_kind, stop_reason: seeded.stop_reason, health: seeded.health,
+          health_reason: seeded.health_reason, health_since: seeded.health_since,
+          owner_name: "Robin Diaz", worker_name: seeded.worker_name ?? null, is_mine: true, run_count: 1,
+          first_started_at: seeded.first_started_at ?? null, finished_at: seeded.finished_at,
+          auto_approve_blocked_reasons: [], created_at: seeded.created_at, updated_at: seeded.updated_at,
+        };
+      }
+    }
   }
   if (mockScenario() === "account-cooldown") {
     for (const board of boards.values()) for (const card of board.cards) {

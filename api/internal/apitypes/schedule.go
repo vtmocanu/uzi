@@ -311,16 +311,18 @@ type ScheduleDTO struct {
 	RepoPath              string         `json:"repo_path"`
 	Target                string         `json:"target"`
 	IssueIID              *int64         `json:"issue_iid"`
-	Labels                []string       `json:"labels"`
-	Prompt                string         `json:"prompt"`
-	Timing                string         `json:"timing"`
-	CronExpr              string         `json:"cron_expr"`
-	RunAt                 *time.Time     `json:"run_at"`
-	Timezone              string         `json:"timezone"`
-	NextFireAt            *time.Time     `json:"next_fire_at"`
-	LastFiredAt           *time.Time     `json:"last_fired_at"`
-	AutoApprove           bool           `json:"auto_approve"`
-	WaitOnLimit           bool           `json:"wait_on_limit"`
+	// IssueKey is the issue tracker key of IssueIID on a linked repo, omitted otherwise (PRD #4173 M6).
+	IssueKey    string     `json:"issue_key,omitempty"`
+	Labels      []string   `json:"labels"`
+	Prompt      string     `json:"prompt"`
+	Timing      string     `json:"timing"`
+	CronExpr    string     `json:"cron_expr"`
+	RunAt       *time.Time `json:"run_at"`
+	Timezone    string     `json:"timezone"`
+	NextFireAt  *time.Time `json:"next_fire_at"`
+	LastFiredAt *time.Time `json:"last_fired_at"`
+	AutoApprove bool       `json:"auto_approve"`
+	WaitOnLimit bool       `json:"wait_on_limit"`
 	// MrReworkEnabled is the per-schedule MR-rework override (PRD #841 M2): nil means
 	// inherit the owner default (NULL in the DB, the schedule default per D5), a value is
 	// an explicit override a scheduled run stamps onto itself. It is *bool (tri-state),

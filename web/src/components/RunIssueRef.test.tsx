@@ -201,3 +201,22 @@ describe('RunIssueRef — tone="inherit" lets the ref read the parent colour (#4
     expect(chip.className).toContain("text-muted");
   });
 });
+
+describe("RunIssueRef — a run on a repo linked to an issue tracker (PRD 4173 M6)", () => {
+  it("names the key in the anchor's label and shows it as the text", () => {
+    render(
+      <RunIssueRef issueIid={26} issueKey="ABC-26" issueWebUrl={URL26} kind="issue" forgeType="gitlab" />,
+    );
+    const link = screen.getByRole("link");
+    expect(link.getAttribute("aria-label")).toBe("Open issue ABC-26 in the issue tracker");
+    expect(link.textContent).toContain("ABC-26");
+    expect(link.textContent).not.toContain("#26");
+  });
+
+  it("shows the key as plain text when the issue has no valid url", () => {
+    render(<RunIssueRef issueIid={26} issueKey="ABC-26" issueWebUrl={null} kind="issue" forgeType="gitlab" />);
+    expect(screen.queryByRole("link")).toBeNull();
+    expect(screen.getByText("ABC-26")).toBeTruthy();
+    expect(screen.queryByText("#26")).toBeNull();
+  });
+});

@@ -246,9 +246,11 @@ type HarnessDecisionDTO struct {
 // CreatedIssueDTO is a confirmed issue created by this scheduled prompt run.
 // WebURL is empty when the stored repository URL cannot safely form a link.
 type CreatedIssueDTO struct {
-	IID    int64  `json:"iid"`
-	Title  string `json:"title"`
-	WebURL string `json:"web_url"`
+	IID int64 `json:"iid"`
+	// IssueKey is the issue tracker key of IID on a linked repo, omitted otherwise (PRD #4173 M6).
+	IssueKey string `json:"issue_key,omitempty"`
+	Title    string `json:"title"`
+	WebURL   string `json:"web_url"`
 }
 
 // InjectedEnvVarDTO names one run environment variable the run's current claim delivered
@@ -298,8 +300,11 @@ type RunDTO struct {
 	// set for the issue-shaped kinds (issue, self_improve); the ci_fix fields below carry
 	// pipeline context, chat carries Title, and a task (uzi handoff) carries
 	// Branch/BaseBranch/OpenMr set at create.
-	Kind              string `json:"kind"`
-	IssueIID          *int64 `json:"issue_iid"`
+	Kind     string `json:"kind"`
+	IssueIID *int64 `json:"issue_iid"`
+	// IssueKey is the issue tracker key ("ABC-12") of IssueIID on a repo linked to an issue
+	// tracker (PRD #4173 M6): omitted for an unlinked repo and for a run with no issue.
+	IssueKey          string `json:"issue_key,omitempty"`
 	ContinuedIssueIID *int64 `json:"continued_issue_iid"`
 	IssueTitle        string `json:"issue_title"`
 	IssueDescription  string `json:"issue_description"`
@@ -1310,8 +1315,11 @@ type RunSummaryItemDTO struct {
 	// set for the issue-shaped kinds (issue, self_improve); the ci_fix fields below carry
 	// pipeline context, chat carries Title, and a task (uzi handoff) carries
 	// Branch/BaseBranch/OpenMr set at create.
-	Kind              string `json:"kind"`
-	IssueIID          *int64 `json:"issue_iid"`
+	Kind     string `json:"kind"`
+	IssueIID *int64 `json:"issue_iid"`
+	// IssueKey is the issue tracker key ("ABC-12") of IssueIID on a repo linked to an issue
+	// tracker (PRD #4173 M6): omitted for an unlinked repo and for a run with no issue.
+	IssueKey          string `json:"issue_key,omitempty"`
 	ContinuedIssueIID *int64 `json:"continued_issue_iid"`
 	IssueTitle        string `json:"issue_title"`
 	// Harness is the run's ACTUAL execution harness (PRD #1429 M1 / D2), the stored
@@ -2198,6 +2206,7 @@ func RunSummaryOf(item RunListItemDTO) RunSummaryItemDTO {
 		ForgeType:                     item.ForgeType,
 		Kind:                          item.Kind,
 		IssueIID:                      item.IssueIID,
+		IssueKey:                      item.IssueKey,
 		ContinuedIssueIID:             item.ContinuedIssueIID,
 		IssueTitle:                    item.IssueTitle,
 		Harness:                       item.Harness,
@@ -2396,6 +2405,7 @@ func (s RunSummaryItemDTO) ListItem() RunListItemDTO {
 			ForgeType:                     s.ForgeType,
 			Kind:                          s.Kind,
 			IssueIID:                      s.IssueIID,
+			IssueKey:                      s.IssueKey,
 			ContinuedIssueIID:             s.ContinuedIssueIID,
 			IssueTitle:                    s.IssueTitle,
 			Harness:                       s.Harness,

@@ -896,6 +896,23 @@ describe("Findings page - File as one issue (issue #1724)", () => {
     expect(await screen.findByText(/Filed 2 findings as issue #81/)).toBeTruthy();
   });
 
+  it("names the filed issue by its key on a repo linked to an issue tracker (PRD 4173 M6)", async () => {
+    mockApi.listFindings.mockResolvedValue(backlog({ open_count: 40, findings: rows.slice(0, 2) }));
+    openDraft();
+    mockApi.fileFindingGroup.mockResolvedValue({
+      operation_id: "op-keyed", disposition_ids: ["d1", "d2"], phase: "settled",
+      issue: { iid: 81, issue_key: "ABC-81", web_url: "https://youtrack.example.com/issue/ABC-81", title: "Grouped" },
+    });
+    renderFindings();
+    expect(await screen.findByText("Alpha bug")).toBeTruthy();
+    tick("Alpha bug");
+    tick("Beta bug");
+    fireEvent.click(groupButton());
+    fireEvent.click(await screen.findByRole("button", { name: "Create issue" }));
+    expect(await screen.findByText("Filed 2 findings as issue ABC-81.")).toBeTruthy();
+    expect(screen.queryByText(/issue #81/)).toBeNull();
+  });
+
   it("happy path: loads the draft, posts ids and edits, reloads, and shows the warning", async () => {
     openDraft();
     mockApi.fileFindingGroup.mockResolvedValue({

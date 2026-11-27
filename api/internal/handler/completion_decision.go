@@ -109,7 +109,7 @@ func (h *Handler) ContinueCompletionDecision(w http.ResponseWriter, r *http.Requ
 		}
 		return
 	}
-	dto := runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)
+	dto := h.runDTO(r.Context(), run)
 	dto.CompletionPending, err = workersvc.CompletionPending(run)
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, "semantic completion authority unavailable")

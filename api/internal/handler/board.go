@@ -304,6 +304,10 @@ type boardDTO struct {
 	// between "importing", "failed" and "the repo has no issues". Null for a legacy
 	// repo (no recorded import) and for a repo that is not enabled.
 	InitialImport *initialImportDTO `json:"initial_import"`
+	// EligibilityLabel is the stored eligibility tag name of a repo linked to an issue
+	// tracker (PRD #4173 M6): an issue is uzi's when its labels include it. Omitted on an
+	// unlinked repo, where the configured uzi label decides.
+	EligibilityLabel string `json:"eligibility_label,omitempty"`
 }
 
 // initialImportDTO is one repo's first-import status: state is
@@ -550,6 +554,7 @@ func (h *Handler) buildBoard(w http.ResponseWriter, r *http.Request, repo store.
 	// owner-only run-view link. repo.ForgeType stamps every card's forge for the
 	// per-card MR/PR noun (all cards on one board share the repo's connection).
 	cards := assembleCards(issues, runRows, cardPipelines, autofixHalts, position, repo.UserID, repo.ForgeType, repo.IssueTrackerConnectionID.Valid, revising, h.cfg.RunTimeout)
+	stampLinkedIssueKeys(cards, repo)
 
 	return boardDTO{
 		RepoID:         repo.ID.String(),
@@ -561,6 +566,8 @@ func (h *Handler) buildBoard(w http.ResponseWriter, r *http.Request, repo store.
 		Pipeline:       repoPipeline,
 		BotForgeUserID: repo.BotForgeUserID,
 		InitialImport:  initialImportForBoard(repo),
+		// The stored eligibility tag name, on a linked repo only (omitted otherwise).
+		EligibilityLabel: linkedEligibilityLabel(repo),
 	}, true
 }
 
@@ -1171,7 +1178,7 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 		}
 		// On a linked repo a refused move (409) or a moved-away issue (404) leaves the
 		// cache unchanged, so the card snaps back; any other failure is a 502.
-		if repo.IssueTrackerConnectionID.Valid && writeLinkedMoveError(w, err) {
+		if repo.IssueTrackerConnectionID.Valid && writeLinkedMoveError(w, err, repo.IssueTrackerProjectShort.String) {
 			return
 		}
 		httpx.Error(w, http.StatusBadGateway, "could not update the issue on the forge: "+err.Error())
@@ -1203,6 +1210,9 @@ func (h *Handler) MoveIssue(w http.ResponseWriter, r *http.Request) {
 		position[c.LabelName] = int(c.Position)
 	}
 	card := issueToCard(updated, position, repo.ForgeType, repo.IssueTrackerConnectionID.Valid)
+	if k := linkedIssueKey(repo, card.IID); k != "" {
+		card.IssueKey = k
+	}
 	// Carry the issue's latest run on the single-card response too, so a drag never
 	// blanks the run badge the board is showing (the client replaces the card).
 	if lr, err := h.q.GetLatestRunForIssue(r.Context(), store.GetLatestRunForIssueParams{RepoID: repo.ID, IssueIid: pgtype.Int8{Int64: iid, Valid: true}}); err == nil {
@@ -1329,6 +1339,9 @@ func (h *Handler) PromoteIssue(w http.ResponseWriter, r *http.Request) {
 		position[c.LabelName] = int(c.Position)
 	}
 	card := issueToCard(updated, position, repo.ForgeType, repo.IssueTrackerConnectionID.Valid)
+	if k := linkedIssueKey(repo, card.IID); k != "" {
+		card.IssueKey = k
+	}
 	if lr, err := h.q.GetLatestRunForIssue(r.Context(), store.GetLatestRunForIssueParams{RepoID: repo.ID, IssueIid: pgtype.Int8{Int64: iid, Valid: true}}); err == nil {
 		card.LatestRun = mapLatestRun(lr.ID, lr.UserID, lr.Status, lr.Kind, lr.IterationCount, lr.HasPlanMd.Bool, lr.MrIid, lr.MrWebUrl,
 			lr.MrState, lr.FailureReason, lr.StopKind, lr.StopReason, lr.Health, lr.HealthReason, lr.HealthSince, lr.HoldReason,

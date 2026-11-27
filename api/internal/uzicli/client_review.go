@@ -249,9 +249,11 @@ func (c *HTTPClient) UndoFinding(ctx context.Context, id string) (apitypes.Incid
 // a real server fileIssueResponse into this type) and TestReviewFileClientWireRoundtrip
 // (marshal/unmarshal json-tag parity incl. warning), both in api/internal/handler.
 type ReviewFiledIssueDTO struct {
-	IID    int64  `json:"iid"`
-	WebURL string `json:"web_url"`
-	Title  string `json:"title"`
+	IID int64 `json:"iid"`
+	// IssueKey is the issue tracker key of IID on a linked repo, omitted otherwise.
+	IssueKey string `json:"issue_key,omitempty"`
+	WebURL   string `json:"web_url"`
+	Title    string `json:"title"`
 }
 
 type ReviewIssueFileResult struct {

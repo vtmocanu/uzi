@@ -13,6 +13,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/issueinput"
 	"github.com/vtmocanu/uzi/api/internal/issuesource"
+	"github.com/vtmocanu/uzi/api/internal/issuetracker"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -40,9 +41,12 @@ type RepoGuard interface {
 // callers (web handler, Slack card) render. Kept local so the return type does not
 // leak forge.Issue across the service boundary.
 type CreatedIssue struct {
-	IID    int64
-	WebURL string
-	Title  string
+	IID int64
+	// IssueKey is the issue tracker key of IID (project short name + "-" + IID) when the
+	// target repo is linked to an issue tracker (PRD #4173 M6); empty otherwise.
+	IssueKey string
+	WebURL   string
+	Title    string
 }
 
 // Composite-op sentinels (PRD #191 M1). The caller (web handler, Slack card) maps
@@ -180,7 +184,11 @@ func (s *Service) ConfirmProposalForUser(ctx context.Context, userID, runID, pro
 		slog.Error("confirm proposal: mark confirmed after issue creation",
 			"proposal", propID.String(), "issue_iid", created.IID, "error", err)
 	}
-	return CreatedIssue{IID: created.IID, WebURL: created.WebURL, Title: created.Title}, nil
+	var issueKey string
+	if repo.IssueTrackerConnectionID.Valid && repo.IssueTrackerProjectShort.Valid && repo.IssueTrackerProjectShort.String != "" {
+		issueKey = issuetracker.IssueKey(repo.IssueTrackerProjectShort.String, created.IID)
+	}
+	return CreatedIssue{IID: created.IID, IssueKey: issueKey, WebURL: created.WebURL, Title: created.Title}, nil
 }
 
 // revertProposal best-effort returns a claimed ('confirming') proposal to pending

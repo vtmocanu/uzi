@@ -286,7 +286,9 @@ RETURNING *;
 -- name: ListCreatedIssuesForRun :many
 -- Detail-only metadata for confirmed issues from an owned scheduled prompt run.
 -- Bind both ownership boundaries and the proposal's exact run/repo; no credentials.
-SELECT p.repo_id, p.created_issue_iid::bigint AS iid, p.title, repo.web_url, c.forge_type
+SELECT p.repo_id, p.created_issue_iid::bigint AS iid, p.title, repo.web_url, c.forge_type,
+       -- PRD #4173 M6: the linked repo's project short name (empty when unlinked), for the created issue's key.
+       COALESCE(CASE WHEN repo.issue_tracker_connection_id IS NOT NULL AND repo.issue_tracker_project_short <> '' THEN repo.issue_tracker_project_short END, '')::text AS issue_tracker_project_short
 FROM runs r
 JOIN issue_proposals p ON p.run_id = r.id AND p.repo_id = r.repo_id
 JOIN repos repo ON repo.id = p.repo_id

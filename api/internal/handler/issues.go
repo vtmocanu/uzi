@@ -2,12 +2,14 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/board"
@@ -122,7 +124,7 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 			// nonNilLabels, not created.Labels: this is the THIRD card builder (the two
 			// in board.go go through decodeLabels) and it hands the forge's slice
 			// straight to the DTO, where a nil marshals as JSON null.
-			"card": cardDTO{IID: created.IID, Title: created.Title, State: created.State, Labels: nonNilLabels(created.Labels), AssigneeIds: nonNilAssigneeIDs(created.Assignees), WebURL: created.WebURL, ForgeType: repo.ForgeType, HasPRDLink: forgesvc.HasPRDLink(req.Description)},
+			"card": cardDTO{IID: created.IID, Title: created.Title, State: created.State, Labels: nonNilLabels(created.Labels), AssigneeIds: nonNilAssigneeIDs(created.Assignees), WebURL: created.WebURL, ForgeType: repo.ForgeType, HasPRDLink: forgesvc.HasPRDLink(req.Description), IssueKey: linkedIssueKey(repo, created.IID)},
 		})
 		return
 	}
@@ -137,7 +139,11 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 	for _, c := range cols {
 		position[c.LabelName] = int(c.Position)
 	}
-	httpx.JSON(w, http.StatusCreated, map[string]any{"card": issueToCard(upserted, position, repo.ForgeType, repo.IssueTrackerConnectionID.Valid)})
+	card := issueToCard(upserted, position, repo.ForgeType, repo.IssueTrackerConnectionID.Valid)
+	if k := linkedIssueKey(repo, card.IID); k != "" {
+		card.IssueKey = k
+	}
+	httpx.JSON(w, http.StatusCreated, map[string]any{"card": card})
 }
 
 // issueDetailDTO is the in-app issue view payload (PRD #12 §3): the board card
@@ -168,6 +174,25 @@ type issueDetailDTO struct {
 	// issue view can evaluate assignment-eligibility with the SAME predicate the board
 	// uses. Per-connection, carried at issue-detail level, not the user session.
 	BotForgeUserID int64 `json:"bot_forge_user_id"`
+	// IssueKey and EligibilityLabel are set on a repo linked to an issue tracker only
+	// (PRD #4173 M6): the derived key ("ABC-12") and the stored eligibility tag name an
+	// issue must carry to be uzi's. Both are omitted on an unlinked repo.
+	IssueKey         string `json:"issue_key,omitempty"`
+	EligibilityLabel string `json:"eligibility_label,omitempty"`
+}
+
+// applyLinkedIssueDetail adds what a linked repo's issue page carries beyond the forge
+// shape: the derived key, the stored eligibility name, and the column from the cached
+// State column (column "" for an issue the cache does not hold, the Open lane). Labels
+// never decide the column there, because a tag the account owns can be named like a
+// column (PRD #4173 D9, M6). A repo with no link is left exactly as buildIssueDetail made it.
+func applyLinkedIssueDetail(dto *issueDetailDTO, repo store.GetRepoForUserRow, issue forge.Issue, cachedColumn string, position map[string]int) {
+	if !repo.IssueTrackerConnectionID.Valid {
+		return
+	}
+	dto.IssueKey = linkedIssueKey(repo, issue.IID)
+	dto.EligibilityLabel = linkedEligibilityLabel(repo)
+	dto.Column, dto.Closed, dto.Conflict = board.ResolveColumn(board.CardColumnLabels(true, issue.Labels, cachedColumn), issue.State, position)
 }
 
 // buildIssueDetail assembles the issue-view payload from a freshly-fetched forge
@@ -235,7 +260,11 @@ func (h *Handler) GetIssueDetail(w http.ResponseWriter, r *http.Request) {
 	issue, err := tr.GetIssue(r.Context(), repo.ForgeProjectID, iid)
 	if err != nil {
 		// err is already PAT-redacted by the driver.
-		httpx.Error(w, http.StatusBadGateway, "could not read the issue from the forge: "+err.Error())
+		msg := "could not read the issue from the forge: "
+		if repo.IssueTrackerConnectionID.Valid {
+			msg = "could not read the issue from the issue tracker: "
+		}
+		httpx.Error(w, http.StatusBadGateway, msg+err.Error())
 		return
 	}
 	cols, err := h.q.ListBoardColumns(r.Context(), repo.ID)
@@ -248,5 +277,20 @@ func (h *Handler) GetIssueDetail(w http.ResponseWriter, r *http.Request) {
 	for _, c := range cols {
 		position[c.LabelName] = int(c.Position)
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"issue": buildIssueDetail(issue, position, repo.ForgeType, repo.BotForgeUserID)})
+	dto := buildIssueDetail(issue, position, repo.ForgeType, repo.BotForgeUserID)
+	if repo.IssueTrackerConnectionID.Valid {
+		// An issue the cache does not hold has no cached column: the Open lane.
+		var cachedColumn string
+		cached, err := h.q.GetIssueByIID(r.Context(), store.GetIssueByIIDParams{RepoID: repo.ID, ForgeIssueIid: iid})
+		switch {
+		case err == nil:
+			cachedColumn = cached.IssueTrackerColumn.String
+		case !errors.Is(err, pgx.ErrNoRows):
+			slog.Error("issue detail: read cached issue", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		applyLinkedIssueDetail(&dto, repo, issue, cachedColumn, position)
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"issue": dto})
 }

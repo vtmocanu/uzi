@@ -83,10 +83,37 @@ describe("isUziCard", () => {
     expect(isUziCard(card(["uzi"], false, []), "uzi", undefined)).toBe(true);
   });
 
-  it("counts a card carrying an issue_key as uzi's even without the uzi label", () => {
+  // PRD 4173 M6 (replaces the M4 rule "a keyed card is uzi's"): a key rides every card of a
+  // linked repo, so it decides nothing; the stored eligibility tag does.
+  it("does not count a card as uzi's because it carries an issue_key", () => {
     const keyed = { ...card(["Bug"]), issue_key: "ABC-12" };
-    expect(isUziCard(keyed, "uzi", NO_BOT)).toBe(true);
-    expect(canPromote(keyed, "uzi", NO_BOT)).toBe(false);
+    expect(isUziCard(keyed, "uzi", NO_BOT)).toBe(false);
+    expect(canPromote(keyed, "uzi", NO_BOT)).toBe(true);
+  });
+
+  it("on a linked repo, is uzi's exactly when its labels include the eligibility label", () => {
+    const tagged = { ...card(["Bug", "send-to-uzi"]), issue_key: "ABC-12" };
+    const untagged = { ...card(["Bug"]), issue_key: "ABC-13" };
+    expect(isUziCard(tagged, "uzi", NO_BOT, "send-to-uzi")).toBe(true);
+    expect(canPromote(tagged, "uzi", NO_BOT, "send-to-uzi")).toBe(false);
+    expect(isUziCard(untagged, "uzi", NO_BOT, "send-to-uzi")).toBe(false);
+    expect(canPromote(untagged, "uzi", NO_BOT, "send-to-uzi")).toBe(true);
+  });
+
+  it("on a linked repo, ignores the configured uzi label and a bot assignment", () => {
+    const c = { ...card(["uzi"], false, [BOT]), issue_key: "ABC-12" };
+    expect(isUziCard(c, "uzi", BOT, "send-to-uzi")).toBe(false);
+    expect(canPromote(c, "uzi", BOT, "send-to-uzi")).toBe(true);
+  });
+
+  it("treats an empty eligibility label as an unlinked repo", () => {
+    expect(isUziCard(card(["uzi"]), "uzi", NO_BOT, "")).toBe(true);
+  });
+
+  it("filters visibleCards by the eligibility label on a linked repo", () => {
+    const tagged = card(["send-to-uzi"]);
+    const other = card(["uzi"]);
+    expect(visibleCards([tagged, other], "uzi", NO_BOT, false, "send-to-uzi")).toEqual([tagged]);
   });
 
   it("keeps the label/assignee rule when issue_key is absent or empty", () => {
@@ -245,6 +272,14 @@ describe("matchesQuery", () => {
 
   it("returns false when nothing matches", () => {
     expect(matchesQuery(qcard(429, "Add dashboard", ["bug"]), "zzz")).toBe(false);
+  });
+
+  it("matches the issue key as a case-insensitive substring (PRD 4173 M6)", () => {
+    const keyed = { ...qcard(12, "t"), issue_key: "ABC-12" };
+    expect(matchesQuery(keyed, "abc-12")).toBe(true);
+    expect(matchesQuery(keyed, "ABC-1")).toBe(true);
+    expect(matchesQuery(keyed, "xyz-12")).toBe(false);
+    expect(matchesQuery(qcard(12, "t"), "abc-12")).toBe(false);
   });
 });
 

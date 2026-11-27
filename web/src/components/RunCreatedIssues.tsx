@@ -1,5 +1,6 @@
 import type { Run } from "../lib/apiTypes";
 import { stripDisplayCell } from "../lib/safeText";
+import { issueRef } from "../lib/issueRef";
 
 // Reject raw ambiguity before URL can trim controls or normalize paths/authorities.
 function safeIssueUrl(raw: string): boolean {
@@ -28,7 +29,7 @@ export function RunCreatedIssues({ issues }: { issues: Run["created_issues"] }) 
   return (
     <div role="group" aria-label="Created issues" className="mt-2 space-y-1 text-sm">
       {issues.map((issue, index) => {
-        const label = stripDisplayCell(`Created issue #${issue.iid}`);
+        const label = stripDisplayCell(`Created issue ${issueRef(issue.iid, issue.issue_key)}`);
         const title = stripDisplayCell(issue.title);
         return (
           <div key={index} className="flex flex-wrap items-baseline gap-x-2">

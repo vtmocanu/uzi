@@ -65,6 +65,7 @@ func (f *fakeQuerier) GetRepoIssueSourceForUser(_ context.Context, a store.GetRe
 		IssueTrackerConnectionID: pgtype.UUID{Bytes: r.linkedConn, Valid: r.linkedConn != uuid.Nil},
 		LinkedConnectionID:       pgtype.UUID{Bytes: r.linkedConn, Valid: r.linkedConn != uuid.Nil},
 		IssueTrackerProjectID:    pgtype.Text{String: r.projectID, Valid: r.linkedConn != uuid.Nil},
+		IssueTrackerProjectShort: pgtype.Text{String: r.projectShort, Valid: r.linkedConn != uuid.Nil},
 		OpenState:                pgtype.Text{String: r.openState, Valid: r.hasStates},
 		ClosedState:              pgtype.Text{String: r.closedState, Valid: r.hasStates},
 		ColumnStates:             columnStatesJSON(r.columnStates),

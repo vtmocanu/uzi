@@ -358,7 +358,7 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 		if failedDone {
 			issueC = m.pal.doneAlarm // also on the selected row; run ids keep their selection ink
 		}
-		styledIID := paintSeg(issueC, bg, sel, "#"+itoa(int(*r.IssueIID)))
+		styledIID := paintSeg(issueC, bg, sel, issueRef(*r.IssueIID, m.renderer.Plain(r.IssueKey, tuiIssueKeyCells)))
 		titlePrefix = m.issueLink(r.RunDTO, styledIID) + paintSeg(nil, bg, false, " ")
 		avail -= visualWidth(titlePrefix)
 		avail = max(0, avail)

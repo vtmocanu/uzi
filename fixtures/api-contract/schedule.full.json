@@ -29,6 +29,7 @@
   "repo_path": "x",
   "target": "x",
   "issue_iid": 1,
+  "issue_key": "x",
   "labels": [
     "x"
   ],

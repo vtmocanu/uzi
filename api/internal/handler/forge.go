@@ -202,7 +202,77 @@ func repoToDTO(r store.Repo) apitypes.RepoDTO {
 		}
 		dto.GuardrailOverride = ov
 	}
+	if r.IssueTrackerConnectionID.Valid {
+		link := &apitypes.RepoIssueTrackerLinkDTO{
+			ConnectionID:     uuid.UUID(r.IssueTrackerConnectionID.Bytes).String(),
+			ProjectID:        r.IssueTrackerProjectID.String,
+			ProjectShortName: r.IssueTrackerProjectShort.String,
+			TagID:            r.EligibilityTagID.String,
+			TagName:          r.EligibilityTagName.String,
+		}
+		if r.IssueTrackerLinkedAt.Valid {
+			link.LinkedAt = r.IssueTrackerLinkedAt.Time
+		}
+		dto.IssueTrackerLink = link
+	}
+	// IssueTrackerLinkable is not set here: whether a link can succeed depends on the
+	// operator's allowlist and the user's connections, which the user-facing handlers
+	// resolve once per request through linkableFor.
 	return dto
+}
+
+// linkableFor reports whether the link control should be offered for a repo: it is
+// never-enabled, not already linked, and a link could succeed (offered, from
+// issueTrackerLinkOffered). Advisory only; the link service still decides (PRD #4173 M6
+// follow-up, issue #27).
+func linkableFor(r store.Repo, offered bool) bool {
+	return awaitingLink(r) && offered
+}
+
+// awaitingLink reports whether a repo could take a link at all: never enabled and not
+// yet linked. It is the part of linkableFor that needs no query.
+func awaitingLink(r store.Repo) bool {
+	return r.AwaitingFirstEnable && !r.IssueTrackerConnectionID.Valid
+}
+
+// issueTrackerLinkOffered reports whether linking is possible at all for this user: the
+// operator configured an issue tracker base URL allowlist, or the user already holds a
+// connection. A store error logs and reads as not offered, so the control stays hidden
+// rather than promising a link that may be refused (PRD #4173 M6 follow-up, issue #27).
+func (h *Handler) issueTrackerLinkOffered(ctx context.Context, userID uuid.UUID) bool {
+	if len(h.cfg.IssueTrackerAllowedBaseURLs) > 0 {
+		return true
+	}
+	conns, err := h.q.ListIssueTrackerConnectionsByUser(ctx, userID)
+	if err != nil {
+		slog.Warn("issue tracker link offer: list connections", "error", err)
+		return false
+	}
+	return len(conns) > 0
+}
+
+// repoDTOForUser is repoToDTO plus the user-facing issue_tracker_linkable flag, for the
+// handlers that answer with one repo. It runs setLinkable over that one repo, so the
+// rule lives in one place.
+func (h *Handler) repoDTOForUser(ctx context.Context, userID uuid.UUID, r store.Repo) apitypes.RepoDTO {
+	dtos := []apitypes.RepoDTO{repoToDTO(r)}
+	h.setLinkable(ctx, userID, []store.Repo{r}, dtos)
+	return dtos[0]
+}
+
+// setLinkable fills IssueTrackerLinkable on the DTOs of repos, asking
+// issueTrackerLinkOffered at most once and only if some repo could be linkable.
+func (h *Handler) setLinkable(ctx context.Context, userID uuid.UUID, repos []store.Repo, dtos []apitypes.RepoDTO) {
+	offered, asked := false, false
+	for i, rp := range repos {
+		if !awaitingLink(rp) {
+			continue
+		}
+		if !asked {
+			offered, asked = h.issueTrackerLinkOffered(ctx, userID), true
+		}
+		dtos[i].IssueTrackerLinkable = linkableFor(rp, offered)
+	}
 }
 
 // ── Config ──────────────────────────────────────────────────────────────────
@@ -679,6 +749,7 @@ func (h *Handler) ListProjects(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, d)
 	}
+	h.setLinkable(r.Context(), user.ID, repos, out)
 	httpx.JSON(w, http.StatusOK, map[string]any{"repos": out})
 }
 
@@ -801,6 +872,7 @@ func (h *Handler) ListRepos(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, d)
 	}
+	h.setLinkable(r.Context(), user.ID, repos, out)
 	httpx.JSON(w, http.StatusOK, map[string]any{"repos": out})
 }
 
@@ -905,7 +977,7 @@ func (h *Handler) SetRepoEnabled(w http.ResponseWriter, r *http.Request) {
 		h.requestInitialImport(id)
 	}
 
-	dto := repoToDTO(repo)
+	dto := h.repoDTOForUser(r.Context(), user.ID, repo)
 	dto.EnvVarCount = h.envVarCountForRepo(r.Context(), user.ID, repo.ID)
 	httpx.JSON(w, http.StatusOK, map[string]any{"repo": dto})
 }
@@ -1564,7 +1636,7 @@ func (h *Handler) PatchRepo(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	repoDTO := repoToDTO(repo)
+	repoDTO := h.repoDTOForUser(r.Context(), user.ID, repo)
 	repoDTO.EnvVarCount = h.envVarCountForRepo(r.Context(), user.ID, repo.ID)
 	response := map[string]any{"repo": repoDTO}
 	var overlap []string

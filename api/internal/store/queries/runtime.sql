@@ -774,6 +774,9 @@ WHERE r.id = @repo_id;
 SELECT sqlc.embed(r), rp.path_with_namespace AS repo_path, w.name AS worker_name,
        c.forge_type,
        i.web_url                 AS issue_web_url,   -- PRD #411: the forge issue's web URL for the run's clickable #<iid> link
+       -- PRD #4173 M6: the issue tracker project short name of a LINKED repo (empty for an unlinked or repo-less run),
+       -- so the handler derives the run's issue_key without a per-row repo read.
+       COALESCE(CASE WHEN rp.issue_tracker_connection_id IS NOT NULL AND rp.issue_tracker_project_short <> '' THEN rp.issue_tracker_project_short END, '')::text AS issue_tracker_project_short,
        -- PRD #320 D8: the DISPLAY priority class from the ONE SQL function, so the
        -- Runs-list pill and ClaimRun's ORDER BY are the same decision. @background_grace_cutoff
        -- (now − RUN_BACKGROUND_GRACE) is the D4 fail-open flag: a demoted run created
@@ -956,6 +959,9 @@ WHERE run_id = @run_id::uuid
 SELECT sqlc.embed(r), rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email,
        c.forge_type,
        i.web_url                 AS issue_web_url,   -- PRD #411: the forge issue's web URL for the run's clickable #<iid> link
+       -- PRD #4173 M6: the issue tracker project short name of a LINKED repo (empty for an unlinked or repo-less run),
+       -- so the handler derives the run's issue_key without a per-row repo read.
+       COALESCE(CASE WHEN rp.issue_tracker_connection_id IS NOT NULL AND rp.issue_tracker_project_short <> '' THEN rp.issue_tracker_project_short END, '')::text AS issue_tracker_project_short,
        -- PRD #320 D8: the DISPLAY priority class from the ONE SQL function (same as
        -- ListRunsForUser), so the admin overview pill and the claim order agree.
        -- @background_grace_cutoff (now − RUN_BACKGROUND_GRACE) is the D4 fail-open flag.
@@ -1018,6 +1024,9 @@ LIMIT 500;
 SELECT sqlc.embed(r), rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email,
        c.forge_type,
        i.web_url                 AS issue_web_url,   -- PRD #411: the forge issue's web URL for the run's clickable #<iid> link
+       -- PRD #4173 M6: the issue tracker project short name of a LINKED repo (empty for an unlinked or repo-less run),
+       -- so the handler derives the run's issue_key without a per-row repo read.
+       COALESCE(CASE WHEN rp.issue_tracker_connection_id IS NOT NULL AND rp.issue_tracker_project_short <> '' THEN rp.issue_tracker_project_short END, '')::text AS issue_tracker_project_short,
        -- PRD #320 D8: the DISPLAY priority class from the ONE SQL function (same as
        -- ListRunsForUser), so the admin overview pill and the claim order agree.
        -- @background_grace_cutoff (now − RUN_BACKGROUND_GRACE) is the D4 fail-open flag.

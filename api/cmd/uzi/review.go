@@ -710,7 +710,7 @@ func runReviewFile(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command
 	if !gf.quiet {
 		// The title is server-templated, but it is agent-influenced text reaching a TTY, so it
 		// goes through sanitizeTTY here too (defence in depth, matching the findings render).
-		p.Printf("filed issue #%d: %s\n", res.Issue.IID, sanitizeTTY(res.Issue.Title))
+		p.Printf("filed issue %s: %s\n", issueRef(res.Issue.IID, res.Issue.IssueKey), sanitizeTTY(res.Issue.Title))
 		if res.Issue.WebURL != "" {
 			p.Printf("  %s\n", res.Issue.WebURL)
 		}

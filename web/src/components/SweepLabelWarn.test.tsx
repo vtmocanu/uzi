@@ -160,3 +160,42 @@ describe("SweepLabelWarn — onCheckStateChange", () => {
     expect(mockApi.checkRepoLabels).not.toHaveBeenCalled();
   });
 });
+
+// PRD 4173 M6: a repo linked to an issue tracker has no forge labels to create, and the API
+// refuses ensureRepoLabels with 409, so the warning offers no action and says why.
+describe("SweepLabelWarn on a repo linked to an issue tracker", () => {
+  it("shows why, offers no create button, and neither checks nor creates", async () => {
+    mockApi.checkRepoLabels.mockResolvedValue({ missing: ["bug"] });
+    const states: string[] = [];
+    render(
+      <SweepLabelWarn
+        repoId="repo-atlas"
+        repoPath="vtmocanu/atlas-api"
+        labels={["bug"]}
+        linked
+        onCheckStateChange={(s) => states.push(s)}
+      />,
+    );
+    expect(screen.getByText("Labels are not created on a repo linked to an issue tracker.")).toBeTruthy();
+    expect(screen.queryByRole("button")).toBeNull();
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 400));
+    });
+    expect(mockApi.checkRepoLabels).not.toHaveBeenCalled();
+    expect(mockApi.ensureRepoLabels).not.toHaveBeenCalled();
+    // A parent holding its Enable button on the check is released at once.
+    expect(states).toEqual(["done"]);
+  });
+
+  it("says nothing when there is no selector label", () => {
+    const { container } = render(<SweepLabelWarn repoId="repo-atlas" labels={[]} linked />);
+    expect(container.textContent).toBe("");
+  });
+
+  it("control: an unlinked repo still warns and offers Create label", async () => {
+    mockApi.checkRepoLabels.mockResolvedValue({ missing: ["bug"] });
+    render(<SweepLabelWarn repoId="repo-atlas" labels={["bug"]} />);
+    expect(await screen.findByRole("button", { name: /Create label “bug”/ })).toBeTruthy();
+    expect(screen.queryByText(/linked to an issue tracker/)).toBeNull();
+  });
+});

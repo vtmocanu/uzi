@@ -50,14 +50,22 @@ func LinkedIssueGone(err error) bool {
 }
 
 // ColumnMoveRefused reports whether err is the issue tracker driver refusing a
-// card move or State write before any request: the column has no State mapped,
-// the mapping is unset, or the target State is not allowed (PRD #4173 M5). It is
-// deliberately not part of IssueWriteSkippable: a refused move may succeed once
-// the owner saves the mapping, so a caller keeps its retry marker for it.
+// card move or State write before any write: the column has no State mapped, the
+// mapping is unset, the target State is not allowed (PRD #4173 M5), the issue's
+// State field is run by a state machine (issuetracker.ErrStateMachineField), or the
+// issue's State field cannot be read as a plain one (issuetracker.ErrStateFieldUnreadable).
+// The last two are found after the driver's issue read, so each costs the State bundle
+// read and one issue GET per attempt and never a write; they heal only by a YouTrack-side
+// change (the workflow, or what the connection's account may see), not by anything the
+// owner saves in uzi. It is deliberately not part of
+// IssueWriteSkippable: a refused move may succeed later, so a caller keeps its
+// retry marker for it.
 func ColumnMoveRefused(err error) bool {
 	return errors.Is(err, issuetracker.ErrColumnNotMapped) ||
 		errors.Is(err, issuetracker.ErrStateMappingUnset) ||
-		errors.Is(err, issuetracker.ErrStateNotAllowed)
+		errors.Is(err, issuetracker.ErrStateNotAllowed) ||
+		errors.Is(err, issuetracker.ErrStateMachineField) ||
+		errors.Is(err, issuetracker.ErrStateFieldUnreadable)
 }
 
 // LinkedIssueResolved reports whether err is the issue tracker driver refusing a

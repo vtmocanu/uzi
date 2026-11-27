@@ -48,4 +48,18 @@ type Driver interface {
 	ListTags(ctx context.Context) ([]Tag, error)
 	// ListStates returns the issue states available in a project.
 	ListStates(ctx context.Context, projectID string) ([]State, error)
+	// CheckStateField reports whether uzi can write the project's State field.
+	// It returns ErrStateMachineField when a sample of the project's issues
+	// shows the field run by a state machine, ErrStateFieldUnreadable (never
+	// nil and never ErrStateMachineField for it) when a sampled issue of the
+	// project does not list the State field as a plain StateIssueCustomField
+	// only, nil when the sample is empty or its issues of the project are
+	// plain, and a plain error (never nil, never
+	// ErrStateMachineField) when the sample is not empty but holds no issue of
+	// the project, as with a stale short name. A (redacted) read error is
+	// returned when the sample cannot be read, so a failed read never counts as
+	// a pass. ErrStateMachineField wins when both kinds of issue appear. It
+	// never writes. A sample is one page of issues, so a project that mixes
+	// kinds is judged by that page only.
+	CheckStateField(ctx context.Context, project ProjectRef) error
 }

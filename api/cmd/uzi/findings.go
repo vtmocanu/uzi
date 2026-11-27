@@ -279,7 +279,7 @@ func findingStateLabel(f apitypes.IncidentalFindingDTO) string {
 		}
 	case dispStatusDone:
 		if f.SetVia == findingSetViaIssueClose && f.FiledIssueIID != nil {
-			return fmt.Sprintf("Done via #%d", *f.FiledIssueIID)
+			return "Done via " + issueRef(*f.FiledIssueIID, f.FiledIssueKey)
 		}
 	}
 	return f.Status
@@ -408,7 +408,7 @@ func runFindingsFile(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Comma
 	if !gf.quiet {
 		// The title is server-sanitised at rest, but it is agent-authored text reaching a TTY,
 		// so it goes through sanitizeTTY here too (defence in depth, matching the backlog render).
-		p.Printf("filed issue #%d: %s\n", res.Issue.IID, sanitizeTTY(res.Issue.Title))
+		p.Printf("filed issue %s: %s\n", issueRef(res.Issue.IID, res.Issue.IssueKey), sanitizeTTY(res.Issue.Title))
 		if res.Issue.WebURL != "" {
 			p.Printf("  %s\n", res.Issue.WebURL)
 		}
@@ -572,7 +572,7 @@ func runFindingsFileGroup(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.
 		}
 	} else {
 		if res.Issue != nil && !gf.quiet {
-			p.Printf("filed issue #%d: %s\n", res.Issue.IID, sanitizeTTY(res.Issue.Title))
+			p.Printf("filed issue %s: %s\n", issueRef(res.Issue.IID, res.Issue.IssueKey), sanitizeTTY(res.Issue.Title))
 			if res.Issue.WebURL != "" {
 				p.Printf("  %s\n", res.Issue.WebURL)
 			}
