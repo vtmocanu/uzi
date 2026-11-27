@@ -48,12 +48,12 @@ readonly PRIVATE_IMAGE="$REGISTRY_REF/private/base:1"
 
 log() { printf '\n### %s\n' "$*"; }
 
-pulled_registry=0 pulled_htpasswd=0 pulled_fixture=0 built_worker=0 built_run=0 tagged_private=0
+built_worker=0 built_run=0
 
 # remove_owned_container removes a container by exact name, only when it carries this run's label.
 remove_owned_container() {
   local name="$1" owner
-  owner="$(docker inspect --format "{{ index .Config.Labels \"$OWNER_LABEL\" }}" "$name" 2>/dev/null || true)"
+  owner="$(docker inspect --type container --format "{{ index .Config.Labels \"$OWNER_LABEL\" }}" "$name" 2>/dev/null || true)"
   if [[ $owner == "$token" ]]; then
     docker rm -f "$name" >/dev/null 2>&1 || true
   fi
@@ -71,12 +71,11 @@ cleanup() {
       docker rmi -f "$ref" >/dev/null 2>&1 || true
     fi
   done < <(docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null || true)
-  if [[ $tagged_private == 1 ]]; then docker rmi "$PRIVATE_IMAGE" >/dev/null 2>&1 || true; fi
+  # The private tag is unique to this run (its registry port is part of the name), so it is always
+  # attempted, whatever step failed; it only untags when it shares an image id with the pinned fixture.
+  docker rmi "$PRIVATE_IMAGE" >/dev/null 2>&1 || true
   if [[ $built_run == 1 ]]; then docker rmi "$RUN_IMAGE" >/dev/null 2>&1 || true; fi
   if [[ $built_worker == 1 && -z ${DCP_WORKER_IMAGE:-} ]]; then docker rmi "$WORKER_IMAGE" >/dev/null 2>&1 || true; fi
-  if [[ $pulled_fixture == 1 ]]; then docker rmi "$FIXTURE_IMAGE" >/dev/null 2>&1 || true; fi
-  if [[ $pulled_htpasswd == 1 ]]; then docker rmi "$HTPASSWD_IMAGE" >/dev/null 2>&1 || true; fi
-  if [[ $pulled_registry == 1 ]]; then docker rmi "$REGISTRY_IMAGE" >/dev/null 2>&1 || true; fi
   if [[ -n ${SEED_CONFIG:-} ]]; then rm -rf "$SEED_CONFIG"; fi
   if [[ -n ${HTPASSWD_DIR:-} ]]; then rm -rf "$HTPASSWD_DIR"; fi
   if [[ -n ${RUN_CTX:-} ]]; then rm -rf "$RUN_CTX"; fi
@@ -84,11 +83,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Pinned public images are pulled when absent and then left in place: another job on the shared
+# daemon may use them, so this run never removes an image only because it pulled it.
 ensure_image() {
-  local ref="$1" flag="$2"
+  local ref="$1"
   if ! docker image inspect "$ref" >/dev/null 2>&1; then
     docker pull -q "$ref" >/dev/null
-    printf -v "$flag" '%s' 1
   fi
 }
 
@@ -125,8 +125,8 @@ DOCKER_BUILDKIT=1 docker build -q -t "$RUN_IMAGE" --label "$OWNER_LABEL=$token" 
 built_run=1
 
 # 3. A password-protected private registry published on the daemon host's loopback.
-ensure_image "$REGISTRY_IMAGE" pulled_registry
-ensure_image "$HTPASSWD_IMAGE" pulled_htpasswd
+ensure_image "$REGISTRY_IMAGE"
+ensure_image "$HTPASSWD_IMAGE"
 HTPASSWD_DIR="$(mktemp -d "$OUT/htpasswd.XXXXXX")"
 docker create --name "$HTPASSWD_NAME" --label "$OWNER_LABEL=$token" -i --entrypoint htpasswd "$HTPASSWD_IMAGE" -Bin "$UZI_DCP_USER" >/dev/null
 printf '%s' "$UZI_DCP_PASS" | docker start -a -i "$HTPASSWD_NAME" >"$HTPASSWD_DIR/htpasswd"
@@ -156,16 +156,13 @@ if [[ $ready != 1 ]]; then
   docker logs "$REGISTRY_NAME" 2>&1 | tail -20 >&2 || true
   exit 1
 fi
-ensure_image "$FIXTURE_IMAGE" pulled_fixture
+ensure_image "$FIXTURE_IMAGE"
 docker tag "$FIXTURE_IMAGE" "$PRIVATE_IMAGE"
-tagged_private=1
 DOCKER_CONFIG="$SEED_CONFIG" docker push -q "$PRIVATE_IMAGE" >/dev/null
 docker rmi "$PRIVATE_IMAGE" >/dev/null
-tagged_private=0
 # Without credentials the registry must refuse the seeded image (the positive control for the refused-pull steps).
 if DOCKER_CONFIG="$OUT/nocreds-$token" docker pull -q "$PRIVATE_IMAGE" >/dev/null 2>&1; then
   echo "FAIL: the private registry served an image without credentials" >&2
-  tagged_private=1
   exit 1
 fi
 

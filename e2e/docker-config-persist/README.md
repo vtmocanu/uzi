@@ -29,7 +29,7 @@ Per mode (`off`, plus `required` when `uzi-codex-command-sandbox --probe` exits 
 | g | (required only) another run's `.docker` is not writable from this run's sandbox |
 
 A Claude leg runs the same login-then-pull as `runner` (10002) with `DOCKER_CONFIG` set explicitly;
-the `buildSdkEnv` wiring lands in a later milestone. When Landlock is unavailable the script prints
+the value `buildSdkEnv` sets; that wiring is pinned by `agent/test/sdk-env.test.ts`, not by this leg. When Landlock is unavailable the script prints
 `required: NOT PROVEN` and does not count it as passing.
 
 Isolation: every container and image is named `dcp-test-<hex>-*`, containers are labeled

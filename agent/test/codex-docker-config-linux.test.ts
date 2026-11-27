@@ -216,7 +216,7 @@ describe("Codex command Docker login persistence (Linux packaged profile)", { sk
     });
   });
 
-  it("Claude leg: a login in one runner process persists to a later separate process (DOCKER_CONFIG set explicitly; buildSdkEnv wiring lands in m2)", async () => {
+  it("Claude leg: a login in one runner process persists to a later separate process (DOCKER_CONFIG set explicitly to the value buildSdkEnv sets)", async () => {
     const claudeHome = `${HOME_ROOT}/${uniq("dcp-claude")}`;
     await fs.mkdir(claudeHome);
     await fs.chmod(claudeHome, 0o2770);

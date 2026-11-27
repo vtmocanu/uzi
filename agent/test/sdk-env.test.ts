@@ -196,6 +196,25 @@ describe("buildSdkEnv", () => {
     assert.strictEqual(env.HOME, HOME_DIR);
   });
 
+  it("sets DOCKER_CONFIG to <home>/.docker exactly when the daemon is wired; no tool or run variable can move it (PRD #4416 M3)", () => {
+    const DIND = "unix:///run/dind/docker.sock";
+    const cred = { kind: "oauth", token: FAKE_OAUTH } as const;
+    assert.strictEqual(buildSdkEnv(cred, HOME_DIR, {}, DIND).DOCKER_CONFIG, `${HOME_DIR}/.docker`);
+    assert.ok(!("DOCKER_CONFIG" in buildSdkEnv(cred, HOME_DIR)), "absent when no daemon is wired");
+    assert.ok(!("DOCKER_CONFIG" in buildSdkEnv(cred, HOME_DIR, { DOCKER_CONFIG: "/evil/.docker" })), "a provisioned var is dropped when unwired");
+    assert.strictEqual(buildSdkEnv(cred, HOME_DIR, { DOCKER_CONFIG: "/evil/.docker" }, DIND).DOCKER_CONFIG, `${HOME_DIR}/.docker`);
+    const prior = process.env.UZI_UID_SPLIT;
+    process.env.UZI_UID_SPLIT = "1";
+    try {
+      const vars = [{ var_id: "0b8d7a52-91c4-4e0f-8a36-5d2f9c1e7b45", scope: "repo", rev: 1, name: "DOCKER_CONFIG", value: "/user/.docker", secret: false, description: "" }] as const;
+      const injection = { vars: [...vars], set: sdkRunEnvInjected(vars, cred, HOME_DIR, {}) };
+      assert.strictEqual(buildSdkEnv(cred, HOME_DIR, {}, DIND, undefined, undefined, undefined, injection).DOCKER_CONFIG, `${HOME_DIR}/.docker`);
+      assert.ok(!("DOCKER_CONFIG" in buildSdkEnv(cred, HOME_DIR, {}, undefined, undefined, undefined, undefined, injection)), "a user variable never supplies it when unwired");
+    } finally {
+      if (prior === undefined) delete process.env.UZI_UID_SPLIT; else process.env.UZI_UID_SPLIT = prior;
+    }
+  });
+
   it("never lets tool env overwrite a protected key (credential, HOME, ANTHROPIC_*)", () => {
     // filterShellenv already drops these, but buildSdkEnv is defensive too — the
     // ANTHROPIC_* keys must stay undefined so nothing outranks the OAuth token.

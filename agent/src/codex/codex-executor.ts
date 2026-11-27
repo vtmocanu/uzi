@@ -6042,7 +6042,7 @@ export class CodexExecutor implements Executor {
         capturedMemory,
         // Issue #4416: the run home's `.docker` is granted to model commands so a Docker login
         // persists across them. Never to a cross-check run, the fileop root or a boundary process.
-        (ctx.kind as string | undefined) === "cross_check" ? undefined : path.join(this.homeRoot, ".docker"),
+        runDockerConfigDir(ctx.kind as string | undefined, this.homeRoot),
       );
       const spawnCommand: SpawnCommandSeam = (argv, spawnOpts) => this.lifetime.admit(() => baseSpawnCommand(argv, { ...spawnOpts, env: commandEnv }));
       // Issue #1598: least privilege: the fileop helper never runs Go or npm, so it gets no
@@ -8471,6 +8471,12 @@ async function launchRegisteredEffectRoot(
     throw new TrustedExecutionRefusal(`${kind} root failed registry admission`);
   }
   return { handle, root };
+}
+
+/** Issue #4416: the Docker client config directory granted to a run's model commands: the run
+ *  home's `.docker`, except for a cross-check run, which is never granted one. */
+export function runDockerConfigDir(kind: string | undefined, homeRoot: string): string | undefined {
+  return kind === "cross_check" ? undefined : path.join(homeRoot, ".docker");
 }
 
 /** Build the fixed argv for the root-owned Landlock wrapper used by uid 10003.

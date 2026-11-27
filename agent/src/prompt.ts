@@ -1307,7 +1307,7 @@ export function interruptedCallsNote(calls: InterruptedCalls | undefined): strin
 /** Docker scratch is transient across pauses, independent of session and working-tree recovery. */
 export function dockerScratchResumeNote(dockerScratchResume: boolean | undefined): string {
   return dockerScratchResume
-    ? "Docker containers and volumes from before the pause may be gone. Recreate your Docker fixtures before relying on them."
+    ? "Docker containers and volumes from before the pause may be gone. Recreate your Docker fixtures before relying on them. A registry login (`docker login`) made before the pause may also be gone: if a pull or build is refused for authentication, log in again."
     : "";
 }
 
