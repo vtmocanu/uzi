@@ -10,7 +10,6 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/issuetracker/youtracktest"
-	"github.com/vtmocanu/uzi/api/internal/issuetrackersvc"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -168,6 +167,13 @@ func TestLinkedBoardMoveToAnUnmappedColumnIsRefusedLiveDB(t *testing.T) {
 // A drag on a repo whose project's State field a state machine runs (set up after the
 // mapping was saved) is a 409 with the state-machine reason; the YouTrack fake sees no write
 // and the cache is unchanged so the card snaps back.
+// youTrackStateMachineReason is the state-machine refusal exactly as it read before PRD
+// #4765 A1 moved its remedy into the driver's error: the real YouTrack driver must still
+// produce it word for word.
+const youTrackStateMachineReason = "project " + youtracktest.ProjectShortName +
+	" uses a state-machine workflow on its State field; uzi needs a plain State field. " +
+	"Link a project with a plain State field, or remove the state-machine rule from the State field in YouTrack."
+
 func TestLinkedBoardDragOnAStateMachineProjectIs409LiveDB(t *testing.T) {
 	f := newStateMappingFixture(t)
 	f.boardMapping(t)
@@ -175,7 +181,7 @@ func TestLinkedBoardDragOnAStateMachineProjectIs409LiveDB(t *testing.T) {
 	f.srv.ResetRequests()
 
 	code, body := f.move("In Progress")
-	if code != http.StatusConflict || !strings.Contains(body, issuetrackersvc.StateMachineRefusal(youtracktest.ProjectShortName)) {
+	if code != http.StatusConflict || !strings.Contains(body, youTrackStateMachineReason) {
 		t.Fatalf("move = %d %s, want 409 with the state-machine reason", code, body)
 	}
 	f.assertNoYouTrackWrites(t)

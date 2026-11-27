@@ -197,7 +197,7 @@ func TestLinkRepoLiveDB(t *testing.T) {
 		h.stateFieldErr = issuetracker.ErrStateMachineField
 		repo := h.freshRepo()
 		e := wantKind(t, h.link(repo), KindConflict)
-		if e.Message != StateMachineRefusal("UZI") {
+		if e.Message != StateMachineRefusal("UZI", issuetracker.ErrStateMachineField) {
 			t.Fatalf("message = %q", e.Message)
 		}
 		if r := h.repoRow(repo); r.IssueTrackerConnectionID.Valid || r.IssueTrackerProjectID.Valid || !r.AwaitingFirstEnable {

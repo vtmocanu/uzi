@@ -240,7 +240,9 @@ func TestStateMappingRefusesAStoredInvalidProjectID(t *testing.T) {
 	h := newHarness(t)
 	user := uuid.New()
 	ctx := context.Background()
-	for _, bad := range []string{"", "abc", "0-1/../x", "1-", "0-1\n"} {
+	// Ids the stored shape refuses for every kind (PRD #4765 A1); a kind's own grammar
+	// (YouTrack's "0-1") is the driver's check, tested in the issuetracker package.
+	for _, bad := range []string{"", "a/b", "0-1/../x", "-1", "0-1\n", "a?b"} {
 		repo := linkedFakeRepo(t, h, user, bad)
 		// The id is refused before a driver is built, so no request can carry it.
 		h.template.listStatesErr = errors.New("must not be reached")
