@@ -67,6 +67,9 @@ type Handler struct {
 	// handler copies accepted Anthropic readings through; nil means h.q (issue #4692).
 	anthropicHistory anthropicUsageHistory
 	cfg              config.Config
+	// moduleData is the per-user module document store seam (issue #4784); nil in
+	// production means the pool-backed implementation. Tests inject failures.
+	moduleData moduleUserDataStore
 	// secretTestProbeContext is a test-only deadline arm; nil retains the real probe budget.
 	secretTestProbeContext func(context.Context, time.Duration) (context.Context, context.CancelFunc)
 	// oauthBeginTx, when non-nil, replaces h.pool.Begin as the transaction source of the OAuth
@@ -1013,6 +1016,10 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 	r := chi.NewRouter()
 	r.Use(chimw.Recoverer)
 	r.Use(chimw.RequestID)
+	// Issue #4784: every /api/modules/ response is no-store. It is at the root, not in
+	// mountModuleRoutes, because chi answers 405 for a method missing from a route's
+	// methodMap before any subrouter middleware runs.
+	r.Use(moduleUserDataNoStore)
 
 	r.Route("/api", func(r chi.Router) {
 		r.Get("/health", h.Health)
@@ -1037,6 +1044,7 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		// the Put or it clobbers the PUT method (the two were Route-then-Put inline).
 		h.mountJudgeRoutes(r, forgeLimiter)
 		h.mountMeRoutes(r, authLimiter)
+		h.mountModuleRoutes(r)
 		h.mountSchedulesRoutes(r, forgeLimiter)
 		h.mountVaultRoutes(r, authLimiter)
 		h.mountSlackRoutes(r, slackDMLimiter)
