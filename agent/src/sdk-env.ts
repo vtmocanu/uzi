@@ -294,7 +294,9 @@ export function sdkRunEnvInjected(
  *                   is the TMPDIR instead of the shared runner TMPDIR; undefined ⇒ unchanged.
  * @param runEnv     PRD #4416 M2: the run's user variables. Lead-lane spawn sites only. Folded in
  *                   right after the toolEnv fold with the lowest precedence (see foldRunEnv); every
- *                   worker-set key below still wins; its `set`, when given, is the precomputed
+ *                   worker-set key below still wins, except the optional GOMEMLIMIT default
+ *                   (WORKER_GO_MEMLIMIT), which yields to an injected GOMEMLIMIT run variable
+ *                   (see applyGoMemLimitDefault); its `set`, when given, is the precomputed
  *                   list the fold applies (see {@link sdkRunEnvInjected}). Undefined ⇒ the env is
  *                   byte-identical to before.
  */
