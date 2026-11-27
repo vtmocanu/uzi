@@ -617,6 +617,59 @@ describe("AdminSharedProviders — organization key card", () => {
     expect(screen.getByTestId("probe-results-o1").textContent).not.toMatch(/Authentication worked/);
   });
 
+  it("shows the written key state and no old verdict when the refresh after a replace fails", async () => {
+    mockApi.adminPutOperatorKey.mockResolvedValue({ provider: operator() });
+    await testedCard();
+    mockApi.adminListSharedProviders.mockRejectedValue(new Error("network down"));
+    fireEvent.change(screen.getByLabelText("Organization key"), { target: { value: "next-key" } });
+    fireEvent.click(screen.getByRole("button", { name: "Replace organization key for org-gateway" }));
+    await waitFor(() => expect(screen.getByTestId("probe-results-o1").textContent).toMatch(/Not tested yet/));
+    expect(screen.getByTestId("probe-results-o1").textContent).not.toMatch(/Authentication worked/);
+  });
+
+  it("shows the key disabled and no old verdict when the refresh after a disable fails", async () => {
+    mockApi.adminSetOperatorKeyEnabled.mockResolvedValue({ provider: operator({ operator_key: { present: true, enabled: false } }) });
+    await testedCard();
+    mockApi.adminListSharedProviders.mockRejectedValue(new Error("network down"));
+    fireEvent.click(screen.getByRole("button", { name: "Disable organization key for org-gateway" }));
+    await waitFor(() => expect(screen.getByTestId("key-status-o1").textContent).toMatch(/Key set, disabled/));
+    expect(screen.getByTestId("probe-results-o1").textContent).toMatch(/Not tested yet/);
+  });
+
+  it("shows the key gone when the refresh after a key delete fails", async () => {
+    mockApi.adminDeleteOperatorKey.mockResolvedValue({ provider: operator({ operator_key: { present: false, enabled: false } }) });
+    await testedCard();
+    mockApi.adminListSharedProviders.mockRejectedValue(new Error("network down"));
+    fireEvent.click(screen.getByRole("button", { name: "Delete organization key for org-gateway" }));
+    const group = screen.getByRole("group", { name: "Confirm deleting the organization key of org-gateway" });
+    fireEvent.click(within(group).getByRole("button", { name: "Delete key" }));
+    await waitFor(() => expect(screen.getByTestId("key-status-o1").textContent).toMatch(/No key set/));
+    expect(screen.getByTestId("probe-results-o1").textContent).toMatch(/Not tested yet/);
+  });
+
+  it("shows this Test's result when the refresh after a Test fails", async () => {
+    const probe = { auth_result: "rejected" as const, tool_result: "not_run" as const, probed_at: "2026-11-21T00:00:00Z" };
+    mockApi.adminTestOperatorKey.mockResolvedValue({ probe });
+    await renderPage([operator()]);
+    mockApi.adminListSharedProviders.mockRejectedValue(new Error("network down"));
+    fireEvent.click(screen.getByRole("button", { name: "Test organization key for org-gateway" }));
+    await waitFor(() => expect(screen.getByTestId("probe-results-o1").textContent).toMatch(/Authentication rejected/));
+  });
+
+  it("says an organization-key definition is staged, not usable by users, on create", async () => {
+    mockApi.adminCreateSharedProvider.mockResolvedValue({ provider: operator() });
+    mockApi.adminListSharedProviders.mockResolvedValue({ providers: [operator()] });
+    const form = await openOperatorForm();
+    fireEvent.change(form.getByLabelText("Provider name"), { target: { value: "org-gateway" } });
+    fireEvent.change(form.getByLabelText("Base URL"), { target: { value: URL_B } });
+    fireEvent.change(form.getByLabelText("Haiku model (required)"), { target: { value: "gw-small" } });
+    fireEvent.click(form.getByRole("checkbox", { name: /acknowledge/i }));
+    fireEvent.click(form.getByRole("button", { name: "Create shared provider" }));
+    const notice = await screen.findByText(/Shared provider org-gateway created/);
+    expect(notice.textContent).toMatch(/Staged: set its organization key next; it is not yet available to users/);
+    expect(notice.textContent).not.toMatch(/attach their own key/);
+  });
+
   it("does not mention an organization key in the delete copy when none is set", async () => {
     mockApi.adminDeleteSharedProvider.mockResolvedValue({ deleted: true, deleted_key_count: 0 });
     await renderPage([operator({ operator_key: { present: false, enabled: false } })]);

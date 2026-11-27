@@ -133,7 +133,12 @@ export function AdminSharedProviders() {
     [],
     { fallback: "Failed to load the shared providers" },
   );
-  const providers = data?.providers ?? [];
+  // Authoritative server answers to key writes, shown over the loaded list until a list load
+  // succeeds (a new `data`), so a failed refresh never leaves the pre-write state on screen.
+  const [applied, setApplied] = useState<Record<string, AdminSharedProvider>>({});
+  useEffect(() => { setApplied({}); }, [data]);
+  const providers = (data?.providers ?? []).map((p) => applied[p.id] ?? p);
+  const apply = (p: AdminSharedProvider) => setApplied((prev) => ({ ...prev, [p.id]: p }));
   const [creating, setCreating] = useState(false);
   const [editing, setEditing] = useState<string | null>(null);
   const [confirm, setConfirm] = useState<Confirm>(null);
@@ -162,7 +167,9 @@ export function AdminSharedProviders() {
       description={
         <>
           Shared providers are Claude or Codex gateways any user can pick as their source for that engine. You fix the
-          engine, endpoint and auth style and map the models; each user attaches their own key, which you never see.
+          engine, endpoint and auth style and map the models. With a per-user key, each user attaches their own key, which
+          you never see. With an organization key, you set one key for the definition; that mode is staged and not yet
+          available to users.
         </>
       }
     >
@@ -179,7 +186,11 @@ export function AdminSharedProviders() {
       )}
 
       {creating ? (
-        <CreateForm allowed={data?.allowed ?? []} onCancel={() => setCreating(false)} onCreated={(p) => done(`Shared provider ${sanitizeLabel(p.name)} created. Users can now attach their own key to it.`)} />
+        <CreateForm allowed={data?.allowed ?? []} onCancel={() => setCreating(false)} onCreated={(p) => done(
+          p.credential_mode === "operator_key"
+            ? `Shared provider ${sanitizeLabel(p.name)} created. Staged: set its organization key next; it is not yet available to users.`
+            : `Shared provider ${sanitizeLabel(p.name)} created. Users can now attach their own key to it.`,
+        )} />
       ) : (
         !loading &&
         providers.length > 0 && (
@@ -215,6 +226,7 @@ export function AdminSharedProviders() {
                   onAsk={(kind) => { setNotice(""); setConfirm({ kind, id: p.id }); }}
                   onCancel={() => setConfirm(null)}
                   onDone={done}
+                  onApply={apply}
                   onStale={reload}
                 />
               )}
@@ -251,6 +263,7 @@ function ProviderCard({
   onAsk,
   onCancel,
   onDone,
+  onApply,
   onStale,
 }: {
   provider: AdminSharedProvider;
@@ -259,6 +272,7 @@ function ProviderCard({
   onAsk: (kind: "retire" | "delete") => void;
   onCancel: () => void;
   onDone: (message: string) => Promise<void>;
+  onApply: (p: AdminSharedProvider) => void;
   onStale: () => Promise<void>;
 }) {
   const name = sanitizeLabel(p.name);
@@ -334,7 +348,7 @@ function ProviderCard({
         )}
       </ul>
 
-      {p.credential_mode === "operator_key" && <OperatorKeyPanel provider={p} name={name} onDone={onDone} onStale={onStale} />}
+      {p.credential_mode === "operator_key" && <OperatorKeyPanel provider={p} name={name} onDone={onDone} onApply={onApply} onStale={onStale} />}
 
       <FixedFacts baseUrl={p.base_url} auth={p.auth_style} />
 
@@ -423,11 +437,13 @@ function OperatorKeyPanel({
   provider: p,
   name,
   onDone,
+  onApply,
   onStale,
 }: {
   provider: AdminSharedProvider;
   name: string;
   onDone: (message: string) => Promise<void>;
+  onApply: (p: AdminSharedProvider) => void;
   onStale: () => Promise<void>;
 }) {
   const key = p.operator_key ?? { present: false, enabled: false };
@@ -466,7 +482,7 @@ function OperatorKeyPanel({
     // Clear first: the key must not outlive the attempt, whatever its outcome.
     setDraft("");
     return run(async () => {
-      await api.adminPutOperatorKey(p.id, value);
+      onApply((await api.adminPutOperatorKey(p.id, value)).provider);
       await onDone(`Organization key for ${name} saved.`);
     }, "Failed to save the organization key");
   };
@@ -537,7 +553,7 @@ function OperatorKeyPanel({
                 size="sm"
                 disabled={working}
                 onClick={() => void run(async () => {
-                  await api.adminSetOperatorKeyEnabled(p.id, !key.enabled);
+                  onApply((await api.adminSetOperatorKeyEnabled(p.id, !key.enabled)).provider);
                   await onDone(`Organization key for ${name} ${key.enabled ? "disabled" : "enabled"}.`);
                 }, "Failed to change the organization key")}
                 aria-label={`${key.enabled ? "Disable" : "Enable"} organization key for ${name}`}
@@ -560,8 +576,9 @@ function OperatorKeyPanel({
                 setTesting(true);
                 try {
                   await run(async () => {
-                    await api.adminTestOperatorKey(p.id);
-                    // Show the server's stored result, not a copy kept on this card.
+                    // The 200 body is the stored result for the current tuple: show it now, then reload.
+                    const { probe } = await api.adminTestOperatorKey(p.id);
+                    onApply({ ...p, operator_key: { ...key, probe } });
                     await onStale();
                   }, "Failed to test the organization key");
                 } finally {
@@ -607,7 +624,7 @@ function OperatorKeyPanel({
           actions={
             <>
               <Button variant="dangerSolid" size="sm" disabled={working} onClick={() => void run(async () => {
-                await api.adminDeleteOperatorKey(p.id);
+                onApply((await api.adminDeleteOperatorKey(p.id)).provider);
                 setConfirmingDelete(false);
                 await onDone(`Organization key for ${name} deleted.`);
               }, "Failed to delete the organization key")}>
