@@ -17,7 +17,7 @@ import (
 )
 
 // These LiveDB tests pin issue #4692 M1: the two best-effort history copies
-// (CopyAnthropicUsageSample / CopyCodexUsageSample) and the 00536 tables. Every fence test
+// (CopyAnthropicUsageSample / CopyCodexUsageSample) and the 00547 tables. Every fence test
 // goes through the production generated functions and isolates ONE guard: the gauge is
 // written by the real upsert, and the copy is then called with parameters that differ from
 // the gauge in exactly one respect (or the gauge is moved on by exactly one real write).

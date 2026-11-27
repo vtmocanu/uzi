@@ -53,7 +53,7 @@ type CopyAnthropicUsageSampleParams struct {
 }
 
 // Provider usage-limit history (issue #4692, M1): the two best-effort copies from an
-// accepted gauge reading into the raw five-minute sample tables (00536). Each is ONE
+// accepted gauge reading into the raw five-minute sample tables (00547). Each is ONE
 // autocommit INSERT ... SELECT ... ON CONFLICT DO NOTHING, run by the caller AFTER its gauge
 // write succeeded. There is no transaction, no SET LOCAL, no FOR SHARE and no advisory lock:
 // every guard is a plain read in the same snapshot as the insert, and the only implicit lock

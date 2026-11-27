@@ -1,6 +1,6 @@
 ---
 title: Provider usage-limit history
-order: 70
+order: 72
 audience: operator
 ---
 
@@ -106,7 +106,7 @@ image. Only when the pages changed since the last checkpoint does it drop to abo
 The cost is expected to grow roughly in proportion to identities and years (only one
 identity-year was measured), and leaves dead rows for autovacuum.
 
-Rolling the migration back (the Down section of `00536_provider_usage_samples.sql`) drops both
+Rolling the migration back (the Down section of `00547_provider_usage_samples.sql`) drops both
 tables and their history. Take a database backup first; it is the only recovery. Each
 `DROP TABLE` also takes an `ACCESS EXCLUSIVE` lock on `users` (to drop the foreign-key
 triggers), and the Down section sets no lock timeout, so a rollback can wait behind a long reader
