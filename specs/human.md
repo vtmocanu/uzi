@@ -2093,7 +2093,7 @@ PRD at `prds/done/4686-runtime-web-modules.md`.
 
 PRD at `prds/done/4691-pr-merge-close-history.md`.
 
-- uzi records PR merge/close history: a per-PR head plus append-only transition events, written in the same statement as `runs.mr_state`. The forge's own merge/close time is kept apart from uzi's observation time (an event with no provider time is marked as an observation fallback), a PR's first observation is a bootstrap event, and the first merge is recorded once. Expiry is off by default: rows go with their repository unless an operator opts into age-based expiry of ordinary events with `UZI_HISTORY_RETENTION` (#4695); the heads and `first_merge` events are exempt. Nothing reads it yet. Only the connection owner's observations are recorded, and the watcher's coverage limits apply (`docs/pr-history.md`). (AI-synced 2026-11-25) (AI-synced 2026-11-27)
+- uzi records PR merge/close history: a per-PR head plus append-only (except opt-in age-based expiry) transition events, written in the same statement as `runs.mr_state`. The forge's own merge/close time is kept apart from uzi's observation time (an event with no provider time is marked as an observation fallback), a PR's first observation is a bootstrap event, and the first merge is recorded once. Expiry is off by default: rows go with their repository unless an operator opts into age-based expiry of ordinary events with `UZI_HISTORY_RETENTION` (#4695); the heads and `first_merge` events are exempt. Nothing reads it yet. Only the connection owner's observations are recorded, and the watcher's coverage limits apply (`docs/pr-history.md`). (AI-synced 2026-11-25) (AI-synced 2026-11-27)
 
 ## Feature #4695: Opt-in history retention
 

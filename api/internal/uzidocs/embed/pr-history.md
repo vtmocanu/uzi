@@ -92,8 +92,9 @@ whose `observed_at` is older than that age. Deletes are irreversible.
 - **A pruned PR can start mid-stream.** Its remaining events begin after the
   expired ones, and an old PR can show `first_merged_at` on its head with no
   ordinary events left.
-- **Kept rows grow.** `first_merge` events and heads are never expired, so they
-  grow by one each per merged PR.
+- **Kept rows grow.** `first_merge` events and heads are never expired. Heads
+  grow by one per PR uzi records (any state); `first_merge` events grow by one per
+  merged PR.
 - **Size.** Each PR state change inserts one event row and upserts the PR's single
   head row. Measured on PostgreSQL 17 after 10,000 PRs with 3 events each: about
   223 B per event row and about 206 B per head row in total relation size.

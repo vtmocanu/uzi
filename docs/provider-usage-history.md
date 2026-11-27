@@ -118,8 +118,9 @@ Rolling the migration back (the Down section of `00547_provider_usage_samples.sq
 tables and their history. Take a database backup first; it is the only recovery. Each
 `DROP TABLE` also takes an `ACCESS EXCLUSIVE` lock on `users` (to drop the foreign-key
 triggers). The Down section starts with `SET LOCAL lock_timeout = '5s'`, so a rollback that
-cannot take its locks within 5 seconds fails and rolls back rather than waiting; until then it
-can block queries on `users`. Run it when the database is quiet.
+cannot take a lock within 5 seconds fails and rolls back rather than waiting. The timeout applies
+to each lock wait, so each `DROP TABLE` can wait up to 5 seconds and the rollback can block queries
+on `users` for roughly 10 seconds in total before failing. Run it when the database is quiet.
 
 ## Growth
 

@@ -1275,7 +1275,7 @@ CI-watch artifact inputs reuse sealed job-file storage, the per-owner and instan
 
 ## History retention (issue #4695)
 
-uzi records three kinds of analytics history that nothing deletes by age: [PR merge and close history](pr-history.md), [provider usage history](provider-usage-history.md) (Anthropic and Codex) and [worker capacity samples](worker-capacity-samples.md). Age-based expiry is opt-in.
+uzi records three kinds of analytics history that nothing deletes by age by default: [PR merge and close history](pr-history.md), [provider usage history](provider-usage-history.md) (Anthropic and Codex) and [worker capacity samples](worker-capacity-samples.md). Age-based expiry is opt-in.
 
 | Var | Default | Notes |
 |---|---|---|
@@ -1302,7 +1302,7 @@ The `history_retention` sweeper pass (`api/internal/historyretention/retention.g
 
 Measured on PostgreSQL 17 with synthetic data; they are figures to size from, not predictions for your workload.
 
-- PR history: about 223 B per `pr_history_events` row and about 206 B per `pr_history_heads` row (10,000 PRs, 3 events each). Kept `first_merge` rows and heads grow by one per merged PR.
+- PR history: about 223 B per `pr_history_events` row and about 206 B per `pr_history_heads` row (10,000 PRs, 3 events each). Heads grow by one per PR uzi records (any state); kept `first_merge` events grow by one per merged PR.
 - Anthropic usage: about 22.9 MB per identity-year.
 - Codex usage: about 70 MB per typical identity-year and 224 MB for the largest measured; a less compressible admissible sample takes more still.
 - Worker capacity: about 22 MiB per worker-year (218 B per row).
@@ -1317,16 +1317,16 @@ The per-profile tables are in [provider usage history](provider-usage-history.md
 - A table whose 50-row batch still exceeds 300 ms makes no progress, and the warning names it.
 - The first enable drains at most 1000 rows per table per tick. With full batches, that outpaces the stated sample workload of about 1000 rows per minute per table only while `SWEEP_INTERVAL` (default `15s`) is under 60 s. That is a theoretical ceiling: actual drain depends on the cadence, the committed batch sizes and failed ticks.
 
-Measured (PostgreSQL 17, 1M-row synthetic fixtures, compressed time; one workload, so indications only): with the shipped indexes there were no statement timeouts in a backlog drain or a churn run on any of the four tables. In a 5-minute real-engine smoke the slowest tick took 35 ms and 20,000 rows were deleted per table in 20 ticks. Cold first ticks took under 14 ms; "cold" there means emptied PostgreSQL buffers, not an emptied host cache. PostgreSQL 16 was not measured.
+Measured (PostgreSQL 17, 1M-row synthetic fixtures, compressed time; one workload, so indications only): with the shipped indexes there were no statement timeouts in a backlog drain or a churn run on any of the four tables. In a 5-minute real-engine smoke (about 30,000 to 35,000 expired rows per table on the 1M-row fixtures, no writer) the slowest tick took 35 ms and 20,000 rows were deleted per table in 20 ticks. A cold first batch on one table took under 16 ms including open and close (the delete statement under 14 ms); "cold" there means emptied PostgreSQL buffers, not an emptied host cache. PostgreSQL 16 was not measured.
 
 ### Indexes and the boot-time build
 
 Migrations 00549 to 00552 add four btree indexes: `pr_history_events (observed_at) WHERE NOT first_merge`, and one on `bucket_start` for each of the three sample tables. They are built with `CREATE INDEX CONCURRENTLY` at boot, one non-transactional migration each, and they are built and maintained **even while retention is off**. The migration comments carry the measurements behind the choice of btree over BRIN.
 
 - **Do not drop them.** Without a valid index each batch sorts every expired row and will likely hit the statement timeout.
-- **The build can be slow.** `CREATE INDEX CONCURRENTLY` waits for every older transaction in the database, twice per index, and the four builds run back to back. While one runs it blocks VACUUM and autovacuum on that table, and the index's write-ahead log is shipped to replicas.
+- **The build can be slow.** `CREATE INDEX CONCURRENTLY` waits for transactions that modified the table before each of its two scans, then for every transaction holding an older snapshot, and the four builds run back to back. While one runs it blocks VACUUM and autovacuum on that table, and the index's write-ahead log is shipped to replicas.
 - **The API is down during the build anyway** (the chart's api Deployment uses `Recreate`), so the upgrade is not zero-downtime.
-- **A slow or blocked build can crash-loop the API.** The chart's `startupProbe` allows 300 s (`periodSeconds: 5` times `failureThreshold: 60` in `deploy/chart/values.yaml`); the kubelet kills a pod that is still migrating after that. On large tables, or with long-running database clients, raise `startupProbe.failureThreshold` for the upgrade.
+- **A slow or blocked build can crash-loop the API.** The chart's `startupProbe` allows 300 s (`periodSeconds: 5` times `failureThreshold: 60` in `deploy/chart/values.yaml`); the kubelet kills a pod that is still migrating after that. On large tables, or with long-running database clients, raise `api.startupProbe.failureThreshold` for the upgrade.
 - **Building the index by hand first does not help.** The migration drops and rebuilds a same-named index that no migration recorded.
 - **Recovery** from an interrupted build is to restart the API: the migration is re-run from its `DROP INDEX`.
 - **Exactly one migrating API process per database**, on every deployment path. The migration relies on a single migrator, and two at once can drop each other's build. For the chart that means `api.replicaCount: 1` during the upgrade, which the chart does not enforce; for Docker Compose, one stack per database.

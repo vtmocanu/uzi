@@ -344,7 +344,7 @@ api:
     # UZI_JOB_FILES_INSTANCE_BYTES: "1073741824"    # 1 GiB retained instance-wide
     # UZI_STORED_FILES_BUDGET_BYTES: "4294967296"   # 4 GiB: job files + recovery archives
     # UZI_JOB_FILES_RETENTION: 168h
-    # UZI_HISTORY_RETENTION: 2160h   # opt-in; default off (empty or 0). Minimum 24h. Trims PR history events (never first merges) and usage/capacity samples
+    # UZI_HISTORY_RETENTION: 2160h   # example only, no suggested age; opt-in; default off (empty or 0). Minimum 24h. Trims PR history events (never first merges) and usage/capacity samples
     # UZI_JOB_UPLOAD_TTL: 1h
     # UZI_PRODUCT_SKILLS_ALLOWED_BASE_URLS: https://github.com   # EXAMPLE, not a default (default: empty, feature off)
   # Infisical-synced secret env: ENV_VAR -> the key in the `uzi-secrets` Secret.
