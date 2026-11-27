@@ -201,6 +201,12 @@ and wait for authoritative terminal state before fixing locally. Never both. Rec
 `ci_fix waiting ID` or `ci_fix cancelled ID` with `S/trail.sh '#PR' 'STATE'`, then re-snapshot.
 Before rebasing or merging after cancellation, confirm terminal state and inspect branch changes, `preserved_patch`, recovery captures and held publications. Preserve unresolved work even without a patch. Never bypass an active helper.
 
+While a PR you hold waits (for a CI slot, or with a reviewed local head not pushed), keep
+`S/watch-pr.sh OWNER/REPO PR --writers-only 300 288` armed in the background. A red head
+can start a ci_fix at any time, and the readiness watch stops on red before it sees one.
+Exit 10 or 4 means a writer appeared; exit 14 means the head moved. A cancelled ci_fix can
+leave a custody hold: export, verify and discard it with the buddy (`uzi run recovery RUN`).
+
 `CI_FIX_RECENT` triggers review of the pushed delta against the last reviewed SHA before
 merge, even with green CI. Require the same exact-head buddy review as a small local fix;
 record `ci_fix reviewed ID SHA`. The 24-hour advisory never waives review of older changes.
@@ -279,6 +285,7 @@ For a queued sweep issue without a run ID, use the watcher's `watch-issue.sh` at
    | 10 | active ci_fix, even with green CI, or recent terminal ci_fix while CI is red | follow *CI-fix branch ownership*; plain red without either remains exit 1 |
    | 12 | `RESULT=gh_rate_limited`: GitHub core or GraphQL allowance exhausted | re-arm after `GH_RETRY_AT`; never treat this as ready, findings, or CodeRabbit quota |
    | 13 | `--since` observed an author-attention signal | inspect the push, human activity or CI approval request; never merge on this exit |
+   | 14 | `--writers-only` saw the PR head move | re-snapshot; someone pushed to a held PR |
 
    When waiting for a contributor, run `S/watch-pr.sh OWNER/REPO PR --since FULL_REVIEWED_SHA 60 60`.
    It watches head changes, the PR author's comments/reviews/thread replies after startup,
