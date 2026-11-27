@@ -113,6 +113,22 @@ test("Claude phase case 9: init precedes requests but is not a prompt or abort a
     barrierShape: "new CLI resuming an explicit plan session", withheldAfterReadyMs: 1_000, barrier })}`);
 });
 
+// PRD #4574 M2: on the vendor lane an ALIAS request is reported as the canonical id. The init frame's
+// model is what the harness hands to the lead-config reporter (reportRuntimeConfig decodes it with
+// decodeObservedModel; toLeadObservation turns it into the wire `observed_model`).
+test("Claude phase: an alias request reports the canonical id as observed_model, never the alias", async () => {
+  const { CLAUDE_CANONICAL_MODELS } = await import("../src/claude-canonical-models.js");
+  const { toLeadObservation } = await import("../src/runtime-observation.js");
+  for (const [alias, turn] of [["opus", a], ["sonnet", b]] as const) {
+    const canonical = CLAUDE_CANONICAL_MODELS[alias];
+    assert.ok(canonical, `${alias}: the table carries a canonical id`);
+    assert.notEqual(canonical, alias);
+    const reported = toLeadObservation({ model: turn.model, modelEvidence: "claude_init", effortEvidence: "unknown" });
+    assert.equal(reported.model, canonical, `${alias}: observed_model is the canonical id`);
+    assert.equal(reported.modelEvidence, "claude_init");
+  }
+});
+
 // PRD #3252 m4 (D8): the pin-sensitivity characterization behind claude-canonical-models.ts. Each alias
 // is driven as a RESUMED turn with the prompt withheld, the way the production barrier runs it.
 // A non-default explicit effort, so an alias that honours an explicit effort is told apart from one that
