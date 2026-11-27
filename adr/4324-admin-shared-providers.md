@@ -289,7 +289,7 @@ Each Down is guarded: it takes `ACCESS EXCLUSIVE` locks before the check, then r
 
 **Indexes.** There is no standalone index. Both tables are new and empty, and their primary keys and unique constraints are the only lookups the statements use, so no `CONCURRENTLY` file exists. This departs from the PRD's wording that CONCURRENTLY indexes go in separate files (R14), which assumed an index on an existing table.
 
-**Failure model (limited).** The recovery claim covers an API-process failure with PostgreSQL intact: an interrupted migration or key write rolls back. It does not cover a PostgreSQL or host crash or storage loss, and it does not cover concurrent migrators.
+**Failure model (limited).** The recovery claim covers an API-process failure with PostgreSQL intact. A migration file or key write whose transaction had not committed rolls back; one that PostgreSQL committed stays committed (a migration with its `goose_db_version` row), even if the process failed before it saw the commit result. The next boot reads `goose_db_version` and re-runs only unrecorded files, and an admin re-reads the key status before retrying a key write. It does not cover a PostgreSQL or host crash or storage loss, and it does not cover concurrent migrators.
 
 ### Rollback (image-only)
 
