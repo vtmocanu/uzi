@@ -25,8 +25,8 @@ func testBox(t *testing.T) *secretbox.Box {
 
 func TestAADPinsTheVersionedBinding(t *testing.T) {
 	id := uuid.MustParse("11111111-2222-3333-4444-555555555555")
-	if got, want := string(AAD(id)), "uzi/provider-operator-key/v1|11111111-2222-3333-4444-555555555555"; got != want {
-		t.Fatalf("AAD = %q, want %q", got, want)
+	if got, want := string(aad(id)), "uzi/provider-operator-key/v1|11111111-2222-3333-4444-555555555555"; got != want {
+		t.Fatalf("aad = %q, want %q", got, want)
 	}
 }
 

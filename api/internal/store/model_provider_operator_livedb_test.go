@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -400,8 +401,8 @@ func TestOperatorShapeChecksLiveDB(t *testing.T) {
 }
 
 // TestOperatorKeyRevSQLMonotonicLiveDB: at the SQL level key_rev strictly increases across set, replace,
-// disable and enable, and a repeated disable or enable updates no row and so leaves it alone. (The
-// route-level proof, including delete-then-restore, is TestOperatorKeyRevLiveDB in the handler.)
+// disable and enable, and a repeated disable or enable updates no row and so leaves it alone. (PRD
+// #4540 M2 adds the route-level proof, including delete-then-restore, in the handler.)
 func TestOperatorKeyRevSQLMonotonicLiveDB(t *testing.T) {
 	ctx, _, _, q, admin := opHeadDB(t, "operator_keyrev_")
 	box := opBox(t)
@@ -642,7 +643,7 @@ func TestOperatorKeyMigrationFailureRollbackLiveDB(t *testing.T) {
 				}
 			}},
 		{"validate", opValidateMigration,
-			`(SELECT bool_and(convalidated) FROM pg_constraint WHERE conrelid = 'model_providers'::regclass AND conname IN ('model_providers_credential_mode_check', 'model_providers_operator_engine_check'))`,
+			`(SELECT count(*) = 2 AND bool_and(convalidated) FROM pg_constraint WHERE conrelid = 'model_providers'::regclass AND conname IN ('model_providers_credential_mode_check', 'model_providers_operator_engine_check'))`,
 			func(t *testing.T, s state) {
 				if !strings.HasPrefix(s.modeCheck, "false:") || !strings.HasPrefix(s.engineCheck, "false:") {
 					t.Errorf("state after the failed 00550 = %+v, want both checks still NOT VALID", s)
@@ -705,6 +706,13 @@ func TestOperatorKeyMigrationFailureRollbackLiveDB(t *testing.T) {
 
 // TestOperatorKeyMigrationsAreTransactional: none of the three migrations opts out of goose's per-file
 // transaction, the premise of the recovery claim (each file and its version row commit together).
+// opDownLocks is, per migration, the tables its Down locks in ACCESS EXCLUSIVE MODE, in order.
+var opDownLocks = map[string][]string{
+	opModeMigration:     {"model_providers"},
+	opValidateMigration: {"model_providers"},
+	opKeysMigration:     {"model_providers", "model_provider_revisions", "model_provider_operator_keys", "model_provider_operator_key_test_results"},
+}
+
 func TestOperatorKeyMigrationsAreTransactional(t *testing.T) {
 	for _, name := range []string{opModeMigration, opValidateMigration, opKeysMigration} {
 		m := operatorMigration(t, name)
@@ -723,10 +731,26 @@ func TestOperatorKeyMigrationsAreTransactional(t *testing.T) {
 			}
 		}
 		down := text[strings.Index(text, "-- +goose Down"):]
+		var locked []string
+		lastLock := -1
+		offset := 0
 		for _, line := range strings.Split(down, "\n") {
-			if strings.HasPrefix(line, "LOCK TABLE") && !strings.HasSuffix(line, "IN ACCESS EXCLUSIVE MODE;") {
-				t.Errorf("%s locks a table in a Down in a mode other than ACCESS EXCLUSIVE: %s", path, line)
+			if strings.HasPrefix(line, "LOCK TABLE") {
+				if !strings.HasSuffix(line, "IN ACCESS EXCLUSIVE MODE;") {
+					t.Errorf("%s locks a table in a Down in a mode other than ACCESS EXCLUSIVE: %s", path, line)
+				} else {
+					locked = append(locked, strings.TrimSuffix(strings.TrimPrefix(line, "LOCK TABLE "), " IN ACCESS EXCLUSIVE MODE;"))
+					lastLock = offset
+				}
 			}
+			offset += len(line) + 1
+		}
+		// The Down locks every table its guard reads before the guard runs, in the plan's order.
+		if want := opDownLocks[name]; !slices.Equal(locked, want) {
+			t.Errorf("%s Down locks %v in ACCESS EXCLUSIVE MODE, want %v", path, locked, want)
+		}
+		if guard := strings.Index(down, "DO $$"); guard < 0 || lastLock > guard {
+			t.Errorf("%s Down has a LOCK TABLE after its first DO $$ guard (or no guard)", path)
 		}
 	}
 }

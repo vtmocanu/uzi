@@ -25,12 +25,13 @@ type visClass int
 const (
 	classOwner    visClass = iota // owner-only: the predicate stays the owner arm, never widened
 	classVIS                      // recipient read: own definition OR shared per-user-key definition
-	classShared                   // shared-admin: scoped to NULL owner and the per-user-key mode
+	classShared                   // shared-admin: scoped to NULL owner and either credential mode
 	classIdentity                 // keyed by identity (row ids, key ids), no ownership predicate of its own
 	// classOperatorCustody is an organization key's custody or Test evidence statement (PRD #4540): it
 	// names model_provider_operator_keys or its evidence table, or reads an organization-funded
 	// definition. It has its own text rules, and only the three statements flagged ciphertext may name
-	// the sealed key.
+	// the sealed key. A statement that names a custody table in any other class is refused (see
+	// custodyTableMarker), except the two admin reads in adminCustodyJoinReaders.
 	classOperatorCustody
 )
 
@@ -93,6 +94,11 @@ var bothSelectionArms = []string{
 
 // adminCountMust is bothSelectionArms plus the shared scope the admin reads select on, in both modes.
 var adminCountMust = append([]string{"p.owner_user_id IS NULL AND p." + sharedBothModes}, bothSelectionArms...)
+
+// adminCustodyJoinReaders are the only statements outside classOperatorCustody that may name a custody
+// table: the admin list and get join the key and its evidence for their projection, which
+// adminProjectionLeaks pins and the classShared rule keeps free of ciphertext.
+var adminCustodyJoinReaders = []string{"ListSharedModelProvidersAdmin", "GetSharedModelProviderAdmin"}
 
 // visibilityTable is the classification. Keep it sorted by class, then name.
 var visibilityTable = map[string]visEntry{
@@ -331,6 +337,11 @@ func visibilityViolations(sqlText string, table map[string]visEntry) []string {
 				out = append(out, name+": identity-only query has no authorized caller recorded")
 			}
 		}
+		// Whatever its class, a statement naming a custody table is a custody statement.
+		if e.class != classOperatorCustody && !slices.Contains(adminCustodyJoinReaders, name) &&
+			strings.Contains(strings.ToLower(stmt), custodyTableMarker) {
+			out = append(out, name+": names an organization key table outside classOperatorCustody")
+		}
 	}
 	for name := range table {
 		if _, ok := stmts[name]; !ok {
@@ -338,7 +349,7 @@ func visibilityViolations(sqlText string, table map[string]visEntry) []string {
 		}
 	}
 	// The admin list and get never join per-user keys or evidence, and project no custody internals.
-	for _, name := range []string{"ListSharedModelProvidersAdmin", "GetSharedModelProviderAdmin"} {
+	for _, name := range adminCustodyJoinReaders {
 		s, ok := stmts[name]
 		if !ok {
 			continue
@@ -405,9 +416,6 @@ func TestModelProviderQueriesAreVisibilityClassified(t *testing.T) {
 	}
 }
 
-// TestModelProviderVisibilityPinFiresOnItsCanaries proves the scanner is not vacuous: an
-// unclassified query, a recipient query that kept only the owner arm, an owner-only query that was
-// widened, a shared-admin query that lost its scope and a stale table entry each fail.
 // adminCountCodexArmMissingSQL is an admin count in the two-mode form with the Claude selection arm
 // only: it must raise exactly the missing Codex arm and nothing else, so the canary keeps isolating the
 // arm after the single-mode literal was replaced (TestAdminCountMissingArmRaisesOnlyThatArm).
@@ -426,6 +434,10 @@ func TestAdminCountMissingArmRaisesOnlyThatArm(t *testing.T) {
 	}
 }
 
+// TestModelProviderVisibilityPinFiresOnItsCanaries proves the scanner is not vacuous: an
+// unclassified query, a recipient query that kept only the owner arm, an owner-only query that was
+// widened, a shared-admin query that lost its scope, a custody table named outside its class and a
+// stale table entry each fail.
 func TestModelProviderVisibilityPinFiresOnItsCanaries(t *testing.T) {
 	vis := "(p.owner_user_id = @u::uuid OR (p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'))"
 	vis2 := "(p.owner_user_id = u.id OR (p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'))"
@@ -500,6 +512,12 @@ func TestModelProviderVisibilityPinFiresOnItsCanaries(t *testing.T) {
 			map[string]visEntry{"S": {class: classShared}}, "S: shared-admin query has no authorized caller"},
 		{"identity-only without caller", "-- name: I :one\nSELECT 1 FROM user_secrets WHERE id = $1;",
 			map[string]visEntry{"I": {class: classIdentity, must: []string{"WHERE id = $1"}}}, "I: identity-only query has no authorized caller recorded"},
+		{"custody read classified owner-only", "-- name: O :one\nSELECT ciphertext, key_rev FROM model_provider_operator_keys WHERE provider_id = $1;",
+			map[string]visEntry{"O": {class: classOwner, must: []string{"provider_id"}}}, "O: names an organization key table outside classOperatorCustody"},
+		{"custody read classified identity-only", "-- name: I :one\nSELECT ciphertext, key_rev FROM model_provider_operator_keys WHERE provider_id = $1;",
+			map[string]visEntry{"I": {class: classIdentity, must: []string{"provider_id"}, callers: []string{"x.go"}}}, "I: names an organization key table outside classOperatorCustody"},
+		{"custody read in upper case classified identity-only", "-- name: I :one\nSELECT CIPHERTEXT FROM MODEL_PROVIDER_OPERATOR_KEYS WHERE provider_id = $1;",
+			map[string]visEntry{"I": {class: classIdentity, must: []string{"provider_id"}, callers: []string{"x.go"}}}, "I: names an organization key table outside classOperatorCustody"},
 		{"stale entry", "-- name: A :one\nSELECT 1;", map[string]visEntry{"A": {class: classIdentity, must: []string{"1"}, callers: []string{"x.go"}}, "Gone": {class: classOwner}}, "Gone: in visibilityTable but not in the query file"},
 	}
 	for _, c := range cases {
@@ -545,6 +563,41 @@ func TestIdentityQueryCallersArePinned(t *testing.T) {
 		}
 	}
 	checkProviderEvidenceCalls(t, files["handler/providers_probe.go"], true)
+	if got := operatorKeyAliasViolations(files); len(got) != 0 {
+		t.Errorf("production files import operatorkey under a non-default name (the Seal/Open caller pin cannot see them):\n  %s", strings.Join(got, "\n  "))
+	}
+}
+
+// operatorKeyImportRE matches an import of the operatorkey package that carries a name (an alias, `_` or
+// `.`); the default-named import is the only form callersOf("operatorkey.Seal(") can see.
+var operatorKeyImportRE = regexp.MustCompile(`(?m)^\s*(?:import\s+)?[A-Za-z_.][A-Za-z0-9_]*\s+"[^"\n]*/internal/operatorkey"`)
+
+// operatorKeyAliasViolations returns the production files that import the operatorkey package under a
+// non-default name.
+func operatorKeyAliasViolations(files map[string]string) []string {
+	var out []string
+	for path, src := range files {
+		if operatorKeyImportRE.MatchString(src) {
+			out = append(out, path)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func TestOperatorKeyAliasScanFiresOnAliasedImports(t *testing.T) {
+	const pkg = "github.com/vtmocanu/uzi/api/internal/operatorkey"
+	files := map[string]string{
+		"handler/aliased.go": "package handler\n\nimport (\n\tok \"" + pkg + "\"\n)\n",
+		"handler/dot.go":     "package handler\n\nimport . \"" + pkg + "\"\n",
+		"handler/blank.go":   "package handler\n\nimport (\n\t_ \"" + pkg + "\"\n)\n",
+		"handler/plain.go":   "package handler\n\nimport (\n\t\"" + pkg + "\"\n)\n",
+		"handler/none.go":    "package handler\n",
+	}
+	got := operatorKeyAliasViolations(files)
+	if want := []string{"handler/aliased.go", "handler/blank.go", "handler/dot.go"}; !slices.Equal(got, want) {
+		t.Fatalf("alias violations = %v, want %v", got, want)
+	}
 }
 
 // operatorKeySealOpenCallers is the exact set of production files that call operatorkey.Seal or Open.
@@ -728,7 +781,7 @@ func TestOperatorCustodyPinFiresOnItsCanaries(t *testing.T) {
 		{"the sink admits a disabled key", "GetOperatorProviderKeyForTest", repl("AND disabled_at IS NULL", "AND disabled_at IS NULL OR disabled_at IS NOT NULL"), exact},
 		{"the sink drops the provider_id bind", "GetOperatorProviderKeyForTest", repl(" AND provider_id = @provider_id", ""), "lacks required text"},
 		{"the write lock projects ciphertext", "LockOperatorProviderKeyForWrite", repl("SELECT id, key_rev", "SELECT id, ciphertext, key_rev"), "names the sealed key"},
-		{"the evidence lookup names the sealed key", "GetOperatorProviderForTest", repl("cust.id AS key_id", "cust.ciphertext AS key_id"), "names the sealed key"},
+		{"the probe snapshot lookup names the sealed key", "GetOperatorProviderForTest", repl("cust.id AS key_id", "cust.ciphertext AS key_id"), "names the sealed key"},
 		{"admin get projects to_jsonb(cust)", "GetSharedModelProviderAdmin", repl("cust.set_at AS operator_key_set_at", "to_jsonb(cust) AS operator_key_set_at"), "projects custody internals"},
 		{"admin get projects cust.*", "GetSharedModelProviderAdmin", repl("cust.set_at AS operator_key_set_at", "cust.*"), "projects custody internals"},
 		{"admin list projects cust.key_rev", "ListSharedModelProvidersAdmin", repl("cust.set_at AS operator_key_set_at", "cust.key_rev AS operator_key_set_at"), "projects custody internals"},
@@ -737,6 +790,9 @@ func TestOperatorCustodyPinFiresOnItsCanaries(t *testing.T) {
 		{"Enable without nextval", "EnableOperatorProviderKey", repl("SET disabled_at = NULL, key_rev = nextval('model_provider_operator_key_rev_seq')", "SET disabled_at = NULL"), "custody UPDATE does not assign"},
 		{"Disable without nextval", "DisableOperatorProviderKey", repl(", key_rev = nextval('model_provider_operator_key_rev_seq')", ""), "custody UPDATE does not assign"},
 		{"the Test lookup loses the operator scope", "GetOperatorProviderForTest", repl("p.owner_user_id IS NULL AND p.credential_mode = 'operator_key'", "p.id IS NOT NULL"), "lacks required text"},
+		{"admin get narrowed to the single-mode scope", "GetSharedModelProviderAdmin", func(s string) string {
+			return strings.ReplaceAll(s, "p.credential_mode IN ('per_user_key', 'operator_key')", "p.credential_mode = 'per_user_key'")
+		}, "lacks required text p.owner_user_id IS NULL AND p.credential_mode IN ('per_user_key', 'operator_key')"},
 		{"a recipient reader widened to both modes", "LockVisibleProviderForEvidence", repl("p.credential_mode = 'per_user_key'", "p.credential_mode IN ('per_user_key', 'operator_key')"), exact},
 	}
 	for _, c := range cases {
@@ -744,19 +800,6 @@ func TestOperatorCustodyPinFiresOnItsCanaries(t *testing.T) {
 		if !strings.Contains(got, c.stmt+": ") || !strings.Contains(got, c.want) {
 			t.Errorf("%s: violations %q do not name %s with %q", c.name, got, c.stmt, c.want)
 		}
-	}
-	// An adminCountMust entry that keeps the old single-mode literal no longer matches an admin
-	// statement: the two-mode string replaced it, and no entry keeps both.
-	oldMust := append([]string{"p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'"}, bothSelectionArms...)
-	table := map[string]visEntry{}
-	for k, v := range visibilityTable {
-		table[k] = v
-	}
-	e := table["GetSharedModelProviderAdmin"]
-	e.must = oldMust
-	table["GetSharedModelProviderAdmin"] = e
-	if got := strings.Join(visibilityViolations(fileWith(t, "GetSharedModelProviderAdmin", func(s string) string { return s + " " }), table), "\n"); !strings.Contains(got, "GetSharedModelProviderAdmin: lacks required text p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'") {
-		t.Errorf("an admin entry keeping the single-mode literal was not refused: %q", got)
 	}
 	for _, m := range adminCountMust {
 		if strings.Contains(m, "credential_mode = 'per_user_key'") {
@@ -775,12 +818,12 @@ const custodyTableMarker = "model_provider_operator_key"
 func custodyOutOfFileViolations(goFiles, otherQueries map[string]string) []string {
 	var out []string
 	for path, src := range goFiles {
-		if strings.Contains(src, custodyTableMarker) {
+		if strings.Contains(strings.ToLower(src), custodyTableMarker) {
 			out = append(out, path+": production Go names an organization key table")
 		}
 	}
 	for path, src := range otherQueries {
-		if strings.Contains(src, custodyTableMarker) {
+		if strings.Contains(strings.ToLower(src), custodyTableMarker) {
 			out = append(out, path+": a query file other than model_providers.sql names an organization key table")
 		}
 	}
@@ -818,6 +861,12 @@ func TestCustodyOutOfFileScanFiresAndIgnoresTestsAndGeneratedFiles(t *testing.T)
 		map[string]string{"queries/other.sql": "SELECT 1 FROM model_provider_operator_key_test_results;", "queries/fine.sql": "SELECT 1;"})
 	if len(got) != 2 || !strings.HasPrefix(got[0], "handler/leak.go: ") || !strings.HasPrefix(got[1], "queries/other.sql: ") {
 		t.Fatalf("violations = %q, want the two synthetic offenders only", got)
+	}
+	got = custodyOutOfFileViolations(
+		map[string]string{"handler/upper.go": `q := "SELECT 1 FROM MODEL_PROVIDER_OPERATOR_KEYS"`},
+		map[string]string{"queries/mixed.sql": "SELECT 1 FROM Model_Provider_Operator_Key_Test_Results;"})
+	if len(got) != 2 || !strings.HasPrefix(got[0], "handler/upper.go: ") || !strings.HasPrefix(got[1], "queries/mixed.sql: ") {
+		t.Fatalf("upper and mixed case violations = %q, want both offenders", got)
 	}
 	for name, want := range map[string]bool{
 		"providers_admin.go":      true,

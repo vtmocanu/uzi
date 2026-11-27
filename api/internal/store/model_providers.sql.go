@@ -123,7 +123,8 @@ DELETE FROM model_provider_operator_keys WHERE provider_id = $1
 `
 
 // Removes the organization key and, through the foreign key, its Test evidence. A later set inserts a
-// new row with a new id and a larger key_rev. Authorized caller: admin key delete.
+// new row with a new id and a larger key_rev. Authorized caller: admin key delete, which holds
+// LockSharedModelProviderForEdit first and then LockOperatorProviderKeyForWrite.
 func (q *Queries) DeleteOperatorProviderKey(ctx context.Context, providerID uuid.UUID) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteOperatorProviderKey, providerID)
 	if err != nil {
@@ -510,7 +511,7 @@ SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at, p.created_at,
        r.protocol, r.base_url, r.auth_style, r.model_map,
        COALESCE(su.n, 0)::bigint AS selected_user_count,
        COALESCE(ak.n, 0)::bigint AS attached_key_count,
-       (cust.provider_id IS NOT NULL) AS operator_key_present,
+       (cust.provider_id IS NOT NULL)::boolean AS operator_key_present,
        cust.disabled_at AS operator_key_disabled_at,
        cust.set_at AS operator_key_set_at,
        cev.auth_result, cev.tool_result, cev.probed_at
@@ -546,7 +547,7 @@ type GetSharedModelProviderAdminRow struct {
 	ModelMap              []byte             `json:"model_map"`
 	SelectedUserCount     int64              `json:"selected_user_count"`
 	AttachedKeyCount      int64              `json:"attached_key_count"`
-	OperatorKeyPresent    interface{}        `json:"operator_key_present"`
+	OperatorKeyPresent    bool               `json:"operator_key_present"`
 	OperatorKeyDisabledAt pgtype.Timestamptz `json:"operator_key_disabled_at"`
 	OperatorKeySetAt      pgtype.Timestamptz `json:"operator_key_set_at"`
 	AuthResult            pgtype.Text        `json:"auth_result"`
@@ -1100,7 +1101,7 @@ SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at, p.created_at,
        r.protocol, r.base_url, r.auth_style, r.model_map,
        COALESCE(su.n, 0)::bigint AS selected_user_count,
        COALESCE(ak.n, 0)::bigint AS attached_key_count,
-       (cust.provider_id IS NOT NULL) AS operator_key_present,
+       (cust.provider_id IS NOT NULL)::boolean AS operator_key_present,
        cust.disabled_at AS operator_key_disabled_at,
        cust.set_at AS operator_key_set_at,
        cev.auth_result, cev.tool_result, cev.probed_at
@@ -1137,7 +1138,7 @@ type ListSharedModelProvidersAdminRow struct {
 	ModelMap              []byte             `json:"model_map"`
 	SelectedUserCount     int64              `json:"selected_user_count"`
 	AttachedKeyCount      int64              `json:"attached_key_count"`
-	OperatorKeyPresent    interface{}        `json:"operator_key_present"`
+	OperatorKeyPresent    bool               `json:"operator_key_present"`
 	OperatorKeyDisabledAt pgtype.Timestamptz `json:"operator_key_disabled_at"`
 	OperatorKeySetAt      pgtype.Timestamptz `json:"operator_key_set_at"`
 	AuthResult            pgtype.Text        `json:"auth_result"`

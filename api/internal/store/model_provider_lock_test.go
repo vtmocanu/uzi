@@ -152,7 +152,7 @@ func TestNoModelProviderRevisionOrKeyAssociationUpdate(t *testing.T) {
 			t.Errorf("tuple assignment missed %s: %q", column, got)
 		}
 	}
-	// The custody statements as shipped, and the evidence upsert that copies key_rev into its own table,
+	// Representative custody statements (the shapes of the shipped ones), and the evidence upsert that copies key_rev into its own table,
 	// are clean.
 	custodyClean := "UPDATE model_provider_operator_keys SET ciphertext = $1, key_rev = nextval('model_provider_operator_key_rev_seq'), set_by = $2, set_at = now() WHERE provider_id = $3 RETURNING id;\n" +
 		"UPDATE model_provider_operator_keys SET disabled_at = NULL, key_rev = nextval('model_provider_operator_key_rev_seq') WHERE provider_id = $1 AND disabled_at IS NOT NULL;\n" +

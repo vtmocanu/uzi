@@ -506,7 +506,7 @@ SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at, p.created_at,
        r.protocol, r.base_url, r.auth_style, r.model_map,
        COALESCE(su.n, 0)::bigint AS selected_user_count,
        COALESCE(ak.n, 0)::bigint AS attached_key_count,
-       (cust.provider_id IS NOT NULL) AS operator_key_present,
+       (cust.provider_id IS NOT NULL)::boolean AS operator_key_present,
        cust.disabled_at AS operator_key_disabled_at,
        cust.set_at AS operator_key_set_at,
        cev.auth_result, cev.tool_result, cev.probed_at
@@ -535,7 +535,7 @@ SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at, p.created_at,
        r.protocol, r.base_url, r.auth_style, r.model_map,
        COALESCE(su.n, 0)::bigint AS selected_user_count,
        COALESCE(ak.n, 0)::bigint AS attached_key_count,
-       (cust.provider_id IS NOT NULL) AS operator_key_present,
+       (cust.provider_id IS NOT NULL)::boolean AS operator_key_present,
        cust.disabled_at AS operator_key_disabled_at,
        cust.set_at AS operator_key_set_at,
        cev.auth_result, cev.tool_result, cev.probed_at
@@ -597,7 +597,8 @@ WHERE provider_id = @provider_id AND disabled_at IS NOT NULL;
 
 -- name: DeleteOperatorProviderKey :execrows
 -- Removes the organization key and, through the foreign key, its Test evidence. A later set inserts a
--- new row with a new id and a larger key_rev. Authorized caller: admin key delete.
+-- new row with a new id and a larger key_rev. Authorized caller: admin key delete, which holds
+-- LockSharedModelProviderForEdit first and then LockOperatorProviderKeyForWrite.
 DELETE FROM model_provider_operator_keys WHERE provider_id = @provider_id;
 
 -- name: GetOperatorProviderKeyForTest :one
