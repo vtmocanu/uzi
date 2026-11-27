@@ -283,7 +283,7 @@ func TestSharedScopeConstraintNegativesLiveDB(t *testing.T) {
 	wantViolation(t, "NULL owner without a credential mode", err, "23514", "model_providers_shared_mode_check")
 	_, err = pool.Exec(ctx, insProv, owner, "owned-mode", "claude", "per_user_key", a)
 	wantViolation(t, "owned provider with a credential mode", err, "23514", "model_providers_shared_mode_check")
-	// "operator_key" is a real mode since PRD #4540 (00549); the unknown-mode refusal uses a name no migration admits.
+	// "operator_key" is a real mode since PRD #4540 (00551); the unknown-mode refusal uses a name no migration admits.
 	_, err = pool.Exec(ctx, insProv, pgtype.UUID{}, "bad-mode", "claude", "bogus_mode", nilScope)
 	wantViolation(t, "unknown credential mode", err, "23514", "model_providers_credential_mode_check")
 	// A shared Codex definition is accepted since 00536 (issue #4633); a third engine is still refused

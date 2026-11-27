@@ -22,7 +22,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// PRD #4540 M1 against real Postgres: the organization-funded mode (00549-00551), the custody and Test
+// PRD #4540 M1 against real Postgres: the organization-funded mode (00551-00553), the custody and Test
 // evidence tables, their queries, and the recipient statements that must never see any of it. Every
 // test stands its own isolated database. Skipped unless UZI_TEST_DATABASE_URL points at a throwaway
 // Postgres; run via ./e2e/run-store-it.sh.
@@ -376,7 +376,7 @@ func TestOperatorShapeChecksLiveDB(t *testing.T) {
 	missing.Revision = 9
 	err = q.UpsertOperatorProviderKeyTestResult(ctx, missing)
 	wantViolation(t, "evidence for a missing revision", err, "23503", fkNames("model_provider_revisions")...)
-	// Evidence with no custody row at all is impossible (the foreign key), the premise of the 00551 guard order.
+	// Evidence with no custody row at all is impossible (the foreign key), the premise of the 00553 guard order.
 	noCustody := newOperatorProvider(ctx, t, q, "shape-nocustody")
 	err = q.UpsertOperatorProviderKeyTestResult(ctx, store.UpsertOperatorProviderKeyTestResultParams{ProviderID: noCustody.ID, Revision: 1, KeyID: uuid.New(), KeyRev: 1, AuthResult: "ok", ProbedBy: admin})
 	wantViolation(t, "evidence with no custody row", err, "23503", fkNames("model_provider_operator_keys")...)
@@ -486,14 +486,14 @@ func TestOperatorKeyRevSQLMonotonicLiveDB(t *testing.T) {
 
 // TestOperatorKeyDownGuardsLiveDB: each migration's Down is tested one step from exactly its own
 // version, and refuses with its own sentinel while the state it guards exists. A refusal changes nothing:
-// the data, the goose head and (for 00551) the tables are all still there.
+// the data, the goose head and (for 00553) the tables are all still there.
 func TestOperatorKeyDownGuardsLiveDB(t *testing.T) {
 	const (
-		s549      = "refusing to roll back 00549: operator-key provider definition(s) exist"
-		s550      = "refusing to roll back 00550: operator-key provider definition(s) exist"
-		sEvidence = "refusing to roll back 00551: operator key test evidence exists"
-		sCustody  = "refusing to roll back 00551: organization key custody row(s) exist"
-		sDef      = "refusing to roll back 00551: operator-key provider definition(s) exist"
+		s551      = "refusing to roll back 00551: operator-key provider definition(s) exist"
+		s552      = "refusing to roll back 00552: operator-key provider definition(s) exist"
+		sEvidence = "refusing to roll back 00553: operator key test evidence exists"
+		sCustody  = "refusing to roll back 00553: organization key custody row(s) exist"
+		sDef      = "refusing to roll back 00553: operator-key provider definition(s) exist"
 	)
 	insertDef := func(ctx context.Context, t *testing.T, pool *pgxpool.Pool, name string) uuid.UUID {
 		t.Helper()
@@ -511,15 +511,15 @@ func TestOperatorKeyDownGuardsLiveDB(t *testing.T) {
 		sentinel string
 		tables   bool
 	}{
-		{"00549 with a keyless definition", opModeMigration, func(ctx context.Context, t *testing.T, pool *pgxpool.Pool) { insertDef(ctx, t, pool, "d549") }, s549, false},
-		{"00550 with a keyless definition", opValidateMigration, func(ctx context.Context, t *testing.T, pool *pgxpool.Pool) { insertDef(ctx, t, pool, "d550") }, s550, false},
-		{"00551 with a keyless definition", opKeysMigration, func(ctx context.Context, t *testing.T, pool *pgxpool.Pool) { insertDef(ctx, t, pool, "d551") }, sDef, true},
-		{"00551 with a custody row and no evidence", opKeysMigration, func(ctx context.Context, t *testing.T, pool *pgxpool.Pool) {
-			id := insertDef(ctx, t, pool, "c551")
+		{"00551 with a keyless definition", opModeMigration, func(ctx context.Context, t *testing.T, pool *pgxpool.Pool) { insertDef(ctx, t, pool, "d551") }, s551, false},
+		{"00552 with a keyless definition", opValidateMigration, func(ctx context.Context, t *testing.T, pool *pgxpool.Pool) { insertDef(ctx, t, pool, "d552") }, s552, false},
+		{"00553 with a keyless definition", opKeysMigration, func(ctx context.Context, t *testing.T, pool *pgxpool.Pool) { insertDef(ctx, t, pool, "d553") }, sDef, true},
+		{"00553 with a custody row and no evidence", opKeysMigration, func(ctx context.Context, t *testing.T, pool *pgxpool.Pool) {
+			id := insertDef(ctx, t, pool, "c553")
 			mustExec(ctx, t, pool, `INSERT INTO model_provider_operator_keys (provider_id, ciphertext, set_by) VALUES ($1, 'x', $2)`, id, uuid.New())
 		}, sCustody, true},
-		{"00551 with evidence and its required custody row", opKeysMigration, func(ctx context.Context, t *testing.T, pool *pgxpool.Pool) {
-			id := insertDef(ctx, t, pool, "e551")
+		{"00553 with evidence and its required custody row", opKeysMigration, func(ctx context.Context, t *testing.T, pool *pgxpool.Pool) {
+			id := insertDef(ctx, t, pool, "e553")
 			var key uuid.UUID
 			var rev int64
 			if err := pool.QueryRow(ctx, `INSERT INTO model_provider_operator_keys (provider_id, ciphertext, set_by) VALUES ($1, 'x', $2) RETURNING id, key_rev`, id, uuid.New()).Scan(&key, &rev); err != nil {
@@ -556,11 +556,11 @@ func TestOperatorKeyDownGuardsLiveDB(t *testing.T) {
 			if c.tables {
 				for _, tbl := range []string{"model_provider_operator_keys", "model_provider_operator_key_test_results"} {
 					if !scalar[bool](ctx, t, pool, `SELECT to_regclass($1) IS NOT NULL`, tbl) {
-						t.Errorf("%s is gone after a refused 00551 Down: the guard must run before the drop", tbl)
+						t.Errorf("%s is gone after a refused 00553 Down: the guard must run before the drop", tbl)
 					}
 				}
 				if !scalar[bool](ctx, t, pool, `SELECT to_regclass('model_provider_operator_key_rev_seq') IS NOT NULL`) {
-					t.Error("the key_rev sequence is gone after a refused 00551 Down")
+					t.Error("the key_rev sequence is gone after a refused 00553 Down")
 				}
 			}
 		})
@@ -569,7 +569,7 @@ func TestOperatorKeyDownGuardsLiveDB(t *testing.T) {
 	t.Run("evidence without custody is impossible", func(t *testing.T) {
 		m := operatorMigration(t, opKeysMigration)
 		ctx, _, pool := sharedDB(t, "operator_down_fk_", m.version)
-		id := insertDef(ctx, t, pool, "fk551")
+		id := insertDef(ctx, t, pool, "fk553")
 		_, err := pool.Exec(ctx, `INSERT INTO model_provider_operator_key_test_results (provider_id, revision, key_id, key_rev, auth_result, probed_at, probed_by) VALUES ($1, 1, $2, 1, 'ok', now(), $3)`, id, uuid.New(), uuid.New())
 		if code, _ := pgCodeC(err); code != "23503" {
 			t.Fatalf("evidence with no custody row: %v, want a foreign key violation", err)
@@ -651,36 +651,36 @@ func TestOperatorKeyMigrationFailureRollbackLiveDB(t *testing.T) {
              AND EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'model_providers'::regclass AND conname = 'model_providers_operator_engine_check')`,
 			func(t *testing.T, s state) {
 				if !strings.HasPrefix(s.modeCheck, "true:") || strings.Contains(s.modeCheck, "operator_key") || s.engineCheck != "absent" {
-					t.Errorf("state after the failed 00549 = %+v, want the validated single-mode check and no engine check", s)
+					t.Errorf("state after the failed 00551 = %+v, want the validated single-mode check and no engine check", s)
 				}
 			},
 			func(t *testing.T, s state) {
 				if !strings.HasPrefix(s.modeCheck, "false:") || !strings.Contains(s.modeCheck, "operator_key") || !strings.HasPrefix(s.engineCheck, "false:") {
-					t.Errorf("state after the retried 00549 = %+v, want both checks present and NOT VALID", s)
+					t.Errorf("state after the retried 00551 = %+v, want both checks present and NOT VALID", s)
 				}
 			}},
 		{"validate", opValidateMigration,
 			`(SELECT count(*) = 2 AND bool_and(convalidated) FROM pg_constraint WHERE conrelid = 'model_providers'::regclass AND conname IN ('model_providers_credential_mode_check', 'model_providers_operator_engine_check'))`,
 			func(t *testing.T, s state) {
 				if !strings.HasPrefix(s.modeCheck, "false:") || !strings.HasPrefix(s.engineCheck, "false:") {
-					t.Errorf("state after the failed 00550 = %+v, want both checks still NOT VALID", s)
+					t.Errorf("state after the failed 00552 = %+v, want both checks still NOT VALID", s)
 				}
 			},
 			func(t *testing.T, s state) {
 				if !strings.HasPrefix(s.modeCheck, "true:") || !strings.HasPrefix(s.engineCheck, "true:") {
-					t.Errorf("state after the retried 00550 = %+v, want both checks validated", s)
+					t.Errorf("state after the retried 00552 = %+v, want both checks validated", s)
 				}
 			}},
 		{"keys", opKeysMigration,
 			`to_regclass('model_provider_operator_keys') IS NOT NULL AND to_regclass('model_provider_operator_key_test_results') IS NOT NULL AND to_regclass('model_provider_operator_key_rev_seq') IS NOT NULL`,
 			func(t *testing.T, s state) {
 				if s.tables != "" {
-					t.Errorf("state after the failed 00551 = %+v, want no tables and no sequence", s)
+					t.Errorf("state after the failed 00553 = %+v, want no tables and no sequence", s)
 				}
 			},
 			func(t *testing.T, s state) {
 				if s.tables == "" || strings.Count(s.tables, ",") != 2 {
-					t.Errorf("state after the retried 00551 = %+v, want both tables and the sequence", s)
+					t.Errorf("state after the retried 00553 = %+v, want both tables and the sequence", s)
 				}
 			}},
 	}

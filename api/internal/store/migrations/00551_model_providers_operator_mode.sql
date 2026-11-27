@@ -3,10 +3,10 @@ SET LOCAL lock_timeout = '5s';
 
 -- PRD #4540 M1: an organization-funded shared definition. A shared definition (owner_user_id NULL)
 -- may now carry credential_mode 'operator_key' as well as 'per_user_key': its one credential is an
--- organization key held in model_provider_operator_keys (00551), never a recipient's key. The mode
+-- organization key held in model_provider_operator_keys (00553), never a recipient's key. The mode
 -- check is replaced in one statement so no window exists without it. NOT VALID (no full scan under
--- the lock), validated in 00550. The new engine check keeps an operator definition Claude only; it is
--- NOT VALID for the same reason and validated in 00550.
+-- the lock), validated in 00552. The new engine check keeps an operator definition Claude only; it is
+-- NOT VALID for the same reason and validated in 00552.
 ALTER TABLE model_providers
     DROP CONSTRAINT model_providers_credential_mode_check,
     ADD CONSTRAINT model_providers_credential_mode_check
@@ -26,7 +26,7 @@ LOCK TABLE model_providers IN ACCESS EXCLUSIVE MODE;
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM model_providers WHERE credential_mode = 'operator_key') THEN
-        RAISE EXCEPTION 'refusing to roll back 00549: operator-key provider definition(s) exist';
+        RAISE EXCEPTION 'refusing to roll back 00551: operator-key provider definition(s) exist';
     END IF;
 END
 $$;

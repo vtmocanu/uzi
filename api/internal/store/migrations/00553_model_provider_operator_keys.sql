@@ -60,13 +60,13 @@ LOCK TABLE model_provider_operator_key_test_results IN ACCESS EXCLUSIVE MODE;
 DO $$
 BEGIN
     IF EXISTS (SELECT 1 FROM model_provider_operator_key_test_results) THEN
-        RAISE EXCEPTION 'refusing to roll back 00551: operator key test evidence exists';
+        RAISE EXCEPTION 'refusing to roll back 00553: operator key test evidence exists';
     END IF;
     IF EXISTS (SELECT 1 FROM model_provider_operator_keys) THEN
-        RAISE EXCEPTION 'refusing to roll back 00551: organization key custody row(s) exist';
+        RAISE EXCEPTION 'refusing to roll back 00553: organization key custody row(s) exist';
     END IF;
     IF EXISTS (SELECT 1 FROM model_providers WHERE credential_mode = 'operator_key') THEN
-        RAISE EXCEPTION 'refusing to roll back 00551: operator-key provider definition(s) exist';
+        RAISE EXCEPTION 'refusing to roll back 00553: operator-key provider definition(s) exist';
     END IF;
 END
 $$;

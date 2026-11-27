@@ -52,7 +52,7 @@ CHECKs keep the pair honest and the scopes closed:
 | CHECK | Rule |
 |---|---|
 | `model_providers_shared_mode_check` | `(owner_user_id IS NULL) = (credential_mode IS NOT NULL)` |
-| `model_providers_credential_mode_check` | `credential_mode IN ('per_user_key', 'operator_key')` (migration 00549 model_providers_operator_mode widened it from `('per_user_key')` for #4540 M1) |
+| `model_providers_credential_mode_check` | `credential_mode IN ('per_user_key', 'operator_key')` (migration 00551 model_providers_operator_mode widened it from `('per_user_key')` for #4540 M1) |
 | `model_providers_shared_engine_check` | `owner_user_id IS NOT NULL OR engine IN ('claude', 'codex')` (Claude only until #4633 widened it, migration 00536 model_providers_shared_codex_engine) |
 | `model_providers_scope_owner_check` | `scope_owner_id = COALESCE(owner_user_id, nil)`, never NULL |
 | `model_providers_owner_not_nil_check` | no personal owner is the nil UUID |
@@ -275,17 +275,17 @@ The definition is always locked before custody, so no cycle exists with the key-
 
 The evidence tuple is the current revision, base URL, auth style, protocol, model map, the custody id, `key_rev`, enabled and not retired. A key replace, enable, disable or delete, a model-map edit and retirement invalidate it; a rename does not. A retired definition hides its evidence (current status, not history). The fence is exact for the write: a change committed before the evidence write's locks gets 409 and no write, and a change that starts while the write holds them waits and then hides the result. It is not a fence on the dial: a change made after the pre-dial recheck can still let the in-flight probe use the key and endpoint it captured.
 
-### Migrations 00549-00551
+### Migrations 00551-00553
 
 Draft numbers; they are renumbered at merge, so match by name.
 
 | File | Does |
 |---|---|
-| 00549 (`model_providers_operator_mode`) | replaces the mode CHECK and adds the operator engine CHECK, both `NOT VALID` |
-| 00550 (`validate_model_providers_operator_mode`) | validates both |
-| 00551 (`model_provider_operator_keys`) | creates the custody table, its `key_rev` sequence and the Test evidence table |
+| 00551 (`model_providers_operator_mode`) | replaces the mode CHECK and adds the operator engine CHECK, both `NOT VALID` |
+| 00552 (`validate_model_providers_operator_mode`) | validates both |
+| 00553 (`model_provider_operator_keys`) | creates the custody table, its `key_rev` sequence and the Test evidence table |
 
-Each Down is guarded: it takes `ACCESS EXCLUSIVE` locks before the check, then refuses while an operator definition, custody row or evidence row exists (00550's Down is a guarded no-op that keeps a rollback between 00549 and 00550 in step). Nothing deletes a key or definition automatically. Run Downs with the API stopped; as for 00538, the lock order is not guaranteed to match every application path, so a Down against live traffic can deadlock in a narrow window, with one side aborted and nothing lost.
+Each Down is guarded: it takes `ACCESS EXCLUSIVE` locks before the check, then refuses while an operator definition, custody row or evidence row exists (00552's Down is a guarded no-op that keeps a rollback between 00551 and 00552 in step). Nothing deletes a key or definition automatically. Run Downs with the API stopped; as for 00538, the lock order is not guaranteed to match every application path, so a Down against live traffic can deadlock in a narrow window, with one side aborted and nothing lost.
 
 **Indexes.** There is no standalone index. Both tables are new and empty, and their primary keys and unique constraints are the only lookups the statements use, so no `CONCURRENTLY` file exists. This departs from the PRD's wording that CONCURRENTLY indexes go in separate files (R14), which assumed an index on an existing table.
 
