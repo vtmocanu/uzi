@@ -271,8 +271,25 @@ func TestOperatorKeyAADLiveDB(t *testing.T) {
 	if n, err := q.DisableOperatorProviderKey(ctx, a.ID); err != nil || n != 1 {
 		t.Fatalf("disable = %d (%v)", n, err)
 	}
-	if _, err := q.GetOperatorProviderKeyForTest(ctx, store.GetOperatorProviderKeyForTestParams{ID: ka.ID, ProviderID: a.ID, KeyRev: ka.KeyRev}); !errors.Is(err, pgx.ErrNoRows) {
-		t.Errorf("the sink for a disabled key = %v, want no row", err)
+	// Disabling draws a new key_rev, so the pre-disable ka.KeyRev would miss for that reason alone. Use
+	// the disabled row's current key_rev: only the disabled_at predicate can then refuse it.
+	const curRev = `SELECT key_rev FROM model_provider_operator_keys WHERE provider_id = $1`
+	current := scalar[int64](ctx, t, pool, curRev, a.ID)
+	if current == ka.KeyRev {
+		t.Fatalf("disable did not draw a new key_rev (%d); the check below would not isolate the disabled predicate", current)
+	}
+	disabled := store.GetOperatorProviderKeyForTestParams{ID: ka.ID, ProviderID: a.ID, KeyRev: current}
+	if _, err := q.GetOperatorProviderKeyForTest(ctx, disabled); !errors.Is(err, pgx.ErrNoRows) {
+		t.Errorf("the sink for a disabled key at its current key_rev = %v, want no row", err)
+	}
+	// Positive control: the same id, provider and current key_rev returns the row once the key is
+	// enabled again (cleared in SQL so key_rev stays put).
+	mustExec(ctx, t, pool, `UPDATE model_provider_operator_keys SET disabled_at = NULL WHERE provider_id = $1`, a.ID)
+	if got := scalar[int64](ctx, t, pool, curRev, a.ID); got != current {
+		t.Fatalf("control moved key_rev: %d -> %d", current, got)
+	}
+	if row, err := q.GetOperatorProviderKeyForTest(ctx, disabled); err != nil || row.KeyRev != current {
+		t.Errorf("control: the sink for the same key_rev, enabled = %+v (%v), want the row", row, err)
 	}
 }
 

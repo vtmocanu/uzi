@@ -474,7 +474,9 @@ definitions work.
   hides it: the page shows the current state, not history. A rename does not hide it. A change made
   after that last check can still let the probe already in flight use the key and endpoint it
   captured. A Test is refused with 429 when another Test of the same definition is running, when 4
-  Tests are already in flight instance-wide, or after 30 Tests per hour for that definition. The web
+  provider Tests (admin and users' own) are already in flight, or after 30 Tests per hour for that
+  definition. These limits are held in memory by the API process, so each API process counts them
+  separately and they reset when it restarts. The web
   page shows the key controls on retired definitions too (set or replace, enable or disable and delete
   are allowed there; only Test is refused when the definition is retired).
 - **Audit.** Each key change writes a `provider_audit` line (`admin_key_set`, `admin_key_replace`,

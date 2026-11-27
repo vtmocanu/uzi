@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/operatorkey"
@@ -340,34 +341,67 @@ func TestOperatorKeyAdminDeleteCascadeLiveDB(t *testing.T) {
 		t.Errorf("per-user-key operator_key_deleted = %q, want false", got)
 	}
 
-	// Lock order: a key write holding the definition lock blocks the delete, which then completes with
-	// no deadlock.
-	held := s.createOperator(t, "held-"+uuid.NewString()[:6])
-	s.mustPutOrgKey(t, held.ID, orgKeyFixture())
+	// Lock order, definition first. Case 1 holds ONLY the definition lock: the delete must wait on the
+	// definition row (a waiter on its FOR UPDATE statement) and complete once that transaction commits.
+	// Case 2 holds ONLY the custody row lock: the delete takes the definition lock first (a NOWAIT lock
+	// on the definition row is refused while it waits) and then waits on the custody row.
 	ctx := context.Background()
-	tx, err := s.f.pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	q := store.New(tx)
-	hid := uuid.MustParse(held.ID)
-	if _, err := q.LockSharedModelProviderForEdit(ctx, hid); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := q.LockOperatorProviderKeyForWrite(ctx, hid); err != nil {
-		t.Fatal(err)
-	}
-	done := blockedRequest(cookieReqPrepared(t, s.f.router, http.MethodDelete, opPath(held.ID), s.admin.jwt, ""))
-	assertBlocked(t, done, "the delete")
-	if err := tx.Commit(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if rec := awaitDone(t, done, "the delete"); rec.Code != http.StatusOK {
-		t.Fatalf("delete after the key write committed = %d %s", rec.Code, rec.Body.String())
-	}
-	if got := lastDelete(held.ID); got != "true" {
-		t.Errorf("held operator_key_deleted = %q, want true", got)
+	for _, c := range []struct {
+		name       string
+		hold       func(q *store.Queries, id uuid.UUID) error
+		waitsOn    string // a fragment of the statement the blocked delete is waiting in
+		defHeldByD bool   // the delete must already hold the definition lock while it waits
+	}{
+		{"definition lock only", func(q *store.Queries, id uuid.UUID) error {
+			_, err := q.LockSharedModelProviderForEdit(ctx, id)
+			return err
+		}, "model_providers p", false},
+		{"custody lock only", func(q *store.Queries, id uuid.UUID) error {
+			_, err := q.LockOperatorProviderKeyForWrite(ctx, id)
+			return err
+		}, "model_provider_operator_keys", true},
+	} {
+		held := s.createOperator(t, "held-"+uuid.NewString()[:6])
+		s.mustPutOrgKey(t, held.ID, orgKeyFixture())
+		tx, err := s.f.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hid := uuid.MustParse(held.ID)
+		if err := c.hold(store.New(tx), hid); err != nil {
+			_ = tx.Rollback(ctx)
+			t.Fatalf("%s: hold: %v", c.name, err)
+		}
+		done := blockedRequest(cookieReqPrepared(t, s.f.router, http.MethodDelete, opPath(held.ID), s.admin.jwt, ""))
+		assertBlocked(t, done, "the delete ("+c.name+")")
+		if n := countRows(t, s.sharedFx, `SELECT count(*) FROM pg_stat_activity
+			WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%FOR UPDATE%' AND query LIKE '%'||$1||'%'`, c.waitsOn); n < 1 {
+			_ = tx.Rollback(ctx)
+			t.Fatalf("%s: no backend is waiting on a lock in a statement on %q", c.name, c.waitsOn)
+		}
+		if c.defHeldByD {
+			probe, err := s.f.pool.Begin(ctx)
+			if err != nil {
+				_ = tx.Rollback(ctx)
+				t.Fatal(err)
+			}
+			_, err = probe.Exec(ctx, `SELECT 1 FROM model_providers WHERE id = $1 FOR UPDATE NOWAIT`, hid)
+			_ = probe.Rollback(ctx)
+			var pgErr *pgconn.PgError
+			if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+				_ = tx.Rollback(ctx)
+				t.Fatalf("%s: the blocked delete does not hold the definition lock (probe = %v), want lock_not_available", c.name, err)
+			}
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if rec := awaitDone(t, done, "the delete ("+c.name+")"); rec.Code != http.StatusOK {
+			t.Fatalf("%s: delete after the holder committed = %d %s", c.name, rec.Code, rec.Body.String())
+		}
+		if got := lastDelete(held.ID); got != "true" {
+			t.Errorf("%s: operator_key_deleted = %q, want true", c.name, got)
+		}
 	}
 }
 
@@ -499,12 +533,18 @@ func TestOperatorSelectionForcedReadsMissingLiveDB(t *testing.T) {
 		f.anthropic()
 		op := seedOperatorDefinition(t, f.pool, f.h.q, newHandlerTestBox(t), effProviderBase)
 		forceOperatorSource(t, f.pool, f.user, op)
+		// The preview maps every unusable source to the one public token, so pin the typed reason on the
+		// resolver the preview and run creation share, before that mapping.
+		res, err := workersvc.ResolveProviderSource(f.ctx, f.h.q, f.user, "claude", f.h.cfg.ProviderBaseURLAllowed)
+		if err != nil || res.State != workersvc.ProviderSourceUnusable || res.Reason != workersvc.SourceUnusableProviderMissing || res.ProviderID != op {
+			t.Fatalf("the forced operator source resolves to %+v (%v), want unusable with reason provider_missing for %s", res, err, op)
+		}
 		for _, body := range []string{`{"target":"sweep"}`, `{"target":"prompt","harness":"claude"}`} {
 			dto, raw := f.schedulePreview(body)
 			wantRefusal(t, dto, raw, "provider_source_unusable")
 		}
 		before := countRowsPool(t, f.pool, `SELECT count(*) FROM runs WHERE user_id = $1`, f.user)
-		_, err := f.create(nil, nil)
+		_, err = f.create(nil, nil)
 		var unusable *workersvc.ProviderSourceUnusableError
 		if !errors.As(err, &unusable) || unusable.Reason != workersvc.SourceUnusableProviderMissing {
 			t.Fatalf("create with a forced operator source = %v, want a provider_missing refusal", err)

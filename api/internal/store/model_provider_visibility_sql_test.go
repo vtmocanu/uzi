@@ -556,7 +556,7 @@ func TestIdentityQueryCallersArePinned(t *testing.T) {
 		if e.class != classIdentity && e.class != classShared && e.class != classOperatorCustody {
 			continue
 		}
-		got := callersOf(files, "."+name+"(")
+		got := methodRefsOf(files, name)
 		want := append([]string(nil), e.callers...)
 		sort.Strings(want)
 		if strings.Join(got, ",") != strings.Join(want, ",") {
@@ -566,7 +566,7 @@ func TestIdentityQueryCallersArePinned(t *testing.T) {
 	// operatorkey.Seal and Open are the only way the sealed organization key is made or read: the key
 	// routes seal it, the admin Test opens it.
 	for fn, want := range operatorKeySealOpenCallers {
-		if got := callersOf(files, "operatorkey."+fn+"("); !slices.Equal(got, want) {
+		if got := operatorkeyRefsOf(files, fn); !slices.Equal(got, want) {
 			t.Errorf("operatorkey.%s callers = %v, recorded %v", fn, got, want)
 		}
 	}
@@ -580,7 +580,7 @@ func TestIdentityQueryCallersArePinned(t *testing.T) {
 }
 
 // operatorKeyAliasViolations returns the production files that import the operatorkey package under a
-// non-default name (an alias, `_` or `.`), which callersOf("operatorkey.Seal(") cannot see. It reads the
+// non-default name (an alias, `_` or `.`), which the AST scan operatorkeyRefsOf resolves only for a default or aliased name and is kept strict here. It reads the
 // import specs with go/parser, so the spelling of the declaration (a single-line import, a block, a
 // comment between the name and the path) does not matter. A file that does not parse is reported too:
 // the scan must not go blind on it.
@@ -630,15 +630,86 @@ var operatorKeySealOpenCallers = map[string][]string{
 	"Open": {handlerProbe},
 }
 
-func callersOf(files map[string]string, needle string) []string {
+// referencesOf returns, sorted, the files holding a selector expression that match want, resolved on
+// the go/parser AST: a reference counts whether it is called or merely taken (`f := q.Name; f(ctx)`),
+// and comments and string literals never count. match receives each selector and the file's local
+// names for the operatorkey import. A file that does not parse is listed with a marker so the pin
+// fails rather than going blind on it.
+func referencesOf(files map[string]string, match func(sel *ast.SelectorExpr, pkgNames map[string]bool) bool) []string {
 	var got []string
 	for path, src := range files {
-		if strings.Contains(src, needle) {
+		f, err := parser.ParseFile(token.NewFileSet(), path, src, parser.SkipObjectResolution)
+		if err != nil {
+			got = append(got, path+" (does not parse)")
+			continue
+		}
+		pkgNames := map[string]bool{}
+		for _, imp := range f.Imports {
+			p := strings.Trim(imp.Path.Value, "\"`")
+			if !strings.HasSuffix(p, "/internal/operatorkey") {
+				continue
+			}
+			switch {
+			case imp.Name == nil:
+				pkgNames["operatorkey"] = true
+			case imp.Name.Name != "_" && imp.Name.Name != ".":
+				pkgNames[imp.Name.Name] = true
+			}
+		}
+		found := false
+		ast.Inspect(f, func(n ast.Node) bool {
+			if sel, ok := n.(*ast.SelectorExpr); ok && match(sel, pkgNames) {
+				found = true
+			}
+			return !found
+		})
+		if found {
 			got = append(got, path)
 		}
 	}
 	sort.Strings(got)
 	return got
+}
+
+// methodRefsOf returns the production files that reference a method or field named name on any value.
+func methodRefsOf(files map[string]string, name string) []string {
+	return referencesOf(files, func(sel *ast.SelectorExpr, _ map[string]bool) bool {
+		return sel.Sel.Name == name
+	})
+}
+
+// operatorkeyRefsOf returns the production files that reference operatorkey.<fn> through the package
+// identifier the file imports it under.
+func operatorkeyRefsOf(files map[string]string, fn string) []string {
+	return referencesOf(files, func(sel *ast.SelectorExpr, pkgNames map[string]bool) bool {
+		id, ok := sel.X.(*ast.Ident)
+		return ok && pkgNames[id.Name] && sel.Sel.Name == fn
+	})
+}
+
+func TestCallerScanResolvesReferencesOnTheAST(t *testing.T) {
+	const pkg = "github.com/vtmocanu/uzi/api/internal/operatorkey"
+	files := map[string]string{
+		// (a) a method value stored and called later is a reference.
+		"handler/value.go": "package handler\nfunc f(q *Q) {\n\tg := q.GetOperatorProviderKeyForTest\n\tg(nil, 1)\n}\n",
+		// (b) a comment-only mention (and a string) is not.
+		"handler/comment.go": "package handler\n// q.GetOperatorProviderKeyForTest(ctx) is documented here\nfunc f() { _ = \"q.GetOperatorProviderKeyForTest(\" }\n",
+		// (c) a stored package function is a reference.
+		"handler/pkgvalue.go": "package handler\nimport \"" + pkg + "\"\nfunc f() { op := operatorkey.Open; _ = op }\n",
+		// a different identifier named like the package is not the import.
+		"handler/shadow.go":   "package handler\nfunc f(operatorkey T) { _ = operatorkey.Open }\n",
+		"handler/comment2.go": "package handler\nimport \"" + pkg + "\"\n// operatorkey.Open(x)\nfunc f() { _ = operatorkey.Seal }\n",
+		"handler/broken.go":   "package handler\nfunc (",
+	}
+	if got, want := methodRefsOf(files, "GetOperatorProviderKeyForTest"), []string{"handler/broken.go (does not parse)", "handler/value.go"}; !slices.Equal(got, want) {
+		t.Errorf("method refs = %v, want %v", got, want)
+	}
+	if got, want := operatorkeyRefsOf(files, "Open"), []string{"handler/broken.go (does not parse)", "handler/pkgvalue.go"}; !slices.Equal(got, want) {
+		t.Errorf("operatorkey.Open refs = %v, want %v", got, want)
+	}
+	if got, want := operatorkeyRefsOf(files, "Seal"), []string{"handler/broken.go (does not parse)", "handler/comment2.go"}; !slices.Equal(got, want) {
+		t.Errorf("operatorkey.Seal refs = %v, want %v", got, want)
+	}
 }
 
 // isProductionGoFile reports whether a Go file name is a production source: not a test, and not a
