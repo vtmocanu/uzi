@@ -1,0 +1,13 @@
+# Fixture for scripts/assert-web-modules-render.sh: a navSection that is a number, not a string
+web:
+  nginx:
+    resolver: 10.96.0.10
+  modules:
+    - id: num
+      version: "1.0.0"
+      page: Page
+      label: Label
+      icon: package
+      navGroup: modules
+      navSection: 5
+      upstream: svc:80

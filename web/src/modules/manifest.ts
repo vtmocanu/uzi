@@ -17,11 +17,16 @@ export interface ModuleEntry {
   icon: ModuleIconName;
   navGroup: ModuleNavGroup;
   adminOnly: boolean;
+  // Optional sidebar heading (trimmed) for a `modules` entry; absent means "Modules".
+  navSection?: string;
 }
 
 const MODULE_ID_RE = /^[a-z][a-z0-9-]{0,31}$/;
 const NAV_GROUPS: readonly string[] = ["work", "factory", "modules"];
 const LABEL_MAX = 40;
+// The navSection length limit in code points. Keep equal to NAV_SECTION_MAX in
+// scripts/web-modules-gen.py and the chart's navSection check; parity.test.ts pins all three.
+const NAV_SECTION_MAX = 24;
 // C0/C1 controls, zero-width and directional marks (U+200B-200F), bidi embeddings and
 // overrides (U+202A-202E), bidi isolates (U+2066-2069), the line/paragraph separators, the Arabic
 // letter mark (U+061C), the BOM (U+FEFF), word joiner and invisible operators (U+2060-2064), the
@@ -92,6 +97,24 @@ export function parseModuleList(json: unknown): ModuleEntry[] {
       );
       navGroup = "modules";
     }
+    // navSection names the sidebar heading for a `modules` entry; honoured only when the
+    // raw navGroup is exactly "modules". An invalid value drops the heading, not the entry.
+    let navSection: string | undefined;
+    if (e.navGroup === "modules" && e.navSection !== undefined) {
+      const bad = (why: string) =>
+        console.error(`uzi modules: /modules.json entry ${i} (${id}): ${why}; using "Modules"`);
+      const raw = e.navSection;
+      if (typeof raw !== "string") {
+        bad("navSection must be a string");
+      } else if (UNSAFE_TEXT_RE.test(raw) || /\p{Cs}/u.test(raw)) {
+        bad("navSection contains control or invisible formatting characters");
+      } else {
+        const t = raw.trim();
+        const n = [...t].length;
+        if (n >= 1 && n <= NAV_SECTION_MAX) navSection = t;
+        else bad(`navSection must be 1 to ${NAV_SECTION_MAX} characters after trimming whitespace`);
+      }
+    }
     seen.add(id);
     out.push({
       id,
@@ -101,6 +124,7 @@ export function parseModuleList(json: unknown): ModuleEntry[] {
       icon: e.icon,
       navGroup,
       adminOnly: e.adminOnly === true,
+      ...(navSection !== undefined ? { navSection } : {}),
     });
   });
   return out;

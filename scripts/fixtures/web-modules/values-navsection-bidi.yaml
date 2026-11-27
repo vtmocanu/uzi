@@ -1,0 +1,13 @@
+# Fixture for scripts/assert-web-modules-render.sh: a navSection with a right-to-left override (U+202E)
+web:
+  nginx:
+    resolver: 10.96.0.10
+  modules:
+    - id: bidi
+      version: "1.0.0"
+      page: Page
+      label: Label
+      icon: package
+      navGroup: modules
+      navSection: "To‮ols"
+      upstream: svc:80

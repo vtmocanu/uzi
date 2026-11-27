@@ -94,6 +94,29 @@ render on the first invalid rule. Call with the root context.
 {{- if not (has $m.navGroup (list "work" "factory" "modules")) -}}
 {{- fail (printf "%s: unknown navGroup %q (use work, factory or modules)" $where $m.navGroup) -}}
 {{- end -}}
+{{- /*
+navSection (optional): the sidebar heading of a navGroup modules entry. Checked in this order: a
+string (null is refused), no control or invisible characters (on the raw value), 1 to 24
+characters after trimming, then navGroup must be modules. The TRIMMED value is stored.
+*/ -}}
+{{- $navSection := "" -}}
+{{- $hasNavSection := hasKey $m "navSection" -}}
+{{- if $hasNavSection -}}
+{{- $ns0 := index $m "navSection" -}}
+{{- if not (kindIs "string" $ns0) -}}
+{{- fail (printf "%s: navSection must be a string" $where) -}}
+{{- end -}}
+{{- if regexMatch $unsafe $ns0 -}}
+{{- fail (printf "%s: navSection contains control or invisible formatting characters" $where) -}}
+{{- end -}}
+{{- $navSection = trim $ns0 -}}
+{{- if not (regexMatch `(?s)^.{1,24}$` $navSection) -}}
+{{- fail (printf "%s: navSection must be 1 to 24 characters after trimming whitespace" $where) -}}
+{{- end -}}
+{{- if ne $m.navGroup "modules" -}}
+{{- fail (printf "%s: navSection is only valid with navGroup modules" $where) -}}
+{{- end -}}
+{{- end -}}
 {{- $adminOnly := false -}}
 {{- if hasKey $m "adminOnly" -}}
 {{- if not (kindIs "bool" (index $m "adminOnly")) -}}
@@ -129,7 +152,11 @@ render on the first invalid rule. Call with the root context.
 {{- if not (contains "." $host) -}}
 {{- $host = printf "%s.%s.svc.cluster.local" $host $ns -}}
 {{- end -}}
-{{- $out = append $out (dict "id" $id "version" $m.version "page" $m.page "label" $m.label "icon" $m.icon "navGroup" $m.navGroup "adminOnly" $adminOnly "upstream" (printf "%s:%s" $host $port)) -}}
+{{- $entry := dict "id" $id "version" $m.version "page" $m.page "label" $m.label "icon" $m.icon "navGroup" $m.navGroup "adminOnly" $adminOnly "upstream" (printf "%s:%s" $host $port) -}}
+{{- if $hasNavSection -}}
+{{- $_ := set $entry "navSection" $navSection -}}
+{{- end -}}
+{{- $out = append $out $entry -}}
 {{- end -}}
 {{- end -}}
 {{- toJson $out -}}
@@ -137,12 +164,17 @@ render on the first invalid rule. Call with the root context.
 
 {{- /*
 The public projection served as /modules.json: exactly id, version, page, label, icon, navGroup
-and adminOnly (always a boolean). The upstream and any unknown input field never appear here.
+and adminOnly (always a boolean), plus navSection (the trimmed sidebar heading) only when the
+entry sets it. The upstream and any unknown input field never appear here.
 */ -}}
 {{- define "uzi.webModules.json" -}}
 {{- $pub := list -}}
 {{- range include "uzi.webModules.list" . | fromJsonArray -}}
-{{- $pub = append $pub (dict "id" .id "version" .version "page" .page "label" .label "icon" .icon "navGroup" .navGroup "adminOnly" .adminOnly) -}}
+{{- $p := dict "id" .id "version" .version "page" .page "label" .label "icon" .icon "navGroup" .navGroup "adminOnly" .adminOnly -}}
+{{- if hasKey . "navSection" -}}
+{{- $_ := set $p "navSection" .navSection -}}
+{{- end -}}
+{{- $pub = append $pub $p -}}
 {{- end -}}
 {{- toPrettyJson $pub -}}
 {{- end -}}

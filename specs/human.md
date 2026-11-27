@@ -2085,6 +2085,7 @@ PRD at `prds/done/4123-weekly-limit-warning.md`.
 PRD at `prds/done/4686-runtime-web-modules.md`.
 
 - Operators can enable trusted runtime web modules through deployment config (chart `web.modules[]`, or the compose generator and override), served same-origin under `/modules/<id>/` with no web image rebuild and an unchanged CSP. A module failing to load, render or match the host contract is contained to its own page. (AI-synced 2026-11-25)
+- Operators can give modules-group entries a named sidebar section through the optional `navSection` field (1 to 24 characters; entries sharing a heading share a section). (AI-synced 2026-11-27)
 
 ## Demo mode branding
 
