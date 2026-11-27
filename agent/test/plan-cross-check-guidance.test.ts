@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { test } from "node:test";
+import { describe, test } from "node:test";
 import { buildAutomaticRevisionPrompt, buildLeadSystemPrompt, SUBAGENT_SAFETY_APPEND } from "../src/prompt.js";
 import { crossCheckBrief, codeCrossCheckBrief, crossCheckPrompt } from "../src/codex/cross-check.js";
 import type { ClaimResponse } from "../src/protocol.js";
+import { SCRATCH_PLACEMENT_FACT } from "../src/scratch-guidance.js";
 
 // These are instruction-contract checks, not a mock model or a prediction of its verdict.
 const rules = {
@@ -176,6 +177,41 @@ test("worker scratch placement fact reaches both runtime prompts and both plan c
   for (const text of [...runtime, ...checkers]) {
     assert.ok(trusted(text).includes(fact), "same bounded worker-authored placement fact outside DATA");
   }
+});
+
+// Issue #4758: worker-managed tool caches are not run artifacts. One named test per
+// consumer surface, so a missing sentence reports every surface it fails to reach.
+const WORKER_CACHE_SENTENCE = "The worker-managed `GOCACHE`, `GOMODCACHE` and `UZI_SQLC_DIR` caches are tool caches, not run artifacts: they stay where the worker points them, so do not point them into `.uzi/scratch/`, since an empty scratch cache can bypass the baked, verified archive and force a download. A tool's own cache-local atomic population, such as the `.stage.*` directory `scripts/sqlc.sh` creates next to the archive it publishes, is part of that cache and is not a scratch violation. A tool's private per-invocation temp work, such as `scripts/sqlc.sh`'s bare `mktemp -d`, still belongs in scratch by setting `TMPDIR` under `.uzi/scratch/`; moving only that temp work does not make a warm cache cold.";
+describe("worker-managed tool caches are not run artifacts", () => {
+  const surfaces: [string, () => string][] = [
+    ["built-in claude lead", () => buildLeadSystemPrompt(undefined, { harness: "claude" }).append],
+    ["built-in codex lead", () => buildLeadSystemPrompt(undefined, { harness: "codex" }).append],
+    ["customized claude lead", () => buildLeadSystemPrompt("custom lead prompt", { harness: "claude" }).append],
+    ["customized codex lead", () => buildLeadSystemPrompt("custom lead prompt", { harness: "codex" }).append],
+    ["seeded claude lead", () => buildLeadSystemPrompt(undefined, { harness: "claude", seeded: true }).append],
+    ["seeded codex lead", () => buildLeadSystemPrompt(undefined, { harness: "codex", seeded: true }).append],
+    ["subagent safety append", () => SUBAGENT_SAFETY_APPEND],
+    ["plan revision prompt", () => buildAutomaticRevisionPrompt("plan", "advice")],
+    ["codex plan cross-check brief", () => crossCheckBrief("Read and Search")],
+    ["claude plan cross-check brief", () => crossCheckBrief("Read, Grep and Glob")],
+  ];
+  for (const [surface, render] of surfaces) {
+    test(surface, () => {
+      const text = trusted(render());
+      const label = `missing worker-cache guidance on ${surface}`;
+      assert.ok(text.includes(WORKER_CACHE_SENTENCE), `${label}: exact sentence`);
+      for (const pin of ["`GOCACHE`", "`GOMODCACHE`", "`UZI_SQLC_DIR`", "not run artifacts",
+        "`.stage.*` directory", "is part of that cache and is not a scratch violation",
+        "`TMPDIR` under `.uzi/scratch/`", "does not make a warm cache cold"]) {
+        assert.ok(text.includes(pin), `${label}: ${pin}`);
+      }
+      assert.ok(text.indexOf("not a scratch violation") < text.indexOf("still belongs in scratch"),
+        `${label}: cache-local .stage population precedes private temp work`);
+    });
+  }
+  test("scratch fact stays silent on npm (out of scope for #4758)", () => {
+    assert.doesNotMatch(SCRATCH_PLACEMENT_FACT, /npm/i);
+  });
 });
 
 test("both checker families wire the shared plan brief into trusted instructions", () => {

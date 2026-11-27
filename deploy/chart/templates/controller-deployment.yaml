@@ -259,6 +259,11 @@ spec:
             - name: UZI_WORKER_GO_MAXPROCS
               value: {{ $goMaxProcs | quote }}
             {{- end }}
+            {{- $goMemLimit := include "uzi.workerGoMemLimit" (dict "root" .) }}
+            {{- if $goMemLimit }}
+            - name: UZI_WORKER_GO_MEMLIMIT
+              value: {{ $goMemLimit | quote }}
+            {{- end }}
             {{- /* Per-run cache cap (#4576): strings relayed verbatim, only when nonempty. */}}
             {{- $runCacheCapMaxBytes := include "uzi.workerRunCacheCapSetting" (dict "name" "runCacheCapMaxBytes" "root" .) }}
             {{- if $runCacheCapMaxBytes }}

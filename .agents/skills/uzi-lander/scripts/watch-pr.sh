@@ -28,6 +28,12 @@
 #                     CI needing approval. Ignore other humans, bots and edits to older
 #                     comments. Never merges,
 #                     requests reviews, or approves CI. Other readiness flags do not gate.
+#   --writers-only    hold watch for a PR you are not landing yet (waiting for a CI slot, or a
+#                     reviewed local head not pushed). Ignores CI, review and findings; exits 10
+#                     on an active ci_fix on the branch, 4 on an active mr_rework on the PR, 14
+#                     when the PR head moves from the first head seen. A red head is exactly when
+#                     uzi may start a ci_fix, which the readiness mode never waits to see.
+#                     Not combinable with --since. Max polls elapsed is exit 2, as usual.
 #   --after ISO8601   override the discussion cutoff (requires --since); accept seconds,
 #                     optional fractional seconds, and Z or a signed HH:MM UTC offset.
 #                     Activity must be strictly newer. Head/CI triggers ignore this cutoff.
@@ -90,6 +96,8 @@
 #      CI_FIX_ACTIVE/RECENT name the runs; decide wait/cancel/review before local work.
 #  13  author attention — --since observed head_changed, author_activity or
 #      ci_approval_required. Inspect the reason; this is never merge-readiness.
+#  14  head moved — --writers-only saw the PR head change from the first head it read
+#      (RESULT=head_changed from=<sha> to=<sha>). Someone pushed; re-snapshot.
 # Branch-writer resolution precedes conflicts: unreadable uzi plus CONFLICTING is exit 9, not 8.
 #
 # "CodeRabbit reviewed this head" is the union of robust signals, because a
@@ -132,15 +140,16 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/lib/ci-fix.sh"
 net_retry_install
 
-usage() { echo "usage: watch-pr.sh OWNER/REPO PR [--since FULL_SHA [--after ISO8601]] [interval_secs] [max_polls] [--reviewer any|coderabbit|greptile|none] [--reviewer-grace MIN] [--max-unknown N] [--ci-grace MIN]" >&2; exit 2; }
+usage() { echo "usage: watch-pr.sh OWNER/REPO PR [--since FULL_SHA [--after ISO8601] | --writers-only] [interval_secs] [max_polls] [--reviewer any|coderabbit|greptile|none] [--reviewer-grace MIN] [--max-unknown N] [--ci-grace MIN]" >&2; exit 2; }
 
 REVIEWER="any"; GRACE_MIN=10; MAX_UNKNOWN="${WATCH_PR_MAX_UNKNOWN:-5}"; CI_GRACE_MIN="${WATCH_PR_CI_GRACE:-15}"
-SINCE=""; AFTER=""; activity_after=""
+SINCE=""; AFTER=""; activity_after=""; WRITERS_ONLY=0; held_head=""
 POS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --since) [ $# -ge 2 ] && [ -n "$2" ] || usage; SINCE=$2; shift 2;;
     --after) [ $# -ge 2 ] && [ -n "$2" ] || usage; AFTER=$2; shift 2;;
+    --writers-only) WRITERS_ONLY=1; shift;;
     --reviewer) REVIEWER="${2:?}"; shift 2;;
     --reviewer-grace) GRACE_MIN="${2:?}"; shift 2;;
     --max-unknown) MAX_UNKNOWN="${2:?}"; shift 2;;
@@ -160,6 +169,7 @@ case "$MAX_UNKNOWN" in ''|*[!0-9]*|0) echo "bad --max-unknown: $MAX_UNKNOWN" >&2
 case "$CI_GRACE_MIN" in ''|*[!0-9]*) echo "bad --ci-grace: $CI_GRACE_MIN" >&2; usage;; esac
 if [ -n "$SINCE" ] && ! [[ "$SINCE" =~ ^[0-9a-fA-F]{40}$ ]]; then echo 'bad --since: use a full commit SHA' >&2; usage; fi
 SINCE=$(printf '%s' "$SINCE" | tr 'A-F' 'a-f')
+if [ -n "$SINCE" ] && [ "$WRITERS_ONLY" -eq 1 ]; then echo '--writers-only and --since are exclusive' >&2; usage; fi
 if [ -n "$AFTER" ]; then
   [ -n "$SINCE" ] || { echo '--after requires --since' >&2; usage; }
   activity_after=$(iso8601_epoch "$AFTER") || { echo 'bad --after: use an ISO8601 timestamp with seconds and a timezone' >&2; usage; }
@@ -274,6 +284,11 @@ while [ "$i" -lt "$MAX" ]; do
     continue
   fi
   if [ "$pstate" != "OPEN" ]; then echo "RESULT=pr_not_open state=$pstate"; exit 2; fi
+  # The held baseline is the first valid head, recorded before any writer lookup can fail.
+  if [ "$WRITERS_ONLY" -eq 1 ]; then
+    [ -n "$held_head" ] || held_head=$head
+    if [ "$head" != "$held_head" ]; then echo "RESULT=head_changed from=$held_head to=$head"; exit 14; fi
+  fi
   if [ -n "$SINCE" ]; then
     watch_author_activity
     if [ "$unknown" -eq 1 ]; then unknown_streak; else unk_streak=0; fi
@@ -307,6 +322,13 @@ while [ "$i" -lt "$MAX" ]; do
   echo "CI_FIX_RECENT=$CI_FIX_RECENT"
   if [ "$unknown" -ne 0 ]; then unknown_streak; sleep "$INTERVAL"; continue; fi
   if [ "$CI_FIX_ACTIVE_COUNT" -gt 0 ]; then echo "RESULT=ci_fix_active"; exit 10; fi
+  if [ "$WRITERS_ONLY" -eq 1 ]; then
+    if [ "$mrw_active" -gt 0 ]; then echo "RESULT=mr_rework_active"; exit 4; fi
+    unk_streak=0
+    echo "try $i: held head=${head:0:8} writers=none"
+    sleep "$INTERVAL"
+    continue
+  fi
   mergeable=$(printf '%s' "$pv" | jq -r '.mergeable // empty' 2>/dev/null || true)
   if [ "$mergeable" = "CONFLICTING" ]; then
     echo "try $i: head=${head:0:8} mergeable=CONFLICTING merge_state=$(printf '%s' "$pv" | jq -r '.mergeStateStatus // empty' 2>/dev/null || true)"

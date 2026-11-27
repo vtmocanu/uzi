@@ -584,6 +584,7 @@ async function mainBody(): Promise<void> {
   log.info("go concurrency defaults", {
     build_parallelism: config.goConcurrency.buildParallelism ?? "unset",
     max_procs: config.goConcurrency.maxProcs ?? "unset",
+    mem_limit: config.goConcurrency.memLimit ?? "unset",
   });
   // #3031 E6: bounded, non-gating posture diagnostics; the producer never gates on them.
   const bootstrap = maintenanceBootstrapRoots();

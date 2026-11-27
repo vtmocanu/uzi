@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { loadConfig } from "../src/config.js";
-import { configureGoConcurrency, goConcurrencyEnv, parseGoConcurrency } from "../src/go-concurrency.js";
+import { applyGoMemLimitDefault, configureGoConcurrency, goConcurrencyEnv, parseGoConcurrency } from "../src/go-concurrency.js";
 import { buildCheckEnv } from "../src/sdk-env.js";
 
 afterEach(() => { configureGoConcurrency({}); });
@@ -55,6 +55,81 @@ describe("parseGoConcurrency", () => {
         );
       }
     }
+  });
+});
+
+describe("WORKER_GO_MEMLIMIT", () => {
+  const accepted: Array<[string, string]> = [
+    ["6GiB", "6GiB"], ["512MiB", "512MiB"], ["007GiB", "7GiB"], ["\t 6GiB\n", "6GiB"], ["2147483647GiB", "2147483647GiB"],
+  ];
+  const unset = ["", "  \t "];
+  const rejected = [
+    "0GiB", "00MiB", "6gib", "6G", "6GB", "6", "1.5GiB", "+6GiB", "-6GiB", "2147483648GiB", "off",
+    "\uFEFF6GiB", "\u00856GiB",
+  ];
+
+  it("accepts and canonicalizes valid values", () => {
+    for (const [raw, want] of accepted) {
+      assert.deepEqual(parseGoConcurrency({ WORKER_GO_MEMLIMIT: raw }), { memLimit: want }, JSON.stringify(raw));
+    }
+  });
+
+  it("treats unset and blank as no key", () => {
+    for (const raw of unset) {
+      const out = parseGoConcurrency({ WORKER_GO_MEMLIMIT: raw });
+      assert.deepEqual(out, {});
+      assert.equal(Object.hasOwn(out, "memLimit"), false);
+    }
+    assert.deepEqual(parseGoConcurrency({}), {});
+  });
+
+  it("rejects invalid values naming the variable", () => {
+    for (const raw of rejected) {
+      assert.throws(
+        () => parseGoConcurrency({ WORKER_GO_MEMLIMIT: raw }),
+        /WORKER_GO_MEMLIMIT must be a positive integer <= 2147483647 followed by MiB or GiB/,
+        JSON.stringify(raw),
+      );
+    }
+  });
+
+  it("loadConfig carries it and fails startup on a bad value", () => {
+    const base = { UZI_API_URL: "https://example.com", UZI_WORKER_TOKEN: "fixture" };
+    assert.deepEqual(loadConfig({ ...base, WORKER_GO_MEMLIMIT: "6GiB" }).goConcurrency, { memLimit: "6GiB" });
+    assert.throws(() => loadConfig({ ...base, WORKER_GO_MEMLIMIT: "6G" }), /WORKER_GO_MEMLIMIT/);
+  });
+});
+
+describe("applyGoMemLimitDefault", () => {
+  it("sets GOMEMLIMIT from the settings", () => {
+    const env: Record<string, string | undefined> = {};
+    applyGoMemLimitDefault(env, [], { memLimit: "6GiB" });
+    assert.equal(env.GOMEMLIMIT, "6GiB");
+  });
+
+  it("yields to an injected GOMEMLIMIT run variable", () => {
+    const env: Record<string, string | undefined> = { GOMEMLIMIT: "2GiB" };
+    applyGoMemLimitDefault(env, [{ name: "REGION" }, { name: "GOMEMLIMIT" }], { memLimit: "6GiB" });
+    assert.equal(env.GOMEMLIMIT, "2GiB");
+  });
+
+  it("overwrites a GOMEMLIMIT that was not injected", () => {
+    const env: Record<string, string | undefined> = { GOMEMLIMIT: "1MiB" };
+    applyGoMemLimitDefault(env, [{ name: "REGION" }], { memLimit: "6GiB" });
+    assert.equal(env.GOMEMLIMIT, "6GiB");
+    const env2: Record<string, string | undefined> = { GOMEMLIMIT: "1MiB" };
+    applyGoMemLimitDefault(env2, undefined, { memLimit: "6GiB" });
+    assert.equal(env2.GOMEMLIMIT, "6GiB");
+  });
+
+  it("adds no key when unset, and defaults to the configured settings", () => {
+    const env: Record<string, string | undefined> = {};
+    applyGoMemLimitDefault(env, [], {});
+    assert.equal(Object.hasOwn(env, "GOMEMLIMIT"), false);
+    configureGoConcurrency({ memLimit: "512MiB" });
+    applyGoMemLimitDefault(env);
+    assert.equal(env.GOMEMLIMIT, "512MiB");
+    assert.deepEqual(goConcurrencyEnv(), {});
   });
 });
 
