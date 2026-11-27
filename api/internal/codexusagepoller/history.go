@@ -22,7 +22,8 @@ type HistoryRecorder interface {
 
 // copyHistory runs the history copy for a reading the fenced write just accepted, under
 // one 250 ms context. The diagnostic is a fixed message with a fixed category and the
-// account id; error text is never logged.
+// account id; error text is never logged. A timeout logs "outcome unknown": PostgreSQL may have
+// committed the sample before the client gave up. error and skipped log "not recorded".
 func (e *Engine) copyHistory(ctx context.Context, p store.UpsertCodexAccountRateLimitsParams, lastSuccess pgtype.Timestamptz) {
 	if e.history == nil {
 		return
@@ -39,7 +40,10 @@ func (e *Engine) copyHistory(ctx context.Context, p store.UpsertCodexAccountRate
 	case n == 0:
 		category = "skipped"
 	}
-	if category != "" {
+	switch category {
+	case "timeout":
+		e.logger.Warn("codex usage poller: usage history copy outcome unknown", "category", category, "account", p.ProviderAccountID.String())
+	case "error", "skipped":
 		e.logger.Warn("codex usage poller: usage history copy not recorded", "category", category, "account", p.ProviderAccountID.String())
 	}
 }
