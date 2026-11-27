@@ -335,3 +335,33 @@ func TestLinkRepoRefusesIDsLongerThanTheStoreHolds(t *testing.T) {
 		}
 	})
 }
+
+// An id that fits the kind-neutral stored shape but not the connection kind's grammar is
+// refused at the service boundary, before any driver is built or request made: YouTrack's
+// behaviour before PRD #4765 A1 made the stored shape kind-neutral (review of #4779).
+func TestLinkRepoRefusesAnIDTheKindCannotHoldBeforeAnyRequest(t *testing.T) {
+	for _, bad := range []string{"abc", "1-", "1208765432109876"} {
+		t.Run("project "+bad, func(t *testing.T) {
+			h := newLinkHarness(t)
+			h.built = nil
+			repo := h.q.addRepo(h.user, true)
+			e := wantKind(t, errOf(h.link(repo, bad, "5-1")), KindBadRequest)
+			if e.Message != "invalid project id" {
+				t.Errorf("message = %q", e.Message)
+			}
+			if len(h.built) != 0 {
+				t.Error("a driver was built for an id the kind cannot hold")
+			}
+		})
+	}
+	t.Run("listed tag with a non-YouTrack id", func(t *testing.T) {
+		h := newLinkHarness(t)
+		h.template.tags = append(h.template.tags, issuetracker.Tag{ID: "abc", Name: "odd", Owner: linkBot,
+			Use: issuetracker.SharingSettings{Groups: []issuetracker.Group{linkAll}}})
+		repo := h.q.addRepo(h.user, true)
+		_ = wantKind(t, errOf(h.link(repo, "0-1", "abc")), KindBadRequest)
+		if h.q.repo(repo).linkedConn != uuid.Nil {
+			t.Error("the repo was linked")
+		}
+	})
+}

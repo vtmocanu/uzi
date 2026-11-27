@@ -62,6 +62,11 @@ func (s *Service) LinkRepo(ctx context.Context, userID, repoID, connID uuid.UUID
 	if !issuetracker.ValidProjectID(projectID) {
 		return Link{}, &Error{Kind: KindBadRequest, Message: "invalid project id"}
 	}
+	// The kind's own id grammar too, before any request (PRD #4765 A1). An unknown kind
+	// is left to checkLinkTarget, which reports it as the internal error it is.
+	if kind, ok := issuetracker.ParseKind(row.Kind); ok && !issuetracker.ValidIDFor(kind, projectID) {
+		return Link{}, &Error{Kind: KindBadRequest, Message: "invalid project id"}
+	}
 
 	account, project, tag, err := s.checkLinkTarget(ctx, userID, connID, row, projectID, tagID)
 	if err != nil {
@@ -217,7 +222,7 @@ func (s *Service) checkLinkTarget(ctx context.Context, userID, connID uuid.UUID,
 	if !found {
 		return noAccount, noProject, noTag, &Error{Kind: KindBadRequest, Message: "tag not found among the tags this connection's account can see"}
 	}
-	if !issuetracker.ValidTagID(tag.ID) {
+	if !issuetracker.ValidIDFor(kind, tag.ID) {
 		return noAccount, noProject, noTag, &Error{Kind: KindBadRequest, Message: "the tag's id is too long or malformed to store as an eligibility tag"}
 	}
 	if utf8.RuneCountInString(tag.Name) > maxTagNameLen ||

@@ -28,3 +28,15 @@ func TestTagVerdictsByKind(t *testing.T) {
 		}
 	}
 }
+
+// ValidIDFor is the stored shape plus the kind's grammar; an unknown kind accepts no id.
+func TestValidIDForByKind(t *testing.T) {
+	for id, want := range map[string]bool{"0-1": true, "12-345": true, "abc": false, "1-": false, "1208765432109876": false, "0-1/x": false, "": false} {
+		if got := ValidIDFor(KindYouTrack, id); got != want {
+			t.Errorf("ValidIDFor(youtrack, %q) = %v, want %v", id, got, want)
+		}
+	}
+	if ValidIDFor(Kind("nope"), "0-1") {
+		t.Error("an unknown kind accepted an id")
+	}
+}

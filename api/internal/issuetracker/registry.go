@@ -30,6 +30,22 @@ func TagVerdicts(kind Kind, t Tag, a Account) (accountCanApply, othersCanApply b
 	return judge(t, a)
 }
 
+// idGrammars maps each Kind to the grammar of its project and tag ids, on top of
+// the kind-neutral stored shape (ValidProjectID). A kind with no entry accepts no id.
+var idGrammars = map[Kind]func(string) bool{
+	KindYouTrack: entityIDRE.MatchString,
+}
+
+// ValidIDFor reports whether id is a project or tag id that kind accepts: the
+// kind-neutral stored shape and the kind's own grammar. The service checks it at
+// its boundary, from the owner-scoped connection's kind, before any driver is
+// built or request made, so a malformed id is a 400 there for every kind (PRD
+// #4765 A1). An unknown kind accepts none.
+func ValidIDFor(kind Kind, id string) bool {
+	grammar, ok := idGrammars[kind]
+	return ok && ValidProjectID(id) && grammar(id)
+}
+
 // New constructs the driver for kind. An unknown kind wraps ErrUnsupportedKind.
 // Like every Constructor, it never puts the token in an error.
 func New(kind Kind, opts Options) (Driver, error) {

@@ -88,6 +88,16 @@ func (s *Service) listCheckedStates(ctx context.Context, userID uuid.UUID, src s
 		return nil, &Error{Kind: KindBadRequest, Message: "invalid project id"}
 	}
 	connID := uuid.UUID(src.LinkedConnectionID.Bytes)
+	// The kind's own id grammar, read from the owner-scoped connection, before a driver is
+	// built (PRD #4765 A1): a stored id the kind cannot hold is a 400, never a 502 from the
+	// driver. An unknown kind is left to DriverFor, which reports it.
+	row, err := s.getRow(ctx, userID, connID)
+	if err != nil {
+		return nil, err
+	}
+	if kind, ok := issuetracker.ParseKind(row.Kind); ok && !issuetracker.ValidIDFor(kind, src.IssueTrackerProjectID.String) {
+		return nil, &Error{Kind: KindBadRequest, Message: "invalid project id"}
+	}
 	d, err := s.DriverFor(ctx, userID, connID, issuetracker.Binding{}, issuetracker.StateMapping{})
 	if err != nil {
 		return nil, err
