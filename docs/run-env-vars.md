@@ -460,13 +460,16 @@ Things to know:
   It is removed with the home, and kept with it where the home is kept.
 - **Other runs of the same user can read it.** Runs of one user on the same
   worker share a user ID, so another run there can read and modify that
-  directory. This always holds on Claude. On Codex only the `required` command
-  sandbox mode (`UZI_CODEX_COMMAND_SANDBOX`) prevents it; with `off` (the
-  default) or `best-effort` on a kernel without Landlock it holds too. Store
+  directory. This always holds on Claude. On Codex it is prevented only where
+  Landlock is applied (`UZI_CODEX_COMMAND_SANDBOX`): always in `required`, and
+  in `best-effort` on a kernel with Landlock. With `off` (the default) it holds
+  too. Store
   only read-only, narrowly scoped registry credentials.
 - **Credential helpers.** With no `credsStore` in the configuration, the Docker
-  CLI may detect a `docker-credential-*` helper on `PATH` and use it instead of
-  writing the login to `config.json`.
+  CLI on Linux auto-detects only the `pass` or `secretservice` helper
+  (`docker-credential-pass` when `pass` is on `PATH`, or
+  `docker-credential-secretservice`) and uses it instead of writing the login
+  to `config.json`.
 - **A refused directory.** On Codex, if the sandbox cannot set up the directory
   (for example a planted symlink), the command prints
   `Docker config directory unavailable` on stderr and runs without a persistent

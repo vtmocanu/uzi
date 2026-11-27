@@ -771,8 +771,10 @@ The split-across-files and elided-context patch gaps are closed by the `multi_li
 
 ## M3: a per-run Docker client configuration directory
 
-The Docker CLI cannot take a login from the environment, and the worker owns `DOCKER_CONFIG`, so
-a registry login needs a directory that lives as long as the run. M3 gives each run one directory
+Docker CLIs before 28.3 cannot take a login from the environment (later ones also read
+`DOCKER_AUTH_CONFIG`, which a user may set as a variable); a `docker login` writes to
+`DOCKER_CONFIG`, which the worker owns, so a registry login needs a directory that lives as long as
+the run. M3 gives each run one directory
 named `.docker` inside the run home and points `DOCKER_CONFIG` at it for model commands.
 
 Decisions:
@@ -805,9 +807,10 @@ Decisions:
   inside the existing Docker resume note, so it fires on every Docker-wired resume.
 
 Evidence: `e2e/docker-config-persist/run.sh` with `agent/test/codex-docker-config-linux.test.ts`
-runs the production path through `uzi-codex-supervisor` as the command uid, in a worker image
-built at the commit, against an htpasswd registry on the daemon host loopback. It passed at
-`b429d4973` on a fresh build and again on the later M3 tree: every step passed with the sandbox
+runs the production path through `uzi-codex-supervisor` as the command uid, against an htpasswd
+registry on the daemon host loopback. The script builds the worker image from the working tree and
+labels it with HEAD. It passed with a fresh worker image build at `b429d4973` and again on the m2
+and rework trees: every step passed with the sandbox
 modes `off` and `required`, and the Claude leg (which sets `DOCKER_CONFIG` explicitly to
 `buildSdkEnv`'s value) passed.
 
@@ -818,13 +821,14 @@ Residuals:
   on the worker can read and write another run's `.docker`: credentials in `config.json`,
   `cli-plugins`, `credsStore` and `credHelpers` (which make the Docker CLI execute a helper),
   contexts and proxies. That is executable persistence, the class [ADR-91](0091-runner-cross-run-persistence-residual.md)
-  accepts, and it lasts through parked and retained homes. Codex with Landlock `required` closes
-  it.
+  accepts, and it lasts through parked and retained homes. It is closed only where Landlock is
+  applied: always in `required`, and in `best-effort` on a kernel with Landlock.
 - (b) The owner check does not bind the directory to a run: all runs share one command uid.
 - (c) A planted `.docker` keeps a run degraded, visible only to the model through the stderr line.
 - (d) There is no size bound on `.docker`.
 - (e) The Docker CLI may detect a `docker-credential-*` helper on `PATH` when no `credsStore` is
-  set, and the command `PATH` includes the shared `/nix`.
+  set, and the command `PATH` includes the shared `/nix` only when the run is provisioned with devbox (the
+  fixed command `PATH` has no `/nix`).
 - (f) A successor attempt executor gets a new home, so its login is lost; the resume note tells
   the model.
 - (g) Codex creates the grant whether or not Docker is wired; Claude sets `DOCKER_CONFIG` only
