@@ -217,8 +217,8 @@ describe("Run defaults — code cross-check consent", () => {
     expect(mockApi.setPlanCrossCheckEnabled).not.toHaveBeenCalled();
     expect(refresh).toHaveBeenCalledOnce();
   });
-  it("surfaces both-family 400 refusal and preserves consent", async () => {
-    mockApi.setCodeCrossCheckEnabled.mockRejectedValue(new ApiError(400, "both Claude and Codex credentials must be usable"));
+  it("surfaces both-family 409 refusal and preserves consent", async () => {
+    mockApi.setCodeCrossCheckEnabled.mockRejectedValue(new ApiError(409, "both Claude and Codex credentials must be usable"));
     render(<MemoryRouter><RunDefaults /></MemoryRouter>);
     fireEvent.click(code());
     expect(await screen.findByText("both Claude and Codex credentials must be usable")).toBeTruthy();

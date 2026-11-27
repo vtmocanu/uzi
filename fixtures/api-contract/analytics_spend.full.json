@@ -307,6 +307,9 @@
       "repo_key": "x",
       "repo_id": "x",
       "repo_path": "x",
+      "issue_iid": 1,
+      "issue_title": "x",
+      "mr_iid": 1,
       "user_id": "x",
       "user_email": "x"
     }

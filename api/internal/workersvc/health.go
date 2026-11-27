@@ -1775,6 +1775,9 @@ func (s *Service) queuedReasonAfterPrerequisites(ctx context.Context, now time.T
 			if r.Kind == runkind.Job && r.Harness == harnessClaude {
 				return reasonNoProviderJobCapableWorker
 			}
+			// A provider-bound Codex plan or code checker (PRD #4574 M2) reads this generic reason: no
+			// dedicated string exists for codex_provider_checker_v1, which the same count requires for kind
+			// cross_check. The cross-check rungs below are never reached for such a run while this count is 0.
 			return reasonNoProviderCapableWorker
 		}
 	}

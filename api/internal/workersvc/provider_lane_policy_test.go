@@ -77,6 +77,11 @@ type laneCreationStore struct {
 	lanePresenceReader
 }
 
+// TestProviderLaneFakeCreationAdmission is the CheckerLane (plan/code checker) admission over the
+// in-memory store, where no transaction exists (PRD #4574 M2): Refused keeps its refusal, a Vendor
+// decision inserts (Claude checker) or fails closed on the fake credential (Codex checker), and ONLY a
+// Provider decision (a selected Codex source on a Codex checker) is errProviderCreateRequiresTx. Each row
+// asserts the exact error AND the insert count.
 func TestProviderLaneFakeCreationAdmission(t *testing.T) {
 	for _, tc := range []struct {
 		name             string
@@ -89,7 +94,7 @@ func TestProviderLaneFakeCreationAdmission(t *testing.T) {
 		{name: "unknown explicit", explicit: laneHarness("unknown"), want: ErrProviderLaneUnsupported},
 		{name: "claude selected", explicit: laneHarness(HarnessClaude), row: store.GetUserProviderLaneSourcesRow{ClaudeProviderID: pgtype.UUID{Bytes: uuid.New(), Valid: true}}, want: ErrProviderLaneUnsupported, queries: 1},
 		{name: "codex selected claude allowed", explicit: laneHarness(HarnessClaude), row: store.GetUserProviderLaneSourcesRow{CodexProviderID: pgtype.UUID{Bytes: uuid.New(), Valid: true}}, queries: 1, inserts: 1},
-		{name: "codex selected codex refused", explicit: laneHarness(HarnessCodex), row: store.GetUserProviderLaneSourcesRow{CodexProviderID: pgtype.UUID{Bytes: uuid.New(), Valid: true}}, want: ErrProviderLaneUnsupported, queries: 1},
+		{name: "codex selected codex is a provider decision that needs a transaction", explicit: laneHarness(HarnessCodex), row: store.GetUserProviderLaneSourcesRow{CodexProviderID: pgtype.UUID{Bytes: uuid.New(), Valid: true}}, want: errProviderCreateRequiresTx, queries: 1},
 		{name: "neither claude allowed", explicit: laneHarness(HarnessClaude), queries: 1, inserts: 1},
 		{name: "neither codex fake credential refusal", explicit: laneHarness(HarnessCodex), want: errNoCredentialForHarness, queries: 1},
 	} {
@@ -99,7 +104,7 @@ func TestProviderLaneFakeCreationAdmission(t *testing.T) {
 			_, err := (&Service{q: f}).createRunResolved(context.Background(), uuid.New(), tc.explicit, func(Store, resolvedHarness) (store.Run, error) {
 				inserts++
 				return store.Run{}, nil
-			}, harnessCreationOrigin{RefuseProviderOwner: true})
+			}, harnessCreationOrigin{CheckerLane: true})
 			if !errors.Is(err, tc.want) || f.calls != tc.queries || inserts != tc.inserts {
 				t.Fatalf("err=%v want=%v queries=%d inserts=%d", err, tc.want, f.calls, inserts)
 			}
@@ -150,7 +155,9 @@ func TestProviderLaneSettingsSelectionBeforeCredentials(t *testing.T) {
 		{ClaudeProviderID: pgtype.UUID{Bytes: uuid.New(), Valid: true}},
 		{CodexProviderID: pgtype.UUID{Bytes: uuid.New(), Valid: true}},
 	} {
-		// Vendor availability must not be read for a refused selection.
+		// Vendor availability must not be read for a refused or source-decided half. The Codex-only row
+		// is a Provider decision (PRD #4574 M2, Q3) whose source this fake does not resolve to usable, so
+		// it is not usable; the usable-source cases are TestBothHarnessesUsableFollowsTheLaneDecision.
 		f := &laneSettingsStore{lanePresenceReader: lanePresenceReader{row: row}}
 		both, err := (&Service{q: f}).BothHarnessesUsable(context.Background(), uuid.New())
 		if both || err != nil || f.calls != 1 {

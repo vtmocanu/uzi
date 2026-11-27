@@ -1527,7 +1527,7 @@ WITH checker_template_pins AS MATERIALIZED (
       -- unknown claim key and start the run with no model credential. Same @worker_protocol_caps.
       AND (r.model_provider_key_mode IS NULL
            OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY($29::text[]) AND (r.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY($29::text[])))
-           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY($29::text[]) AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY($29::text[]))))
+           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY($29::text[]) AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY($29::text[])) AND (r.kind <> 'cross_check' OR 'codex_provider_checker_v1' = ANY($29::text[]))))
       AND (NOT (r.plan_cross_check_required OR (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan')))
            OR 'cross_check_v1' = ANY($29::text[]))
       AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
@@ -1844,7 +1844,7 @@ WITH checker_template_pins AS MATERIALIZED (
                 -- provider-bound run to a peer that lacks its engine's provider capability and could never claim it.
                 AND (r.model_provider_key_mode IS NULL
            OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(p.protocol_capabilities) AND (r.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY(p.protocol_capabilities)))
-           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(p.protocol_capabilities) AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(p.protocol_capabilities))))
+           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(p.protocol_capabilities) AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(p.protocol_capabilities)) AND (r.kind <> 'cross_check' OR 'codex_provider_checker_v1' = ANY(p.protocol_capabilities))))
       AND (NOT (r.plan_cross_check_required OR (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan')))
            OR 'cross_check_v1' = ANY(p.protocol_capabilities))
       AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
@@ -3259,7 +3259,7 @@ WHERE run.id = $1
   -- PRD #4320 module 5: the provider claim clause, mirrored (see ClaimRun).
   AND (run.model_provider_key_mode IS NULL
            OR (run.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities) AND (run.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities)))
-           OR (run.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities) AND (run.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities))))
+           OR (run.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities) AND (run.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities)) AND (run.kind <> 'cross_check' OR 'codex_provider_checker_v1' = ANY(w.protocol_capabilities))))
       AND (NOT (run.plan_cross_check_required OR (run.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = run.id AND pc.stage = 'plan')))
            OR 'cross_check_v1' = ANY(w.protocol_capabilities))
       AND (NOT (run.kind = 'cross_check' AND run.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = run.id AND pc.stage = 'plan'))
@@ -3849,7 +3849,7 @@ WHERE w.user_id = $1
         AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
         AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)
         AND 'codex_runtime_v3' = ANY(w.protocol_capabilities)
-        AND ($3::text <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities)))
+        AND ($3::text <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities)) AND ($3::text <> 'cross_check' OR 'codex_provider_checker_v1' = ANY(w.protocol_capabilities)))
   )
 `
 
@@ -4543,13 +4543,13 @@ func (q *Queries) CreatePauseInput(ctx context.Context, arg CreatePauseInputPara
 const createPlanCrossCheckChild = `-- name: CreatePlanCrossCheckChild :one
 INSERT INTO runs (id, user_id, repo_id, kind, target_run_id, harness, priority,
                   report_only, budget_wall_seconds, dispatched_at, auto_approve,
-                  issue_title, issue_description, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, trigger_source, worker_id, model_provider_key_mode)
+                  issue_title, issue_description, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, trigger_source, worker_id, model_provider_id, model_provider_revision, model_provider_key_mode, model_provider_key_secret_id, model_provider_key_rev)
 SELECT $1, lead.user_id, lead.repo_id, 'cross_check', lead.id, $2::text, 2,
        true, $3::int, now(), true, lead.issue_title, lead.issue_description,
-       COALESCE(repo.required_capabilities, '{}'), COALESCE(repo.required_capabilities, '{}'), lead.ignored_inferred_capabilities, 'cross_check', lead.worker_id, NULL::text
+       COALESCE(repo.required_capabilities, '{}'), COALESCE(repo.required_capabilities, '{}'), lead.ignored_inferred_capabilities, 'cross_check', lead.worker_id, $4::uuid, $5::int, $6::text, $7::uuid, $8::bigint
 FROM runs lead JOIN repos repo ON repo.id = lead.repo_id
-WHERE lead.id = $4 AND lead.user_id = $5
-  AND lead.worker_id = $6 AND lead.claim_generation = $7
+WHERE lead.id = $9 AND lead.user_id = $10
+  AND lead.worker_id = $11 AND lead.claim_generation = $12
   AND lead.status IN ('claimed', 'running') AND lead.claim_released_at IS NULL
   -- Guarded write (PRD #2460): the child is always the OPPOSITE family of its lead.
   AND lead.harness IN ('claude', 'codex') AND lead.harness <> $2::text
@@ -4561,22 +4561,32 @@ RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, statu
 `
 
 type CreatePlanCrossCheckChildParams struct {
-	ChildID           uuid.UUID   `json:"child_id"`
-	ChildHarness      string      `json:"child_harness"`
-	BudgetWallSeconds int32       `json:"budget_wall_seconds"`
-	LeadRunID         uuid.UUID   `json:"lead_run_id"`
-	UserID            uuid.UUID   `json:"user_id"`
-	WorkerID          pgtype.UUID `json:"worker_id"`
-	ClaimGeneration   int64       `json:"claim_generation"`
+	ChildID                  uuid.UUID   `json:"child_id"`
+	ChildHarness             string      `json:"child_harness"`
+	BudgetWallSeconds        int32       `json:"budget_wall_seconds"`
+	ModelProviderID          pgtype.UUID `json:"model_provider_id"`
+	ModelProviderRevision    pgtype.Int4 `json:"model_provider_revision"`
+	ModelProviderKeyMode     pgtype.Text `json:"model_provider_key_mode"`
+	ModelProviderKeySecretID pgtype.UUID `json:"model_provider_key_secret_id"`
+	ModelProviderKeyRev      pgtype.Int8 `json:"model_provider_key_rev"`
+	LeadRunID                uuid.UUID   `json:"lead_run_id"`
+	UserID                   uuid.UUID   `json:"user_id"`
+	WorkerID                 pgtype.UUID `json:"worker_id"`
+	ClaimGeneration          int64       `json:"claim_generation"`
 }
 
 // Preserve the lead's frozen inference policy; declared requirements keep their repo-hint source.
-// model_provider_key_mode (PRD #4320 M4), class REFUSED-LANE: written as an explicit NULL because this lane does not support provider-sourced runs yet (PRD #4322); workersvc refuses provider_lane_unsupported BEFORE this INSERT for a provider-sourced owner.
+// The five model_provider_* columns (PRD #4574 M2) are stamped from sqlc.narg parameters: all NULL is a vendor checker, all set is a provider-bound checker. createRunAtomic decides the lane under the shared secret-mutation lock (checkerLaneDecision) and verifyRunBinding asserts the inserted row equals the resolution, so an unstamped provider decision fails closed (errProviderBindingMismatch).
 func (q *Queries) CreatePlanCrossCheckChild(ctx context.Context, arg CreatePlanCrossCheckChildParams) (Run, error) {
 	row := q.db.QueryRow(ctx, createPlanCrossCheckChild,
 		arg.ChildID,
 		arg.ChildHarness,
 		arg.BudgetWallSeconds,
+		arg.ModelProviderID,
+		arg.ModelProviderRevision,
+		arg.ModelProviderKeyMode,
+		arg.ModelProviderKeySecretID,
+		arg.ModelProviderKeyRev,
 		arg.LeadRunID,
 		arg.UserID,
 		arg.WorkerID,
@@ -16397,7 +16407,7 @@ WHERE r.status = 'queued'
   -- PRD #4320 module 5: the provider claim clause, mirrored (see ClaimRun).
   AND (r.model_provider_key_mode IS NULL
            OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities) AND (r.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities)))
-           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities) AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities))))
+           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities) AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities)) AND (r.kind <> 'cross_check' OR 'codex_provider_checker_v1' = ANY(w.protocol_capabilities))))
                  AND (
                      NOT (
                          r.harness = 'codex'
@@ -16518,7 +16528,7 @@ WHERE r.status = 'queued'
   -- PRD #4320 module 5: the provider claim clause, mirrored (see ClaimRun).
   AND (r.model_provider_key_mode IS NULL
            OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities) AND (r.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities)))
-           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities) AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities))))
+           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities) AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities)) AND (r.kind <> 'cross_check' OR 'codex_provider_checker_v1' = ANY(w.protocol_capabilities))))
                  AND (
                      NOT (
                          r.harness = 'codex'

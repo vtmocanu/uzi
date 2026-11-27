@@ -880,6 +880,7 @@ func mapAnalyticsSpend(req analyticsRequest, b analytics.Bounds, doc store.Analy
 			PrimaryModel: t.PrimaryModel, CreatedAt: m.createdAt(t.CreatedAt), CostUSD: m.usd(t.Cost),
 			InputTokens: t.InputTokens, CacheReadTokens: t.CacheReadTokens, CacheCreationTokens: t.CacheCreationTokens,
 			OutputTokens: t.OutputTokens, RepoKey: t.RepoKey, RepoID: uuidStringPtr(t.RepoID), RepoPath: t.RepoPath,
+			IssueIID: t.IssueIID, IssueTitle: t.IssueTitle, MRIID: t.MRIID,
 			UserID: t.UserID.String(), UserEmail: t.UserEmail,
 		})
 	}

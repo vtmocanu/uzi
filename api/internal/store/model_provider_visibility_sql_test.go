@@ -201,8 +201,11 @@ var visibilityTable = map[string]visEntry{
 	// identity-only: keyed by an id the caller already holds under a prior visibility check
 	"InsertModelProviderRevision": {class: classIdentity, must: []string{"WHERE p.id = @provider_id"},
 		callers: []string{"handler/providers.go", "handler/providers_admin.go"}},
+	// workersvc/cross_check_same_model.go (PRD #4574 M2 same-model guard) reads the LEAD run's
+	// frozen (model_provider_id, model_provider_revision) stamp, which the server wrote when it froze
+	// the lead's binding under the owner-visibility check; the row feeds only the identity comparison.
 	"GetModelProviderRevision": {class: classIdentity, must: []string{"WHERE provider_id = $1 AND revision = $2"},
-		callers: []string{"handler/providers.go", "handler/providers_admin.go"}},
+		callers: []string{"handler/providers.go", "handler/providers_admin.go", "workersvc/cross_check_same_model.go"}},
 	"GetProviderBindingKeyByID": {class: classIdentity, must: []string{"WHERE id = $1 AND user_id = $2"},
 		callers: []string{"workersvc/provider_claim.go", "workersvc/provider_source.go"}},
 	"LockProviderBindingKeyForShareNowait": {class: classIdentity, must: []string{"WHERE id = $1 AND user_id = $2"},
@@ -215,8 +218,10 @@ var visibilityTable = map[string]visEntry{
 		callers: []string{"handler/providers_probe.go"}},
 	"DeleteProviderKeySecret": {class: classIdentity, must: []string{"WHERE user_id = $1 AND provider_id = $2"},
 		callers: []string{"handler/providers.go"}},
+	// workersvc/cross_check_gate_reason.go (PRD #4574 M2 attestation) passes lead.UserID, the lead
+	// run's own owner, to re-derive the checker lane decision; it reads only the owner's selections.
 	"GetUserProviderLaneSources": {class: classIdentity, must: []string{"WHERE id = $1"},
-		callers: []string{"workersvc/harness_resolver.go"}},
+		callers: []string{"workersvc/cross_check_gate_reason.go", "workersvc/harness_resolver.go"}},
 	"GetUserJudgeLanePolicy": {class: classIdentity, must: []string{"WHERE id = $1"},
 		callers: []string{"workersvc/harness_resolver.go"}},
 }
