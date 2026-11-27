@@ -23,8 +23,9 @@ import (
 // Admin Test of an organization key (PRD #4540 M1): POST /api/admin/providers/{id}/test dials the
 // definition's own gateway with its organization key (two steps: a bounded request and a forced
 // single-tool request, exactly as the per-user Test) and records the verdict as evidence for that exact
-// key and revision. The key is opened for the call and cleared after it; the response, the audit line
-// and every error carry the two verdicts and nothing from the gateway.
+// key and revision. The key is opened for the call and the opened buffer is zeroed after it; the header
+// strings built by providers.Probe and request copies are Go strings and are not cleared. The response,
+// the audit line and every error carry the two verdicts and nothing from the gateway.
 //
 // Steps: (1) capture the definition and its key's identity in one read; (2) admission (allowlist, profile,
 // then the per-definition limiter; the audit boundary starts here); (3) read and open the sealed key;
@@ -84,6 +85,13 @@ func (h *Handler) AdminTestSharedProvider(w http.ResponseWriter, r *http.Request
 	}
 	id, ok := httpx.PathUUID(w, r, "id", "provider")
 	if !ok {
+		return
+	}
+
+	// No instance secret box means no key can be opened. Refused before the capture and admission, so no
+	// audit line is written (as AdminPutOperatorKey does for its seal).
+	if h.box == nil {
+		internalProviderError(w, "open organization key for test", errors.New("no instance secret box"))
 		return
 	}
 
@@ -206,6 +214,7 @@ func (h *Handler) AdminTestSharedProvider(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if err != nil {
+		// Defensive: Prober.Probe documents only ErrBaseURLNotAllowed as an error return.
 		outcome = probeOutcomeProbeFailed
 		internalProviderError(w, "organization-key provider probe", err)
 		return
@@ -227,21 +236,13 @@ func (h *Handler) AdminTestSharedProvider(w http.ResponseWriter, r *http.Request
 		httpx.Error(w, http.StatusConflict, errStaleProbeMessage)
 		return
 	}
+	// The outcome and the response follow the write alone: a change that commits after it may hide the
+	// evidence from a later admin read, but this Test did record it. probed_at is the handler's clock at
+	// the write (the stored value is the database's now()).
 	outcome = probeOutcomeRecorded
-	fresh, err := h.q.GetSharedModelProviderAdmin(r.Context(), id)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		internalProviderError(w, "read organization-key probe result", err)
-		return
-	}
-	// No current evidence after the commit means the key or definition changed after the write: the
-	// same benign race as a lost write.
-	dto := adminSharedProviderDTO(fresh)
-	if err != nil || dto.OperatorKey == nil || dto.OperatorKey.Probe == nil {
-		outcome = probeOutcomeStale
-		httpx.Error(w, http.StatusConflict, errStaleProbeMessage)
-		return
-	}
-	httpx.JSON(w, http.StatusOK, map[string]*apitypes.ProviderProbeDTO{"probe": dto.OperatorKey.Probe})
+	httpx.JSON(w, http.StatusOK, map[string]*apitypes.ProviderProbeDTO{"probe": {
+		AuthResult: res.Auth, ToolResult: res.Tool, ProbedAt: time.Now().UTC(),
+	}})
 }
 
 // recordOperatorProbeEvidence stores the Test result for the exact tuple the probe ran against, in one

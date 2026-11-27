@@ -3,6 +3,7 @@ package handler
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -291,32 +292,32 @@ func TestOperatorKeyTestEvidenceFenceLiveDB(t *testing.T) {
 	// (i) a change committed between the dial and step 7.
 	changes := []struct {
 		name  string
-		apply func(s *opFx)
+		apply func(t *testing.T, s *opFx)
 	}{
-		{"key replace", func(s *opFx) { s.mustPutOrgKey(t, s.op.ID, orgKeyFixture()) }},
-		{"key disable", func(s *opFx) {
+		{"key replace", func(t *testing.T, s *opFx) { s.mustPutOrgKey(t, s.op.ID, orgKeyFixture()) }},
+		{"key disable", func(t *testing.T, s *opFx) {
 			if rec := s.adminDo(t, http.MethodPatch, opPath(s.op.ID, "key", "enabled"), `{"enabled":false}`); rec.Code != 200 {
 				t.Error(rec.Body.String())
 			}
 		}},
-		{"key disable then enable", func(s *opFx) {
+		{"key disable then enable", func(t *testing.T, s *opFx) {
 			for _, v := range []string{"false", "true"} {
 				if rec := s.adminDo(t, http.MethodPatch, opPath(s.op.ID, "key", "enabled"), `{"enabled":`+v+`}`); rec.Code != 200 {
 					t.Error(rec.Body.String())
 				}
 			}
 		}},
-		{"key delete", func(s *opFx) {
+		{"key delete", func(t *testing.T, s *opFx) {
 			if rec := s.adminDo(t, http.MethodDelete, opPath(s.op.ID, "key"), ""); rec.Code != 200 {
 				t.Error(rec.Body.String())
 			}
 		}},
-		{"model-map edit", func(s *opFx) {
+		{"model-map edit", func(t *testing.T, s *opFx) {
 			if rec := s.adminDo(t, http.MethodPatch, opPath(s.op.ID), `{"model_map":{"haiku":{"model":"h-fence"}}}`); rec.Code != 200 {
 				t.Error(rec.Body.String())
 			}
 		}},
-		{"retire", func(s *opFx) {
+		{"retire", func(t *testing.T, s *opFx) {
 			if rec := s.adminDo(t, http.MethodPost, opPath(s.op.ID, "retire"), ""); rec.Code != 200 {
 				t.Error(rec.Body.String())
 			}
@@ -327,7 +328,7 @@ func TestOperatorKeyTestEvidenceFenceLiveDB(t *testing.T) {
 			s := newOpFx(t)
 			s.mustPutOrgKey(t, s.op.ID, orgKeyFixture())
 			logs := captureProviderAudit(t)
-			s.f.h.adminProbeAfterDial = func() { c.apply(s) }
+			s.f.h.adminProbeAfterDial = func() { c.apply(t, s) }
 			t.Cleanup(func() { s.f.h.adminProbeAfterDial = nil })
 			rec := s.adminDo(t, http.MethodPost, testRoute(s.op.ID), "")
 			if rec.Code != http.StatusConflict {
@@ -356,6 +357,7 @@ func TestOperatorKeyTestEvidenceFenceLiveDB(t *testing.T) {
 		t.Run("started while the locks are held: "+c.name, func(t *testing.T) {
 			s := newOpFx(t)
 			s.mustPutOrgKey(t, s.op.ID, orgKeyFixture())
+			logs := captureProviderAudit(t)
 			hk := wireOrgProbe(s.f.h)
 			t.Cleanup(func() { s.f.h.adminProbeWrap = nil })
 			var change chan *httptest.ResponseRecorder
@@ -371,6 +373,14 @@ func TestOperatorKeyTestEvidenceFenceLiveDB(t *testing.T) {
 			rec := s.adminDo(t, http.MethodPost, testRoute(s.op.ID), "")
 			if rec.Code != http.StatusOK {
 				t.Fatalf("test = %d %s, want 200: the locks were taken first", rec.Code, rec.Body.String())
+			}
+			// The evidence was written, so the Test is recorded whatever the change did to it afterwards.
+			var body map[string]apitypes.ProviderProbeDTO
+			if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body["probe"].AuthResult != "ok" || body["probe"].ProbedAt.IsZero() {
+				t.Errorf("response = %s (%v), want this probe's own result", rec.Body.String(), err)
+			}
+			if ev := auditEvents(logs, "admin_test"); len(ev) != 1 || auditField(ev[0], "outcome") != "probed_recorded" {
+				t.Errorf("audit = %v, want one probed_recorded", ev)
 			}
 			if done := awaitDone(t, change, c.name); done.Code != http.StatusOK {
 				t.Fatalf("%s = %d %s", c.name, done.Code, done.Body.String())

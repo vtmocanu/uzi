@@ -29,7 +29,8 @@ const operatorTrustAckMessage = "acknowledge_recipient_trust must be true to cre
 
 // operatorDefinitionError classifies the result of LockSharedModelProviderForEdit for a key route: a
 // missing or personal definition is a 404, a per_user_key one is a 409. Each route calls the lock itself
-// (the call order is pinned by TestKeyRouteCallOrderIsPinned).
+// (the call order is pinned by custodyCallOrderPins in TestIdentityQueryCallersArePinned, in
+// api/internal/store/model_provider_visibility_sql_test.go).
 func operatorDefinitionError(mode string, lockErr error) error {
 	if errors.Is(lockErr, pgx.ErrNoRows) {
 		return errProviderNotFound
@@ -70,6 +71,8 @@ func (h *Handler) AdminPutOperatorKey(w http.ResponseWriter, r *http.Request) {
 		internalProviderError(w, "seal organization key", errors.New("no instance secret box"))
 		return
 	}
+	// Only the plain byte copy is zeroed; req.Key, the trimmed string and the raw body buffer are Go
+	// strings or buffers that are not cleared.
 	plain := []byte(key)
 	sealed, err := operatorkey.Seal(h.box, id, plain)
 	for i := range plain {
