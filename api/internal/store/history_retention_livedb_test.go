@@ -527,8 +527,8 @@ func TestHistoryRetentionFailedOpenLiveDB(t *testing.T) {
 
 	// The work context ends between the settings statement and the try-lock. pgx refuses to send
 	// on a context that is already done, so the try-lock never reaches the server: this pins the
-	// close under a separate, still-live cleanup context. Like the next case, it is a connection
-	// lost before the try-lock is sent.
+	// close under a separate, still-live cleanup context. Like the next case, the try-lock is never
+	// sent, but here the connection stays intact until the session closes it.
 	root.run(t, "deadline before try-lock", func(t *testing.T, f *hrFx) {
 		p := f.probePool(t)
 		workCtx, cancelWork := context.WithCancel(f.ctx)

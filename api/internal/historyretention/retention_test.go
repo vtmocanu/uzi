@@ -467,8 +467,8 @@ func TestPassStarvationOverManyTicks(t *testing.T) {
 
 func TestPassStarvationDeadlineTable(t *testing.T) {
 	// pr_history_events consumes the whole work budget whenever it is reached: the fake clock jumps
-	// past the work deadline and the delete then succeeds, so the deadline check is the only thing
-	// that can end the tick (no error does). Nothing after it in that tick's rotation may be
+	// past the work deadline and the delete then succeeds, so only the deadline check (or the end of
+	// the rotation, when it comes last) can end the tick; no error does. Nothing after it in that tick's rotation may be
 	// attempted, and every other table must still get an attempt within four ticks, alone and with
 	// two instances alternating, whatever position the blocking table has in a rotation.
 	blocking := map[store.HistoryRetentionTable]func(*time.Time) starveFn{
