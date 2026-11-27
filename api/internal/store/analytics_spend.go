@@ -180,7 +180,8 @@ type AnalyticsCacheRead struct {
 
 // AnalyticsTopRun is one of the most expensive runs. UsageStatus is the run's own cost
 // status (metered, subscription, unreported or missing). The repo fields follow the same
-// visibility rule as the groups.
+// visibility rule as the groups. IssueIID, IssueTitle and MRIID are null when withheld
+// (inaccessible_repo: all three; no_repo: the numbers) or when none is recorded.
 type AnalyticsTopRun struct {
 	RunID               uuid.UUID  `json:"run_id"`
 	Kind                string     `json:"kind"`
@@ -197,6 +198,9 @@ type AnalyticsTopRun struct {
 	RepoKey             string     `json:"repo_key"`
 	RepoID              *uuid.UUID `json:"repo_id"`
 	RepoPath            *string    `json:"repo_path"`
+	IssueIID            *int64     `json:"issue_iid"`
+	IssueTitle          *string    `json:"issue_title"`
+	MRIID               *int64     `json:"mr_iid"`
 	UserID              uuid.UUID  `json:"user_id"`
 	UserEmail           string     `json:"user_email"`
 }

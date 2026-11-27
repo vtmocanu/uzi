@@ -209,6 +209,11 @@ type AnalyticsCacheReadDTO struct {
 
 // AnalyticsTopRunDTO is one of the most expensive runs of the window. repo_key is the repo
 // id, "no_repo" or "inaccessible_repo"; repo_id and repo_path are null unless revealed.
+// issue_iid, issue_title and mr_iid are null when withheld (inaccessible_repo: all three;
+// no_repo: the numbers) or when none is recorded (an unbound CI fix has no mr_iid). A
+// stored empty title is "". issue_title is the run's stored title, untruncated: render it
+// as plain text. issue_iid is the internal number; links go through the issue-key/URL
+// contract.
 type AnalyticsTopRunDTO struct {
 	RunID               string    `json:"run_id"`
 	Kind                string    `json:"kind"`
@@ -225,6 +230,9 @@ type AnalyticsTopRunDTO struct {
 	RepoKey             string    `json:"repo_key"`
 	RepoID              *string   `json:"repo_id"`
 	RepoPath            *string   `json:"repo_path"`
+	IssueIID            *int64    `json:"issue_iid"`
+	IssueTitle          *string   `json:"issue_title"`
+	MRIID               *int64    `json:"mr_iid"`
 	UserID              string    `json:"user_id"`
 	UserEmail           string    `json:"user_email"`
 }

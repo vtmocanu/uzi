@@ -231,6 +231,14 @@ const analyticsSpendDocLiteral = `{
      "run_status": "completed", "usage_status": "metered", "primary_model": "claude-opus",
      "created_at": "2026-11-24T10:00:00.000000Z", "cost": "7.654321", "input_tokens": 1, "cache_read_tokens": 2,
      "cache_creation_tokens": 3, "output_tokens": 4, "repo_key": "no_repo", "repo_id": null, "repo_path": null,
+     "issue_iid": null, "issue_title": "job title", "mr_iid": null,
+     "user_id": "22222222-2222-4222-8222-222222222222", "user_email": "a@example.test"},
+    {"run_id": "44444444-4444-4444-8444-444444444444", "kind": "issue", "harness": "claude",
+     "run_status": "completed", "usage_status": "metered", "primary_model": "claude-opus",
+     "created_at": "2026-11-24T09:00:00.000000Z", "cost": "1.000000", "input_tokens": 1, "cache_read_tokens": 2,
+     "cache_creation_tokens": 3, "output_tokens": 4, "repo_key": "33333333-3333-4333-8333-333333333333",
+     "repo_id": "33333333-3333-4333-8333-333333333333", "repo_path": "org/repo",
+     "issue_iid": 42, "issue_title": "", "mr_iid": 7,
      "user_id": "22222222-2222-4222-8222-222222222222", "user_email": "a@example.test"}
   ],
   "breakdown": {"dimension": "repo", "rows": [
@@ -273,8 +281,17 @@ func TestDecodeAnalyticsSpendDoc(t *testing.T) {
 	if r := doc.CostPerMergedPR.Current.Reason; r == nil || *r != store.AnalyticsReasonNoMergedPRs {
 		t.Errorf("cost_per_merged_pr reason = %v", r)
 	}
-	if len(doc.TopRuns) != 1 || doc.TopRuns[0].Cost != "7.654321" || doc.TopRuns[0].UserEmail != "a@example.test" {
-		t.Errorf("top_runs = %+v", doc.TopRuns)
+	if len(doc.TopRuns) != 2 || doc.TopRuns[0].Cost != "7.654321" || doc.TopRuns[0].UserEmail != "a@example.test" {
+		t.Fatalf("top_runs = %+v", doc.TopRuns)
+	}
+	// Null identity keys decode to nil (a no_repo job has a title but no numbers).
+	if a := doc.TopRuns[0]; a.IssueIID != nil || a.MRIID != nil || a.IssueTitle == nil || *a.IssueTitle != "job title" {
+		t.Errorf("null identity top run = %+v", a)
+	}
+	// Set identity keys decode to values, an empty stored title stays "" (not nil).
+	if b := doc.TopRuns[1]; b.IssueIID == nil || *b.IssueIID != 42 || b.MRIID == nil || *b.MRIID != 7 ||
+		b.IssueTitle == nil || *b.IssueTitle != "" {
+		t.Errorf("set identity top run = %+v", b)
 	}
 	if len(doc.Breakdown.Rows) != 1 || doc.Breakdown.Rows[0].Outcomes.Failed != 1 || doc.Breakdown.Rows[0].MergedPRs != 1 ||
 		doc.Breakdown.Rows[0].ElapsedP90Seconds.Value == nil || *doc.Breakdown.Rows[0].ElapsedP90Seconds.Value != 120 {

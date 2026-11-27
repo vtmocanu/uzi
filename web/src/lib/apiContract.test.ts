@@ -2568,6 +2568,9 @@ describe("analytics spend contract (issue #4684)", () => {
   const _rowKeyNullable: IsNullable<Row["key"]> extends true ? true : never = true;
   const _topRepoIdNullable: IsNullable<AnalyticsSpendDTO["top_runs"][number]["repo_id"]> extends true ? true : never = true;
   const _topRepoPathNullable: IsNullable<AnalyticsSpendDTO["top_runs"][number]["repo_path"]> extends true ? true : never = true;
+  const _topIssueIidNullable: IsNullable<AnalyticsSpendDTO["top_runs"][number]["issue_iid"]> extends true ? true : never = true;
+  const _topIssueTitleNullable: IsNullable<AnalyticsSpendDTO["top_runs"][number]["issue_title"]> extends true ? true : never = true;
+  const _topMrIidNullable: IsNullable<AnalyticsSpendDTO["top_runs"][number]["mr_iid"]> extends true ? true : never = true;
   const _nnValueNullable: IsNullable<Row["cost_share"]["value"]> extends true ? true : never = true;
   const _nnReasonNullable: IsNullable<Row["cost_share"]["reason"]> extends true ? true : never = true;
   // ...and what it never carries as null: scalars, slices and the omitempty fields (absent, not null).
@@ -2585,7 +2588,7 @@ describe("analytics spend contract (issue #4684)", () => {
   void [
     _historyNullable, _coverageValueNullable, _coverageReasonNullable, _ratioValueNullable, _ratioReasonNullable,
     _cacheValueNullable, _groupKeyNullable, _groupLabelNullable, _groupIdNullable, _rowKeyNullable,
-    _topRepoIdNullable, _topRepoPathNullable, _nnValueNullable, _nnReasonNullable, _bucketsNotNull, _seriesNotNull,
+    _topRepoIdNullable, _topRepoPathNullable, _topIssueIidNullable, _topIssueTitleNullable, _topMrIidNullable, _nnValueNullable, _nnReasonNullable, _bucketsNotNull, _seriesNotNull,
     _topRunsNotNull, _widthNotNull, _previousNotNull, _previousOptional, _previousFromNotNull, _previousFromOptional,
     _previousToOptional, _panelPreviousOptional, _panelPreviousNotNull,
   ];
@@ -2614,7 +2617,7 @@ describe("analytics spend contract (issue #4684)", () => {
     expect(full.cost_per_completed_run.rolling[0].index).toBe(1);
     expect(full.cost_per_merged_pr.buckets).toBeDefined();
     expect(full.cache_read.value).toBe(1.5);
-    expect(full.top_runs[0]).toMatchObject({ run_id: "x", repo_id: "x", repo_path: "x", cost_usd: 1.5 });
+    expect(full.top_runs[0]).toMatchObject({ run_id: "x", repo_id: "x", repo_path: "x", issue_iid: 1, issue_title: "x", mr_iid: 1, cost_usd: 1.5 });
     expect(full.breakdown.rows[0].outcomes.plan_rejected).toBe(1);
     expect(full.breakdown.rows[0].elapsed_p90_seconds).toEqual({ value: 1.5, reason: "x" });
     expect(full.breakdown.rows[0].merged_prs).toBe(1);
@@ -2830,7 +2833,7 @@ describe("analytics DTO exact nullability (issue #4684)", () => {
   const _ratioCell: never = null as unknown as UnionDiff<NullKeys<AnalyticsRatioCellDTO>, "value" | "reason">;
   const _panel: never = null as unknown as UnionDiff<NullKeys<AnalyticsRatioPanelDTO>, never>;
   const _cache: never = null as unknown as UnionDiff<NullKeys<AnalyticsCacheReadDTO>, "value" | "reason">;
-  const _topRun: never = null as unknown as UnionDiff<NullKeys<AnalyticsTopRunDTO>, "repo_id" | "repo_path">;
+  const _topRun: never = null as unknown as UnionDiff<NullKeys<AnalyticsTopRunDTO>, "repo_id" | "repo_path" | "issue_iid" | "issue_title" | "mr_iid">;
   const _nullableNumber: never = null as unknown as UnionDiff<NullKeys<AnalyticsNullableNumberDTO>, "value" | "reason">;
   const _outcomes: never = null as unknown as UnionDiff<NullKeys<AnalyticsOutcomesDTO>, never>;
   const _row: never = null as unknown as UnionDiff<NullKeys<AnalyticsBreakdownRowDTO>, "key" | "label" | "id">;

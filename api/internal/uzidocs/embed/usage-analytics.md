@@ -223,7 +223,25 @@ Other measures:
   non-chat runs. It is a recorded ratio, not proven savings. Null with
   `no_input_tokens` when the denominator is zero.
 - `top_runs` are the ten most expensive current-window runs, most expensive
-  first. Each carries its own usage status and the same repo masking as above.
+  first. Each carries its own usage status and the same repo masking as above,
+  plus three nullable identity fields:
+  - `issue_iid`: the run's issue number, falling back to the issue a task
+    continued. For a linked external tracker it is the internal number: build
+    links through the issue key and URL contract, not from this field.
+  - `issue_title`: the title stored on the run when it was created (an issue
+    title, or a job's title), untruncated and unsanitized: render it as plain
+    text. A stored empty title is `""`.
+  - `mr_iid`: the run's PR/MR number, else, for a `ci_fix` run, the PR it was
+    created for.
+
+  | Entry | `issue_iid` | `issue_title` | `mr_iid` |
+  |---|---|---|---|
+  | revealed repo | set when recorded | set | set when recorded |
+  | `no_repo` (e.g. a job) | null | set | null |
+  | `inaccessible_repo` | null | null | null |
+
+  A null on a revealed repo means nothing is recorded (an unbound CI fix has
+  no PR), not that it is withheld. Admin responses are never masked.
 - Breakdown `elapsed_p50_seconds` and `elapsed_p90_seconds` cover finished runs
   and measure `finished_at` (else the last status time) minus creation, so they
   include time spent queued or waiting for approval. Other is computed from its
