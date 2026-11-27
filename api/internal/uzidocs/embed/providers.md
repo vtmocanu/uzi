@@ -184,14 +184,15 @@ unless the provider is yours (or an [admin-shared definition](#admin-shared-prov
   matching covers only the key's raw, JSON-escaped, `\/`, `\u`-escaped and percent-encoded forms (other
   encodings such as base64 are not detected), so this guards against accidental
   publication only, not a malicious or prompt-injected job; see the linked section.
-- **Other lanes that cannot use a provider refuse.** The cross-check lane refuses a Claude
-  checker for an owner whose Claude source is set (or whose lead is bound to a provider), with
-  `provider_lane_unsupported`, including that owner's runs that use an Anthropic token. A plan
+- **Other lanes that cannot use a provider refuse.** The Codex checker lane runs on a selected
+  Codex source. Without one, a Codex checker is refused for an owner with a Claude source or a
+  provider-bound lead (#4762). A Claude checker is refused under a provider-bound lead or for an
+  owner with a Claude source. Refusals use `provider_lane_unsupported`, including for that
+  owner's runs that use an Anthropic token. A plan
   cross-check whose checker would be refused sends the plan to the human plan gate instead; for a
   Codex lead that means a Codex lead with plan cross-check, owned by someone with a Claude source,
-  waits for you to approve the plan. The Codex checker lane is open for the rows listed under
-  [What a Codex provider run does not do](#what-a-codex-provider-run-does-not-do) and in
-  [Cross-check on a Codex provider](#cross-check-on-a-codex-provider). The isolated research lane
+  waits for you to approve the plan. See
+  [Cross-check on a Codex provider](#cross-check-on-a-codex-provider) for the open and refused rows. The isolated research lane
   refuses provider runs.
 - **Where judged traces go.** A provider judge sends the judged run's trace to your gateway, including
   the trace of a run that used an Anthropic token. A pinned vendor judge sends a provider run's trace to

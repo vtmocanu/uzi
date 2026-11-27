@@ -639,9 +639,11 @@ consequences to know:
 - Gateway models are mapped, so a different checker family does not prove a
   different model. On an auto-approved run, an unavailable check sends the plan
   to the human gate. If your gateway maps its model to the same target as
-  your lead, pin the vendor side (the lead's model, or the Codex or Claude cell
-  under [Settings → Models → Cross-check](./configuration.md#plan-cross-check-model-and-effort-pins))
-  to a model that differs from the gateway target, so the check can run.
+  your lead, pin the lead's model, or the Codex cell
+  under [Settings → Models → Cross-check](./configuration.md#plan-cross-check-model-and-effort-pins),
+  to a different key of the provider's model map that maps to a different target, so the check can
+  run. A Codex cell pinned to a model that is not a key of the provider's model map makes the check
+  unavailable. The Claude cell does not affect this guard.
 
 ### The same-model guard
 

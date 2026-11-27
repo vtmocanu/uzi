@@ -600,7 +600,7 @@ retries, resume and cold resume use the frozen binding (provider, revision, key 
 `mr_rework` and follow-ups inherit it, CI-fix and handoff resolve the owner's current Codex source.
 Interim refusals (`provider_lane_unsupported`): the Codex judge half is resolved
 (#4574 M1: a Codex-source owner's judge runs on the provider; earlier skip rows are historical).
-Cross-check (#4574 M2, implemented on its branch; hosted acceptance #4761 pending): a plan or code checker
+Cross-check (#4574 M2; hosted acceptance #4761 pending): a plan or code checker
 whose engine is Codex runs on the owner's selected, usable Codex source (the Provider lane). One
 `checkerLaneDecision` (`harness_resolver.go`) returns Refused, Vendor or Provider from the lead's
 provider-boundness, the checker engine and the owner's lane sources, under the shared secret-mutation lock
