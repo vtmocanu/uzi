@@ -118,7 +118,7 @@ function judgeSkipCause(skip: JudgeSkip): string {
   if (skip.reason === "codex_pool_unavailable") return "no pooled Codex account was available.";
   if (skip.reason === "provider_lane_unsupported") {
     if (skip.harness === "claude") return "the selected source was a model provider, which the judge did not support at the time.";
-    if (skip.harness === "codex") return "the selected Codex source is a model provider, which the Codex judge does not support yet.";
+    if (skip.harness === "codex") return "the selected Codex source is a model provider, which the Codex judge did not support at the time.";
     return "the selected source is a model provider, which the judge does not support yet.";
   }
   if (skip.reason === "provider_source_unusable") return "the selected model provider could not serve the judge.";

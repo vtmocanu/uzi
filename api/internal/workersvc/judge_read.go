@@ -274,7 +274,8 @@ func (s *Service) RerunJudge(ctx context.Context, userID uuid.UUID, isAdmin bool
 	// No lane or token presence read here: the judge's lane, and on the vendor Claude lane the
 	// default-token presence check (ErrNoAnthropicToken, as before), are decided inside the create
 	// transaction under the shared secret-mutation lock (createRunAtomic, JudgeLane). A Codex
-	// judge's usability is likewise enforced there, not by a hardcoded Anthropic check.
+	// judge's lane (vendor or bound to the owner's Codex source) and usability are likewise enforced
+	// there, not by a hardcoded Anthropic check.
 	// PRD #1429 M3 (D4); PRD #3257: routed through the M2 createRunResolved funnel with the
 	// JUDGE's harness as an EXPLICIT selection, so D11 resolution + the INSERT + (for a Codex
 	// judge) the binding freeze commit atomically.

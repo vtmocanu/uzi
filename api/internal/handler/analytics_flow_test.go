@@ -18,12 +18,12 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// Issue #4729: Flow handler tests that need no database. analyticsRoutes[4] is the owner flow
-// route and [5] the admin one.
+// Issue #4729: Flow handler tests that need no database. analyticsRoutes[analyticsOwnerFlowRoute] is the owner flow
+// route and [analyticsAdminFlowRoute] the admin one.
 
 func TestAnalyticsFlowParserRejectionsBeginNoTransaction(t *testing.T) {
 	someUUID := uuid.New().String()
-	ownerFlow, adminFlow := analyticsRoutes[4], analyticsRoutes[5]
+	ownerFlow, adminFlow := analyticsRoutes[analyticsOwnerFlowRoute], analyticsRoutes[analyticsAdminFlowRoute]
 	cases := []struct {
 		name  string
 		route analyticsRoute
@@ -70,13 +70,13 @@ func TestAnalyticsFlowAcceptedQueriesReachTheSnapshot(t *testing.T) {
 		route analyticsRoute
 		query string
 	}{
-		{analyticsRoutes[4], ""},
-		{analyticsRoutes[4], "window=all&tz=America/New_York&harness=codex&kind=delivery&repo=" + someUUID},
-		{analyticsRoutes[4], "kind=chat"},
-		{analyticsRoutes[5], "window=7d&user=all"},
-		{analyticsRoutes[5], "window=90d"},
-		{analyticsRoutes[5], "window=all&user=" + someUUID},
-		{analyticsRoutes[5], "user=" + someUUID + "&kind=issue&harness=claude"},
+		{analyticsRoutes[analyticsOwnerFlowRoute], ""},
+		{analyticsRoutes[analyticsOwnerFlowRoute], "window=all&tz=America/New_York&harness=codex&kind=delivery&repo=" + someUUID},
+		{analyticsRoutes[analyticsOwnerFlowRoute], "kind=chat"},
+		{analyticsRoutes[analyticsAdminFlowRoute], "window=7d&user=all"},
+		{analyticsRoutes[analyticsAdminFlowRoute], "window=90d"},
+		{analyticsRoutes[analyticsAdminFlowRoute], "window=all&user=" + someUUID},
+		{analyticsRoutes[analyticsAdminFlowRoute], "user=" + someUUID + "&kind=issue&harness=claude"},
 	}
 	for _, tc := range cases {
 		b := &countingBeginner{err: errors.New("stop here")}

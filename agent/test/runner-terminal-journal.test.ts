@@ -10,6 +10,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { nullLogger } from "./helpers.js";
+import { makeTextRedactor } from "../src/redact.js";
 import { StubExecutor, type Executor, type ExecutorResult, type RunContext } from "../src/executor.js";
 import { Outbox, type RawWriteSeam } from "../src/outbox.js";
 import { api, client, fx, git, fakeGitlab, gitlabClaim, installHarness, runner, simulateCommittedWork } from "./runner-harness.js";
@@ -75,11 +76,13 @@ function minimalFailFlight(opts: {
   events: string[];
   reportState: () => Promise<{ applied: boolean; status?: string; staleClaim?: boolean }>;
   safety?: unknown;
+  redactText?: (s: string) => string;
 }) {
   const cancel = new AbortController();
   cancel.signal.addEventListener("abort", () => opts.events.push("abort"));
   return {
     iterationParkState: "none" as const,
+    redactText: opts.redactText ?? ((s: string) => s),
     runId: opts.runId,
     claimGeneration: opts.gen,
     // barePath present so reapRecoveryProviderForSettle passes its guard and reaps.
@@ -375,6 +378,49 @@ describe("RunRunner terminal journaling (PRD #1391 Run B M3b)", () => {
     assert.equal(sends, 1, "exactly one failed send on the no-outbox path");
     assert.equal(flight.permanentFailureReap, true, "the reap ran on the no-outbox path too");
     assert.equal(flight.terminalResolved, true, "the terminal-resolved latch is set");
+  });
+
+  // Fixture: a failure reason longer than the 512-character cap whose registered secret spans character 512
+  // (it starts at 500 and ends at 524). The tests below check that no 8-character fragment of the secret
+  // reaches the outbound failure_reason.
+  const STRADDLE_PAT = "fixture-forge-pat-000000";
+  const straddlingReason = (): string => `${"x".repeat(500)}${STRADDLE_PAT} and a tail that follows the secret`;
+  const assertNoFragment = (reason: string | undefined, label: string): void => {
+    assert.ok(typeof reason === "string" && reason.length > 0 && reason.length <= 512, `${label}: a capped, non-empty reason`);
+    for (let i = 0; i + 8 <= STRADDLE_PAT.length; i++) {
+      assert.ok(!reason.includes(STRADDLE_PAT.slice(i, i + 8)), `${label}: a fragment of the secret survives: ${STRADDLE_PAT.slice(i, i + 8)}`);
+    }
+  };
+
+  it("redact-then-cap: the permanent-failure hook sends no fragment of a secret that straddles the reason cap", async () => {
+    const { gitlab } = fakeGitlab();
+    const coord = mkRecoveryCoordinator();
+    const run = runner(new StubExecutor(nullLogger()), gitlab, undefined, { recovery: coord }); // NO outbox: the direct send
+    const events: string[] = [];
+    const sent: StateRequest[] = [];
+    const flight = minimalFailFlight({
+      runId: "run-straddle-hook", gen: 1, events,
+      reportState: async () => ({ applied: true, status: "failed" }),
+      redactText: makeTextRedactor([STRADDLE_PAT]),
+    });
+    flight.reportState = async (body: unknown) => {
+      events.push("send");
+      sent.push(structuredClone(body as StateRequest));
+      return { applied: true, status: "failed" };
+    };
+    await callHandle(run, failClaim("run-straddle-hook", 1), flight, straddlingReason());
+    assert.equal(sent.length, 1);
+    assertNoFragment(sent[0]!.failure_reason, "permanent-failure hook");
+  });
+
+  it("redact-then-cap: the generic failure path sends no fragment of a secret that straddles the reason cap", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(12, { claim_generation: 2, secrets: { forge_pat: STRADDLE_PAT, anthropic_oauth_token: "vendor-oauth-token-000000" } as never });
+    const exec: Executor = { run: async () => { throw new Error(straddlingReason()); } };
+    await runner(exec, gitlab).execute(claim);
+    const failed = api.states.filter((s) => s.runId === claim.run_id && s.body.status === "failed");
+    assert.ok(failed.length > 0, "the run failed");
+    for (const s of failed) assertNoFragment(s.body.failure_reason, "generic failure");
   });
 
   // #1539: reserve-exhausted (the terminal-sized reserve cannot admit the journal) — the outcome

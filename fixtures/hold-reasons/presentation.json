@@ -167,5 +167,18 @@
     "completion_panel_held_deny": "always",
     "history_park_label": false,
     "owner_actions_link": false
+  },
+  {
+    "reason": "run_env_history_unavailable",
+    "non_completion": true,
+    "owner_resumable": true,
+    "tone": "warning",
+    "web_label": "variable history unavailable: owner hold",
+    "cli_notice": "held, variable history unavailable; a secret variable version the run was given can no longer be read, so its output cannot be masked; Resume retries once the variable history is restored, otherwise Cancel the run; Resume: uzi run resume run-1; Cancel: uzi run cancel run-1",
+    "announces_entry": true,
+    "completion_panel_early_return": true,
+    "completion_panel_held_deny": "always",
+    "history_park_label": true,
+    "owner_actions_link": true
   }
 ]

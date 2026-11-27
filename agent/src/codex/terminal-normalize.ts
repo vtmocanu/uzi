@@ -13,6 +13,7 @@
 // trivially unit-testable and safe to call on every terminal frame.
 
 import type { HarnessErrorCategory, HarnessUsage } from "../harness.js";
+import { isGatewayLimitStatus } from "../provider-binding.js";
 
 /** The CLOSED classification both harness lanes surface for a Codex terminal error: a
  *  fixed `display` token (or the literal `"unknown"`), its harness `category`, and an
@@ -51,6 +52,35 @@ export function isCodexTransientClassification(
     c.classification === "rateLimitExceeded" ||
     (c.category === "transport" && (c.httpStatus === undefined || isRetryableStatus(c.httpStatus)))
   );
+}
+
+/**
+ * Issue #4574: whether a failed Codex terminal under a PROVIDER-bound credential is a provider
+ * gateway limit (429 rate limit / 529 overload). The one predicate both the run lane
+ * (codex-harness.ts decodeResult) and the provider judge's settlement (judge-runner.ts) use, so
+ * they cannot diverge. Only the selected closed classification can identify a limit, and a
+ * normalized HTTP status exists only on the accepted structured transport variants. Pure; reads no
+ * message text.
+ */
+export function isCodexProviderGatewayLimit(
+  outcome: "success" | "failed",
+  authMode: string | undefined,
+  classification: CodexErrorClassification | undefined,
+): boolean {
+  return outcome === "failed" && authMode === "provider" && (
+    classification?.classification === "rateLimitExceeded" ||
+    classification?.classification === "serverOverloaded" ||
+    (classification?.category === "transport" && isGatewayLimitStatus(classification.httpStatus))
+  );
+}
+
+/** Issue #4574: whether a classification is one of the four HTTP-tagged transport variants (the
+ *  `http: true` entries of the closed map), by its closed display token. The provider judge treats
+ *  one WITHOUT a normalized `httpStatus` as terminal (an unproven transport fault), never a fallback. */
+export function isCodexHttpTaggedClassification(c: CodexErrorClassification | undefined): boolean {
+  if (c === undefined) return false;
+  const entry = CODEX_ERROR_INFO_MAP.get(c.classification);
+  return entry !== undefined && entry.shape === "tagged" && entry.http === true;
 }
 
 /** The CLOSED set of provider statuses we are willing to echo as a display `subtype`.

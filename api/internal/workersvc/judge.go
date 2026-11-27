@@ -1142,23 +1142,22 @@ func judgeDefaultChoice(c secretChoice) secretChoice {
 // claim (it can be MB).
 //
 // PRD #1429 M3 (D4): harness-authoritative, the judge-lane repair mirroring the ordinary
-// lane's claim_assembly.go one. A Codex judge run (run.Harness == harnessCodex) NEVER calls
+// lane's claim_assembly.go one. A vendor Codex judge run (run.Harness == harnessCodex) NEVER calls
 // judgeChoice / openWithAutoRetry / recordRunCredential: it opens no Anthropic credential,
 // writes no run_credential_epochs Anthropic row, and AnthropicOAuthToken stays "". Its
 // Secrets.Codex is attached below through the SAME codexClaimSecrets authority path the
 // ordinary lane uses — which is why this now takes the CLAIMING WORKER (wkr); codexClaimSecrets
-// needs it. A Claude judge run is byte-identical to before this repair. The judge lane still
+// needs it. A provider-bound judge (Claude or Codex) never reaches codexClaimSecrets and carries
+// only secrets.provider, its frozen binding. A vendor Claude judge run is byte-identical to before
+// this repair. The judge lane still
 // forks BEFORE GetRunClaimContext (a judge run has no repo) — that fork lives in
 // claim_assembly.go's assembleClaim, unchanged.
 func (s *Service) assembleJudgeClaim(ctx context.Context, wkr store.Worker, run store.Run) (*ClaimPayload, error) {
-	// PRD #4322 M1a: a provider-bound CLAUDE judge claims against its frozen binding (D-F): it never
-	// calls judgeChoice, reserveGateFrom, openWithAutoRetry or recordRunCredential, so no vendor
-	// credential is opened or recorded. A provider-bound judge of any other harness (Codex, until
-	// #4574) is refused before any credential is opened.
+	// PRD #4322 M1a / #4574 M1: a provider-bound judge (Claude or Codex) claims against its frozen
+	// binding (D-F): it never calls judgeChoice, reserveGateFrom, openWithAutoRetry or
+	// recordRunCredential, and a Codex one never reaches codexClaimSecrets, so no vendor credential
+	// is opened, minted or recorded.
 	providerJudge := providerBoundRun(run)
-	if providerJudge && run.Harness != harnessClaude {
-		return nil, errProviderLaneClaimRefused
-	}
 	var providerBinding *ClaimProviderBinding
 	if providerJudge {
 		b, err := s.assembleProviderBinding(ctx, wkr, run)
@@ -1259,16 +1258,18 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, wkr store.Worker, run 
 	if providerJudge {
 		// Strict (PRD #4322 D-F): a read error is terminal (never a guessed model), and a model the
 		// frozen provider's map does not carry is refused as provider_model_unmapped, nothing delivered.
-		model, dropped, merr := s.resolveJudgeModelFor(ctx, s.q, run.UserID, HarnessClaude, true)
+		// A Codex provider judge skips the modelMapped refusal: the worker maps key-or-default.
+		harness := Harness(run.Harness)
+		model, dropped, merr := s.resolveJudgeModelFor(ctx, s.q, run.UserID, harness, true)
 		if merr != nil {
 			return nil, fmt.Errorf("%w: judge model: %w", errCredentialUnavailable, merr)
 		}
-		if !modelMapped(providerBinding.ModelMap, model) {
+		if harness == HarnessClaude && !modelMapped(providerBinding.ModelMap, model) {
 			return nil, &providerClaimRefusal{Reason: holdProviderModelUnmapped, Detail: fmt.Sprintf("model %q (judge) is not mapped by the provider", model)}
 		}
 		judgeModel = &model
 		if len(dropped) > 0 {
-			recordedLastSeq = s.recordHarnessModelFallbackNote(ctx, run, recordedLastSeq, HarnessClaude, dropped[0])
+			recordedLastSeq = s.recordHarnessModelFallbackNote(ctx, run, recordedLastSeq, harness, dropped[0])
 		}
 	} else if s.settings != nil {
 		harness := Harness(run.Harness)
@@ -1350,7 +1351,8 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, wkr store.Worker, run 
 			// rides the ordinary ClaimPayload; the no-PAT guarantee is that assembly
 			// never decrypts one, asserted in judge_test.go.
 			AnthropicOAuthToken: string(anthropic),
-			// Set only for a provider-bound Claude judge (then AnthropicOAuthToken is empty).
+			// Set only for a provider-bound Claude or Codex judge (then AnthropicOAuthToken is empty
+			// and, for Codex, Secrets.Codex stays nil).
 			Provider: providerBinding,
 		},
 		Agents:        []ClaimAgent{},
@@ -1379,7 +1381,8 @@ func (s *Service) assembleJudgeClaim(ctx context.Context, wkr store.Worker, run 
 	// Claude; a judge never parks (PRD #1590 D7). The one exception is an ambiguous capability
 	// mint (errCodexMintAmbiguous, preserved through the wrap): finishRunClaim returns no
 	// payload and makes no mutation, because the mint write may have landed.
-	if run.Harness == harnessCodex {
+	// A provider-bound Codex judge is excluded: its credential rides Secrets.Provider.
+	if run.Harness == harnessCodex && !providerJudge {
 		codex, err := s.codexClaimSecrets(ctx, wkr, run)
 		if err != nil {
 			// errCredentialDisabled passes through as well: a disabled frozen alias parks the

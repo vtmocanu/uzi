@@ -1,12 +1,14 @@
 package handler
 
-// run_env_vars.go: per-repo environment variables for runs (PRD #4416 M1). Variables
-// are stored and managed here; nothing injects them into a run yet (M2).
+// run_env_vars.go: per-repo environment variables for runs (PRD #4416). Variables are stored
+// and managed here, and the claim path (api/internal/workersvc) delivers them to runs.
 //
-// Every value, plain or secret, is sealed through the vault seam with the AAD that
-// runenv.AADKind builds. A secret's value is never opened for a response. Writes run
-// in one transaction that takes the owner's secret-mutation advisory lock and then
-// the users-row fence, like every other secret writer (withSecretLock).
+// Every value, plain or secret, is sealed through the vault seam with the context that
+// runenv.AADFor selects by the row's aad_version: new seals use version 2 (AADKindV2, which
+// also binds the owner, the variable id and the version number), and a version-1 row keeps
+// opening under AADKind until its value is next written. A secret's value is never opened for
+// a response. Writes run in one transaction that takes the owner's secret-mutation advisory
+// lock and then the users-row fence, like every other secret writer (withSecretLock).
 
 import (
 	"bytes"
@@ -29,6 +31,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/runenv"
+	"github.com/vtmocanu/uzi/api/internal/secretopen"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/vault"
 )
@@ -38,6 +41,7 @@ const (
 	runEnvCodeLimitReached = "env_limit_reached"
 	runEnvCodeHistoryFull  = "env_history_full"
 	runEnvCodeChanged      = "env_changed"
+	runEnvCodeFormsBudget  = "env_forms_budget"
 )
 
 // runEnvMaxBodyBytes caps a PUT body, the same 1 MiB as httpx.DecodeJSONLimited.
@@ -92,9 +96,21 @@ func runEnvHeadroomConflict(code string, err error) error {
 	return &runEnvConflictError{code, fmt.Sprintf("saving this would bring your stored credentials and variables to %d records and %d bytes, over the vault's storage limit; disable or delete a variable, or remove a credential, first", limit.Rows, limit.Bytes)}
 }
 
-// runEnvRow is the shape every run_env_vars read returns, whichever generated query
-// produced it.
-type runEnvRow = store.ListRunEnvVarsForRepoRow
+// runEnvRow is the shape the run_env_vars write queries return, and the one the response view
+// (runEnvDTOAt) takes. The list read, ListRunEnvVarsForRepoRow, carries one more column (VaultEpoch,
+// read in the same statement as the ciphertext); runEnvRowFromList drops it into the epoch the
+// caller passes to runEnvDTOAt.
+type runEnvRow = store.InsertRunEnvVarRow
+
+// runEnvRowFromList is the list row's runEnvRow; its VaultEpoch is the caller's to pass along.
+func runEnvRowFromList(row store.ListRunEnvVarsForRepoRow) runEnvRow {
+	return runEnvRow{
+		ID: row.ID, VarID: row.VarID, Name: row.Name, Secret: row.Secret, Description: row.Description,
+		Ciphertext: row.Ciphertext, SealedWith: row.SealedWith, ValueBytes: row.ValueBytes, Rev: row.Rev,
+		DisabledAt: row.DisabledAt, PendingDeleteAt: row.PendingDeleteAt, CreatedAt: row.CreatedAt,
+		UpdatedAt: row.UpdatedAt, AadVersion: row.AadVersion,
+	}
+}
 
 // runEnvOwner resolves the caller and the repo they own, answering 401/400/404 itself
 // (the same preflight as GetRepoToolProfile: a foreign or unknown repo is a 404).
@@ -140,13 +156,48 @@ func writeRunEnvConflict(w http.ResponseWriter, code, message string) {
 	httpx.JSON(w, http.StatusConflict, map[string]string{"error": message, "code": code})
 }
 
+// runEnvHeldByRunsMax bounds held_by_runs on an env_history_full answer.
+const runEnvHeldByRunsMax = 20
+
+// runEnvHistoryFullError is an env_history_full conflict that also names the held runs keeping
+// retired secret versions of the owner sealed (up to runEnvHeldByRunsMax run ids).
+type runEnvHistoryFullError struct {
+	*runEnvConflictError
+	heldByRuns []string
+}
+
+// withHeldByRuns adds held_by_runs to a history-full conflict, using the same hold predicate as
+// the retired-version sweeper. A failed lookup returns the conflict unchanged: the answer is
+// still correct, only less informative.
+func withHeldByRuns(ctx context.Context, q *store.Queries, userID uuid.UUID, err error) error {
+	var conflict *runEnvConflictError
+	if !errors.As(err, &conflict) {
+		return err
+	}
+	ids, lerr := q.ListRunsHoldingRunEnvVersions(ctx, store.ListRunsHoldingRunEnvVersionsParams{UserID: userID, MaxRuns: runEnvHeldByRunsMax})
+	if lerr != nil {
+		slog.Warn("run env held_by_runs lookup", "error", lerr)
+		return err
+	}
+	held := make([]string, 0, len(ids))
+	for _, id := range ids {
+		held = append(held, id.String())
+	}
+	return &runEnvHistoryFullError{runEnvConflictError: conflict, heldByRuns: held}
+}
+
 // writeRunEnvTxError maps an error out of a write transaction.
 func (h *Handler) writeRunEnvTxError(w http.ResponseWriter, err error, op string) {
 	var conflict *runEnvConflictError
+	var historyFull *runEnvHistoryFullError
 	var pgErr *pgconn.PgError
 	switch {
 	case h.writeVaultStale(w, err):
 	case h.writeVaultLocked(w, err):
+	case errors.As(err, &historyFull):
+		httpx.JSON(w, http.StatusConflict, map[string]any{
+			"error": historyFull.message, "code": historyFull.code, "held_by_runs": historyFull.heldByRuns,
+		})
 	case errors.As(err, &conflict):
 		writeRunEnvConflict(w, conflict.code, conflict.message)
 	case errors.Is(err, errRunEnvRepoGone), errors.As(err, &pgErr) && pgErr.Code == "23503":
@@ -169,12 +220,14 @@ func runEnvState(r runEnvRow) string {
 	return apitypes.RunEnvStateEnabled
 }
 
-// runEnvDTO builds the response view of one row. A secret's value is never opened. A
-// plain value is opened through the vault; a locked vault (or a value that cannot be
-// opened) withholds it and reports locked=true only for the locked case. vaultLocked
-// withholds every plain value without opening it: a row read before the vault was
-// protected and locked may still carry master_aad material the master key opens.
-func (h *Handler) runEnvDTO(userID, repoID uuid.UUID, row runEnvRow, vaultLocked bool) (dto apitypes.RunEnvVarDTO, locked bool) {
+// runEnvDTOAt builds the response view of one row. A secret's value is never opened. A plain
+// value is opened through the vault at epoch, the users.vault_epoch the row's ciphertext was
+// read or written at; a locked vault, a stale seal (the epoch moved since) or a value that
+// cannot be opened withholds it, and locked is true for the locked and stale cases (the next
+// read is coherent). vaultLocked withholds every plain value without opening it: a row read
+// before the vault was protected and locked may still carry master_aad material the master key
+// opens.
+func (h *Handler) runEnvDTOAt(ctx context.Context, userID, repoID uuid.UUID, row runEnvRow, vaultLocked bool, epoch int64) (dto apitypes.RunEnvVarDTO, locked bool) {
 	dto = apitypes.RunEnvVarDTO{
 		VarID:       row.VarID,
 		Name:        row.Name,
@@ -205,11 +258,16 @@ func (h *Handler) runEnvDTO(userID, repoID uuid.UUID, row runEnvRow, vaultLocked
 		dto.ValueWithheld = true
 		return dto, false
 	}
-	kind := runenv.AADKind(runenv.ScopeRepo, &repoID, row.Secret, row.Name)
-	plain, err := h.vault.Open(userID, kind, row.SealedWith, row.Ciphertext)
+	kind, err := runenv.AADFor(row.AadVersion, userID, runenv.ScopeRepo, &repoID, row.Secret, row.Name, row.VarID, row.Rev)
+	if err != nil {
+		slog.Error("run env aad", "name", row.Name, "error", err)
+		dto.ValueWithheld = true
+		return dto, false
+	}
+	plain, err := secretopen.OpenSealedAtEpoch(ctx, h.vault, h.box, userID, kind, row.SealedWith, row.Ciphertext, epoch)
 	if err != nil {
 		dto.ValueWithheld = true
-		if errors.Is(err, vault.ErrLocked) {
+		if errors.Is(err, vault.ErrLocked) || errors.Is(err, secretopen.ErrVaultLocked) || errors.Is(err, store.ErrVaultSealStale) {
 			return dto, true
 		}
 		slog.Error("open plain run env value", "error", err)
@@ -221,13 +279,12 @@ func (h *Handler) runEnvDTO(userID, repoID uuid.UUID, row runEnvRow, vaultLocked
 	return dto, false
 }
 
-// runEnvWriteDTO builds a write response's view of the saved row. It asks the vault for
-// its lock state after the write committed, so an enable+lock that lands between the
-// commit and this response still withholds the plain value (the row may carry master_aad
-// material the master key opens).
-func (h *Handler) runEnvWriteDTO(ctx context.Context, userID, repoID uuid.UUID, row runEnvRow) apitypes.RunEnvVarDTO {
-	vaultLocked := h.vault != nil && h.vault.RequiresUnlock(ctx, userID)
-	dto, _ := h.runEnvDTO(userID, repoID, row, vaultLocked)
+// runEnvWriteDTO builds a write response's view of the saved row. epoch is the vault epoch the
+// row was written or read at (under the owner's users-row lock, or in the same statement as the
+// ciphertext): the plain value is opened at that epoch, so an enable+lock or rewrap that lands
+// after it withholds the value (a stale or locked result, as the list does).
+func (h *Handler) runEnvWriteDTO(ctx context.Context, userID, repoID uuid.UUID, row runEnvRow, epoch int64) apitypes.RunEnvVarDTO {
+	dto, _ := h.runEnvDTOAt(ctx, userID, repoID, row, false, epoch)
 	return dto
 }
 
@@ -263,7 +320,8 @@ func (h *Handler) ListRepoEnvVars(w http.ResponseWriter, r *http.Request) {
 	}
 	vaultLocked := out.VaultLocked
 	for _, row := range rows {
-		dto, locked := h.runEnvDTO(userID, repoID, row, vaultLocked)
+		epoch := row.VaultEpoch
+		dto, locked := h.runEnvDTOAt(r.Context(), userID, repoID, runEnvRowFromList(row), vaultLocked, epoch)
 		out.VaultLocked = out.VaultLocked || locked
 		out.Variables = append(out.Variables, dto)
 		out.Counts.Total++
@@ -284,9 +342,9 @@ type putRunEnvRequest struct {
 	Description *string `json:"description"`
 }
 
-// receiptHeld asks whether any run holds a delivery receipt for one version. M1 has
-// no receipts (store.RunEnvVersionHasReceipt answers false); tests replace the seam to
-// reach the retire and pending-deletion paths.
+// receiptHeld asks whether any run holds a secret delivery receipt for one version
+// (store.RunEnvVersionHasReceipt); tests replace the seam to reach the retire and
+// pending-deletion paths without a run.
 func (h *Handler) receiptHeld(ctx context.Context, q *store.Queries, varID uuid.UUID, rev int32) (bool, error) {
 	if h.runEnvHasReceipt != nil {
 		return h.runEnvHasReceipt(ctx, varID, rev)
@@ -389,7 +447,13 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}
-		old, openErr := h.vault.Open(userID, runenv.AADKind(runenv.ScopeRepo, &repoID, cur.Secret, name), cur.SealedWith, cur.Ciphertext)
+		oldKind, kindErr := runenv.AADFor(cur.AadVersion, userID, runenv.ScopeRepo, &repoID, cur.Secret, name, cur.VarID, cur.Rev)
+		if kindErr != nil {
+			slog.Error("run env aad", "name", name, "error", kindErr)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		old, openErr := h.vault.Open(userID, oldKind, cur.SealedWith, cur.Ciphertext)
 		if openErr != nil {
 			if h.writeVaultLocked(w, openErr) {
 				return
@@ -409,7 +473,20 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	material, err := h.vault.Seal(ctx, userID, runenv.AADKind(runenv.ScopeRepo, &repoID, secret, name), value, vault.SealForUse)
+	// The version-2 context binds var_id and rev, so both are fixed before the seal: a new
+	// variable mints its id now, a new version of an existing one is cur.Rev+1 (the
+	// transaction below refuses to write it unless the live row is still cur).
+	newVarID, newRev := uuid.New(), int32(1)
+	if exists {
+		newVarID, newRev = cur.VarID, cur.Rev+1
+	}
+	sealKind, err := runenv.AADFor(runenv.AADVersion2, userID, runenv.ScopeRepo, &repoID, secret, name, newVarID, newRev)
+	if err != nil {
+		slog.Error("run env aad", "name", name, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	material, err := h.vault.Seal(ctx, userID, sealKind, value, vault.SealForUse)
 	if err != nil {
 		if h.writeVaultLocked(w, err) {
 			return
@@ -445,6 +522,26 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 			return err
 		}
 		newBytes := int64(len(value))
+		// The form budget: the secret value bytes a run of this repo registers for masking.
+		// Refuse only a write that would end over the cap AND grow the total, so a store
+		// already over the cap can still shrink.
+		secretBytes, err := q.GetRunEnvFormBudgetUsage(ctx, store.GetRunEnvFormBudgetUsageParams{UserID: userID, RepoID: repo})
+		if err != nil {
+			return err
+		}
+		checkFormBudget := func(retainOld bool) error {
+			var newSecret, oldSecret int64
+			if secret {
+				newSecret = newBytes
+			}
+			if exists && live.Secret && !retainOld {
+				oldSecret = int64(live.ValueBytes)
+			}
+			if after := secretBytes - oldSecret + newSecret; after > runenv.MaxClaimSecretBytes && after > secretBytes {
+				return &runEnvConflictError{runEnvCodeFormsBudget, fmt.Sprintf("this save would give runs of this repo more secret value bytes (%d) than a run can register for masking (%d); delete or shorten a secret, or wait for held versions to expire", after, runenv.MaxClaimSecretBytes)}
+			}
+			return nil
+		}
 		// A description-only save does not bump rev, so one committed between the planning
 		// read and this transaction passes the id/rev check: an omitted description keeps
 		// the locked row's, not the planning read's.
@@ -455,8 +552,12 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 		params := store.InsertRunEnvVarParams{
 			UserID: userID, RepoID: repo, Name: name, Secret: secret, Description: description,
 			Ciphertext: material.Ciphertext, SealedWith: material.SealedWith, ValueBytes: int32(newBytes), //nolint:gosec // G115: bounded to 65536 by ValidateValue.
+			VarID: newVarID, Rev: newRev, AadVersion: runenv.AADVersion2,
 		}
 		if !exists {
+			if err := checkFormBudget(false); err != nil {
+				return err
+			}
 			if usage.LiveCount+usage.PendingCount >= runenv.MaxVarsPerScope {
 				return &runEnvConflictError{runEnvCodeLimitReached, fmt.Sprintf("this repo already has %d variables (disabled ones and ones pending deletion count); delete one first", runenv.MaxVarsPerScope)}
 			}
@@ -466,7 +567,6 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 			if err := vault.CheckMaterialHeadroom(totals, 1, int64(len(material.Ciphertext)), int64(len(material.Ciphertext))); err != nil {
 				return runEnvHeadroomConflict(runEnvCodeLimitReached, err)
 			}
-			params.VarID, params.Rev = uuid.New(), 1
 		} else {
 			if usage.ValueBytes-int64(live.ValueBytes)+newBytes > runenv.MaxScopeValueBytes {
 				return &runEnvConflictError{runEnvCodeLimitReached, fmt.Sprintf("the variables of this repo may hold at most %d bytes of values", runenv.MaxScopeValueBytes)}
@@ -477,6 +577,9 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 					return err
 				}
 			}
+			if err := checkFormBudget(retain); err != nil {
+				return err
+			}
 			if retain {
 				// The previous secret version stays sealed for the runs that hold a receipt
 				// for it, inside the per-user history budget and the vault material totals.
@@ -485,10 +588,10 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 					return err
 				}
 				if retired.RetiredCount+1 > runenv.MaxRetiredVersions || retired.ValueBytes+int64(live.ValueBytes) > runenv.MaxRetiredValueBytes {
-					return &runEnvConflictError{runEnvCodeHistoryFull, fmt.Sprintf("this change keeps the previous secret version for runs that still hold it, and the history budget is full (%d of %d versions, %d of %d bytes); disable or delete a variable instead", retired.RetiredCount, runenv.MaxRetiredVersions, retired.ValueBytes, runenv.MaxRetiredValueBytes)}
+					return withHeldByRuns(ctx, q, userID, &runEnvConflictError{runEnvCodeHistoryFull, fmt.Sprintf("this update keeps the previous secret version for runs that still hold it, and the history budget is full (%d of %d versions, %d of %d bytes); disable or delete a variable instead", retired.RetiredCount, runenv.MaxRetiredVersions, retired.ValueBytes, runenv.MaxRetiredValueBytes)})
 				}
 				if err := vault.CheckMaterialHeadroom(totals, 1, int64(len(material.Ciphertext)), int64(len(material.Ciphertext))); err != nil {
-					return runEnvHeadroomConflict(runEnvCodeHistoryFull, err)
+					return withHeldByRuns(ctx, q, userID, runEnvHeadroomConflict(runEnvCodeHistoryFull, err))
 				}
 				if n, err := q.RetireRunEnvVarVersion(ctx, store.RetireRunEnvVarVersionParams{ID: live.ID, UserID: userID}); err != nil || n != 1 {
 					if err == nil {
@@ -508,7 +611,7 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 					return err
 				}
 			}
-			params.VarID, params.Rev, params.DisabledAt = live.VarID, live.Rev+1, live.DisabledAt
+			params.DisabledAt = live.DisabledAt
 		}
 		inserted, err := q.InsertRunEnvVar(ctx, params)
 		if err != nil {
@@ -521,7 +624,9 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 		h.writeRunEnvTxError(w, err, "write run env var")
 		return
 	}
-	dto := h.runEnvWriteDTO(r.Context(), userID, repoID, saved)
+	// FenceVaultWrite checked material's epoch under the owner's lock, so the saved row is sealed at it.
+	savedEpoch := material.Epoch
+	dto := h.runEnvWriteDTO(r.Context(), userID, repoID, saved, savedEpoch)
 	status := http.StatusOK
 	if !exists {
 		status = http.StatusCreated
@@ -533,14 +638,11 @@ func (h *Handler) PutRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 // putRunEnvDescription is the description-only save: the live row changes in place and
 // no new version is written. It needs no vault capacity, so it works while locked.
 func (h *Handler) putRunEnvDescription(ctx context.Context, w http.ResponseWriter, userID, repoID uuid.UUID, cur store.RunEnvVar, description string) {
-	row := runEnvRow{
-		ID: cur.ID, VarID: cur.VarID, Name: cur.Name, Secret: cur.Secret, Description: cur.Description,
-		Ciphertext: cur.Ciphertext, SealedWith: cur.SealedWith, ValueBytes: cur.ValueBytes, Rev: cur.Rev,
-		DisabledAt: cur.DisabledAt, PendingDeleteAt: cur.PendingDeleteAt, CreatedAt: cur.CreatedAt, UpdatedAt: cur.UpdatedAt,
-	}
+	var row runEnvRow
+	var epoch int64
 	if description != cur.Description {
 		var err error
-		row, err = h.mutateLiveRunEnv(ctx, userID, repoID, cur.Name, cur, func(q *store.Queries, live store.RunEnvVar) (runEnvRow, error) {
+		row, epoch, err = h.mutateLiveRunEnv(ctx, userID, repoID, cur.Name, cur, func(q *store.Queries, live store.RunEnvVar) (runEnvRow, error) {
 			updated, err := q.UpdateRunEnvVarDescription(ctx, store.UpdateRunEnvVarDescriptionParams{ID: live.ID, UserID: userID, Description: description})
 			return runEnvRow(updated), err
 		})
@@ -548,8 +650,29 @@ func (h *Handler) putRunEnvDescription(ctx context.Context, w http.ResponseWrite
 			h.writeRunEnvTxError(w, err, "update run env description")
 			return
 		}
+	} else {
+		// Nothing is written: the response is built from a fresh read of the live row whose
+		// ciphertext and vault epoch come from one statement. A row that moved since the
+		// planning read is answered as the fresh row, at its own epoch.
+		fresh, err := h.q.GetLiveRunEnvVarByNameWithEpoch(ctx, store.GetLiveRunEnvVarByNameWithEpochParams{UserID: userID, RepoID: repoPG(repoID), Name: cur.Name})
+		if errors.Is(err, pgx.ErrNoRows) {
+			httpx.Error(w, http.StatusNotFound, "variable not found")
+			return
+		}
+		if err != nil {
+			slog.Error("get run env var for description response", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		row = runEnvRow{
+			ID: fresh.ID, VarID: fresh.VarID, Name: fresh.Name, Secret: fresh.Secret, Description: fresh.Description,
+			Ciphertext: fresh.Ciphertext, SealedWith: fresh.SealedWith, ValueBytes: fresh.ValueBytes, Rev: fresh.Rev,
+			DisabledAt: fresh.DisabledAt, PendingDeleteAt: fresh.PendingDeleteAt, CreatedAt: fresh.CreatedAt, UpdatedAt: fresh.UpdatedAt,
+			AadVersion: fresh.AadVersion,
+		}
+		epoch = fresh.VaultEpoch
 	}
-	dto := h.runEnvWriteDTO(ctx, userID, repoID, row)
+	dto := h.runEnvWriteDTO(ctx, userID, repoID, row, epoch)
 	w.Header().Set("Cache-Control", "no-store")
 	httpx.JSON(w, http.StatusOK, apitypes.RunEnvWriteDTO{Variable: dto})
 }
@@ -557,13 +680,17 @@ func (h *Handler) putRunEnvDescription(ctx context.Context, w http.ResponseWrite
 // mutateLiveRunEnv runs a metadata-only change on the live row of a name in a locked
 // transaction: the advisory lock, then the users-row fence (without a seal snapshot,
 // since no ciphertext is written). expect, when set, is the row the caller planned
-// against; a moved row is errRunEnvChanged. A missing row is pgx.ErrNoRows.
-func (h *Handler) mutateLiveRunEnv(ctx context.Context, userID, repoID uuid.UUID, name string, expect store.RunEnvVar, fn func(*store.Queries, store.RunEnvVar) (runEnvRow, error)) (runEnvRow, error) {
+// against; a moved row is errRunEnvChanged. A missing row is pgx.ErrNoRows. It also returns the
+// vault epoch read under the users-row lock, the epoch the returned row's ciphertext is sealed at.
+func (h *Handler) mutateLiveRunEnv(ctx context.Context, userID, repoID uuid.UUID, name string, expect store.RunEnvVar, fn func(*store.Queries, store.RunEnvVar) (runEnvRow, error)) (runEnvRow, int64, error) {
 	var out runEnvRow
+	var epoch int64
 	err := h.withSecretLock(ctx, userID, nil, func(q *store.Queries) error {
-		if _, err := q.LockUserVaultState(ctx, userID); err != nil {
+		state, err := q.LockUserVaultState(ctx, userID)
+		if err != nil {
 			return err
 		}
+		epoch = state.VaultEpoch
 		if err := lockRunEnvRepo(ctx, q, repoID); err != nil {
 			return err
 		}
@@ -577,12 +704,13 @@ func (h *Handler) mutateLiveRunEnv(ctx context.Context, userID, repoID uuid.UUID
 		out, err = fn(q, live)
 		return err
 	})
-	return out, err
+	return out, epoch, err
 }
 
 // SetRepoEnvVarDisabled is POST /api/repos/{id}/env/{name}/disable and .../enable:
 // metadata-only on the live version (no new version, no history or vault capacity, no
-// unlock needed). Idempotent.
+// unlock needed). Idempotent. Disable applies the name shape only, so a stored name the rules
+// now deny can still be switched off; enable applies the full name rule.
 func (h *Handler) setRepoEnvVarDisabled(w http.ResponseWriter, r *http.Request, disabled bool) {
 	userID, repoID, ok := h.runEnvOwner(w, r)
 	if !ok {
@@ -599,7 +727,7 @@ func (h *Handler) setRepoEnvVarDisabled(w http.ResponseWriter, r *http.Request, 
 		writeRunEnvRule(w, err)
 		return
 	}
-	row, err := h.mutateLiveRunEnv(r.Context(), userID, repoID, name, store.RunEnvVar{}, func(q *store.Queries, live store.RunEnvVar) (runEnvRow, error) {
+	row, epoch, err := h.mutateLiveRunEnv(r.Context(), userID, repoID, name, store.RunEnvVar{}, func(q *store.Queries, live store.RunEnvVar) (runEnvRow, error) {
 		updated, err := q.SetRunEnvVarDisabled(r.Context(), store.SetRunEnvVarDisabledParams{ID: live.ID, UserID: userID, Disabled: disabled})
 		return runEnvRow(updated), err
 	})
@@ -611,7 +739,7 @@ func (h *Handler) setRepoEnvVarDisabled(w http.ResponseWriter, r *http.Request, 
 		h.writeRunEnvTxError(w, err, "disable run env var")
 		return
 	}
-	dto := h.runEnvWriteDTO(r.Context(), userID, repoID, row)
+	dto := h.runEnvWriteDTO(r.Context(), userID, repoID, row, epoch)
 	w.Header().Set("Cache-Control", "no-store")
 	httpx.JSON(w, http.StatusOK, apitypes.RunEnvWriteDTO{Variable: dto})
 }
@@ -632,6 +760,8 @@ func (h *Handler) EnableRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 // again, it still counts toward the per-scope limit, and it is never refused for a
 // budget reason. Neither answer revokes the credential at its provider.
 func (h *Handler) DeleteRepoEnvVar(w http.ResponseWriter, r *http.Request) {
+	// The answer names a state about retained secret history; no cache keeps it.
+	w.Header().Set("Cache-Control", "no-store")
 	userID, repoID, ok := h.runEnvOwner(w, r)
 	if !ok {
 		return
@@ -643,7 +773,7 @@ func (h *Handler) DeleteRepoEnvVar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	state := apitypes.RunEnvStateDisabled // overwritten below
-	_, err := h.mutateLiveRunEnv(r.Context(), userID, repoID, name, store.RunEnvVar{}, func(q *store.Queries, live store.RunEnvVar) (runEnvRow, error) {
+	_, _, err := h.mutateLiveRunEnv(r.Context(), userID, repoID, name, store.RunEnvVar{}, func(q *store.Queries, live store.RunEnvVar) (runEnvRow, error) {
 		retain := false
 		if live.Secret {
 			var err error

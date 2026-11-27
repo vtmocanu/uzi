@@ -19,9 +19,10 @@ import (
 // TestRerunJudgeLanePolicy drives POST /api/runs/{id}/rejudge through the public handler with the
 // owner's judge lane policy (PRD #4322 M1a) in the fake store. The fake store is not a live
 // *store.Queries, so the vendor lane reaches the insert (here, the index conflict), a Codex judge
-// reaches the fake's explicit-Codex credential refusal, and the provider-bound Claude lane, which
-// needs the create transaction to freeze under the secret lock, fails closed (500) with nothing
-// created. Each case is one synchronous request.
+// reaches the fake's explicit-Codex credential refusal, and a provider-bound lane (Claude, or Codex
+// with a Codex source since PRD #4574 M1), which needs the create transaction to freeze under the
+// secret lock, fails closed (500) with nothing created; the LiveDB tests prove the allowed path.
+// Each case is one synchronous request.
 func TestRerunJudgeLanePolicy(t *testing.T) {
 	providerID := pgtype.UUID{Bytes: uuid.MustParse("65070921-4487-44f4-8630-378c76e42098"), Valid: true}
 	secretID := pgtype.UUID{Bytes: uuid.MustParse("0f1c2a54-7a52-4a5b-9a07-27a1ec2f10a4"), Valid: true}
@@ -45,9 +46,9 @@ func TestRerunJudgeLanePolicy(t *testing.T) {
 		{name: "claude source/claude is provider-bound", policy: store.GetUserJudgeLanePolicyRow{ClaudeProviderID: providerID}, lane: "claude", status: http.StatusInternalServerError, message: "internal error"},
 		{name: "claude source/codex is vendor", policy: store.GetUserJudgeLanePolicyRow{ClaudeProviderID: providerID}, lane: "codex", status: http.StatusUnprocessableEntity, code: "no_credential_for_harness", message: codexMsg},
 		{name: "codex source/claude is vendor", policy: store.GetUserJudgeLanePolicyRow{CodexProviderID: providerID}, lane: "claude", status: http.StatusConflict, message: activeMsg, presence: 1, created: 1},
-		{name: "codex source/codex refused", policy: store.GetUserJudgeLanePolicyRow{CodexProviderID: providerID}, lane: "codex", status: http.StatusConflict, reason: "provider_lane_unsupported", message: "this run type does not support a model-provider source yet"},
+		{name: "codex source/codex is provider-bound", policy: store.GetUserJudgeLanePolicyRow{CodexProviderID: providerID}, lane: "codex", status: http.StatusInternalServerError, message: "internal error"},
 		{name: "both sources/claude is provider-bound", policy: store.GetUserJudgeLanePolicyRow{ClaudeProviderID: providerID, CodexProviderID: providerID}, lane: "claude", status: http.StatusInternalServerError, message: "internal error"},
-		{name: "both sources/codex refused", policy: store.GetUserJudgeLanePolicyRow{ClaudeProviderID: providerID, CodexProviderID: providerID}, lane: "codex", status: http.StatusConflict, reason: "provider_lane_unsupported", message: "this run type does not support a model-provider source yet"},
+		{name: "both sources/codex is provider-bound", policy: store.GetUserJudgeLanePolicyRow{ClaudeProviderID: providerID, CodexProviderID: providerID}, lane: "codex", status: http.StatusInternalServerError, message: "internal error"},
 		{name: "pinned with a credential beats a claude source", policy: store.GetUserJudgeLanePolicyRow{JudgeAnthropicBindMode: workersvc.BindModePinned, JudgeAnthropicSecretID: secretID, ClaudeProviderID: providerID}, lane: "claude", status: http.StatusConflict, message: activeMsg, presence: 1, created: 1},
 		{name: "pinned without a credential is not a pin", policy: store.GetUserJudgeLanePolicyRow{JudgeAnthropicBindMode: workersvc.BindModePinned, ClaudeProviderID: providerID}, lane: "claude", status: http.StatusInternalServerError, message: "internal error"},
 	} {

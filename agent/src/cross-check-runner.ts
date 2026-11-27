@@ -26,7 +26,8 @@ import { errMessage } from "./util.js";
 import { rmHomeTree } from "./rmtree.js";
 import { uidSplitActive } from "./runner-uid.js";
 import { MessageBatcher } from "./batcher.js";
-import { makeRedactor, makeTextRedactor, providerKeyForms } from "./redact.js";
+import { makeRedactor, makeTextRedactor, providerKeyForms, redactStrings } from "./redact.js";
+import { RUN_ENV_FORMS_OVER_BUDGET, runEnvClaimForms } from "./run-env-forms.js";
 import { CheckActivityRecorder } from "./cross-check-activity.js";
 
 // The verdict route uses reason-class refusals, whereas ordinary state routes use disposition.
@@ -196,6 +197,11 @@ export class CrossCheckRunner {
       // Journaled to the outbox is not proof the original payload arrived (replay may tombstone it): fail closed.
       return usageSeqs.some((s) => (from !== undefined && s >= from) || tombstones.seqs.has(s) || journaled.seqs.has(s));
     };
+    const runEnvClaim = runEnvClaimForms(claim.secrets.run_env, claim.secrets.run_env_redact);
+    const runEnvForms = runEnvClaim.redaction;
+    let runEnvRegistered = false;
+    // Identity until the secrets are known; every verdict body passes through it before it is reported.
+    let redactVerdict: <T>(v: T) => T = (v) => v;
     let verdictDelivered = false;
     let modelInvoked = false;
     let nativeCleanupConfirmed = false;
@@ -221,10 +227,18 @@ export class CrossCheckRunner {
     try {
       const ack = await this.client.reportState(runId, { status: "running", claim_generation: claim.claim_generation });
       if (ack?.staleClaim) return;
-      const secrets = [claim.secrets.forge_pat, claim.secrets.anthropic_oauth_token, ...(claim.secrets.provider?.credential ? providerKeyForms(claim.secrets.provider.credential) : []), claim.secrets.codex?.capability];
+      // PRD #4416 M2: the lead's secret run variables (run_env_redact, versions the checker may quote)
+      // are registered with the logger and the redactors, and evicted in the finally below.
+      for (const s of runEnvForms) this.log.addSecret(s);
+      runEnvRegistered = true;
+      const secrets = [claim.secrets.forge_pat, claim.secrets.anthropic_oauth_token, ...(claim.secrets.provider?.credential ? providerKeyForms(claim.secrets.provider.credential) : []), claim.secrets.codex?.capability, ...runEnvForms];
+      const scrubVerdictText = makeTextRedactor(secrets);
+      redactVerdict = (v) => redactStrings(v, scrubVerdictText);
       // PRD #4320: the cross-check lane cannot serve a provider until PRD #4322; the server refuses it
       // first, this is the worker's second layer. Reported as an unavailable checker, never run.
       if (claim.secrets.provider) throw new Error(PROVIDER_LANE_UNSUPPORTED);
+      // An over-budget claim registered its raw values above and never runs: reported as an unavailable checker.
+      if (runEnvClaim.overBudget) throw new Error(RUN_ENV_FORMS_OVER_BUDGET);
       const b = new MessageBatcher(this.client, runId, claim.last_seq ?? 0, this.opts.batchMs ?? 500, this.log,
         makeRedactor(secrets), makeTextRedactor(secrets), {
           ...(this.opts.outbox ? { outbox: this.opts.outbox } : {}),
@@ -341,7 +355,7 @@ export class CrossCheckRunner {
         const probe = await this.client.reportState(runId, { status: "running", claim_generation: claim.claim_generation }, cancel.signal);
         cancel.signal.throwIfAborted();
         if (probe?.staleClaim || steering.claimLost()) return;
-        await this.client.reportCodeCrossCheckVerdict(runId, generation, { outcome: "completed", findings, ...(code.coverage_supported === true ? { coverage } : {}) }, cancel.signal);
+        await this.client.reportCodeCrossCheckVerdict(runId, generation, redactVerdict({ outcome: "completed" as const, findings, ...(code.coverage_supported === true ? { coverage } : {}) }), cancel.signal);
         verdictDelivered = true;
         await postTerminalState(this.terminalDeps, this.client, {
           runId, claimGeneration: generation, phase: "running", messagesThroughSeq: fence(),
@@ -361,7 +375,7 @@ export class CrossCheckRunner {
       const decision = parsed.verdict === "approve" ? { verdict: "approve", reason_class: "approve" } as const
         : parsed.verdict === "revise" ? { verdict: "revise", reason_class: "revise" } as const
         : { verdict: "block", reason_class: "block" } as const;
-      await this.client.reportCrossCheckVerdict(runId, generation, { ...parsed, ...decision }, cancel.signal);
+      await this.client.reportCrossCheckVerdict(runId, generation, redactVerdict({ ...parsed, ...decision }), cancel.signal);
       verdictDelivered = true;
       await postTerminalState(this.terminalDeps, this.client, {
         runId, claimGeneration: generation, phase: "running", messagesThroughSeq: fence(),
@@ -473,6 +487,7 @@ export class CrossCheckRunner {
           this.log.warn("code snapshot retained after cleanup error", { error: errMessage(err) });
         }
       }
+      if (runEnvRegistered) for (const s of runEnvForms) this.log.removeSecret(s);
       operation?.close();
       this.opts.activeRuns?.remove(runId);
     }

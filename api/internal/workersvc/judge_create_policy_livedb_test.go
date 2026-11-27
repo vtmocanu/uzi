@@ -753,23 +753,276 @@ func TestJudgeSkipProviderReasonsCommittedLiveDB(t *testing.T) {
 			t.Fatalf("judge_skips rows = %d", n)
 		}
 	})
-	t.Run("provider_lane_unsupported", func(t *testing.T) {
-		env := setupCodexLiveDB(t)
-		userID, repoID := seedCodexOnlyOriginUser(t, env)
-		svc := judgeEnqueueSvc(env, userID)
-		provider, _ := seedCodexProviderKeyFor(t, env, userID)
-		env.exec(`UPDATE users SET codex_provider_id = $2, codex_provider_scope_id = id WHERE id = $1`, userID, provider)
-		t.Cleanup(func() {
-			_, _ = env.pool.Exec(env.ctx, `UPDATE users SET codex_provider_id = NULL, codex_provider_scope_id = NULL WHERE id = $1`, userID)
-		})
-		target := seedJudgeTarget(t, env, userID, repoID, "codex", 9811)
-		svc.maybeEnqueueJudge(env.ctx, target)
-		noJudgeAnywhere(t, env, target.ID, "a Codex source")
-		wantSkip(t, env, target.ID, "codex", JudgeSkipProviderLaneUnsupported)
-		if n := judgeSkipCount(t, env, target.ID); n != 1 {
+	t.Run("a codex source no longer records provider_lane_unsupported", func(t *testing.T) {
+		c := newCjFix(t)
+		target := c.newTarget("codex")
+		c.auto(target)
+		c.wantBoundCodex(c.mustJudge(target), c.provider, c.key)
+		c.wantNoSkip(target)
+	})
+	t.Run("codex provider_source_unusable", func(t *testing.T) {
+		c := newCjFix(t)
+		c.env.exec(`UPDATE model_providers SET retired_at = now() WHERE id = $1`, c.provider)
+		target := c.newTarget("codex")
+		c.auto(target)
+		noJudgeAnywhere(t, c.env, target.ID, "a retired Codex source")
+		wantSkip(t, c.env, target.ID, "codex", JudgeSkipProviderSourceUnusable)
+		if n := judgeSkipCount(t, c.env, target.ID); n != 1 {
 			t.Fatalf("judge_skips rows = %d", n)
 		}
 	})
+}
+
+// ---------------------------------------------------------------------------------------------
+// Codex provider judge creation (PRD #4574 M1).
+// ---------------------------------------------------------------------------------------------
+
+// cjFix is a Codex-sourced owner: usable vendor Codex default (so an unintended vendor fallback
+// would succeed and fail the test), a selected valid Codex source, judge runs on Codex, and a
+// judge-enabled service that allows the provider's URL. No Anthropic token.
+type cjFix struct {
+	t        *testing.T
+	env      codexTestEnv
+	userID   uuid.UUID
+	repoID   uuid.UUID
+	svc      *Service
+	provider uuid.UUID
+	key      uuid.UUID
+	iid      int64
+}
+
+func newCjFix(t *testing.T) *cjFix {
+	t.Helper()
+	env := setupCodexLiveDB(t)
+	userID, repoID := seedCodexOnlyOriginUser(t, env)
+	svc := judgeEnqueueSvc(env, userID)
+	svc.p.ProviderAllowedBaseURLs = []string{pvBase}
+	setJudgeRunsOn(env, userID, "codex")
+	c := &cjFix{t: t, env: env, userID: userID, repoID: repoID, svc: svc, iid: 90000}
+	c.provider, c.key = seedCodexProviderKeyFor(t, env, userID)
+	c.selectSource(c.provider)
+	t.Cleanup(func() {
+		_, _ = env.pool.Exec(context.Background(), `UPDATE users SET codex_provider_id = NULL, codex_provider_scope_id = NULL WHERE id = $1`, userID)
+	})
+	return c
+}
+
+func (c *cjFix) selectSource(provider uuid.UUID) {
+	c.t.Helper()
+	c.env.exec(`UPDATE users SET codex_provider_id = $2, codex_provider_scope_id = (SELECT scope_owner_id FROM model_providers WHERE id = $2) WHERE id = $1`, c.userID, provider)
+}
+
+// seedCodexProviderWithMap seeds a Codex provider (revision 1) with the given model map and an
+// enabled key, without selecting it.
+func (c *cjFix) seedCodexProviderWithMap(modelMap string) (provider, key uuid.UUID) {
+	c.t.Helper()
+	p, err := c.env.q.InsertModelProvider(c.env.ctx, store.InsertModelProviderParams{OwnerUserID: c.userID, Name: "cj-" + uuid.NewString()[:8], Engine: harnessCodex})
+	if err != nil {
+		c.t.Fatalf("insert provider: %v", err)
+	}
+	if err := c.env.q.InsertModelProviderRevision(c.env.ctx, store.InsertModelProviderRevisionParams{
+		ProviderID: p.ID, Revision: 1, Protocol: "openai_responses", BaseUrl: pvBase, AuthStyle: "bearer", ModelMap: []byte(modelMap),
+	}); err != nil {
+		c.t.Fatalf("insert revision: %v", err)
+	}
+	k, err := c.env.q.InsertProviderKeySecret(c.env.ctx, store.InsertProviderKeySecretParams{
+		UserID: c.userID, Label: p.ID.String(), Ciphertext: []byte("ct"), SealedWith: "master", ProviderID: pgtype.UUID{Bytes: p.ID, Valid: true},
+	})
+	if err != nil {
+		c.t.Fatalf("insert key: %v", err)
+	}
+	return p.ID, k.ID
+}
+
+func (c *cjFix) newTarget(harness string) store.Run {
+	c.t.Helper()
+	c.iid++
+	return seedJudgeTarget(c.t, c.env, c.userID, c.repoID, harness, c.iid)
+}
+
+func (c *cjFix) auto(target store.Run) { c.svc.maybeEnqueueJudge(c.env.ctx, target) }
+
+func (c *cjFix) manual(target store.Run) (store.Run, error) {
+	return c.svc.RerunJudge(c.env.ctx, c.userID, false, target.ID)
+}
+
+func (c *cjFix) mustJudge(target store.Run) store.Run {
+	c.t.Helper()
+	id, _, ok := judgeForTarget(c.t, c.env, target.ID)
+	if !ok {
+		c.t.Fatalf("no judge was created for %s", target.ID)
+	}
+	return mustRun(c.t, c.env, id)
+}
+
+func (c *cjFix) wantNoSkip(target store.Run) {
+	c.t.Helper()
+	if n := judgeSkipCount(c.t, c.env, target.ID); n != 0 {
+		c.t.Fatalf("%d judge skip(s) recorded, want none", n)
+	}
+}
+
+// wantBoundCodex asserts a provider-bound Codex judge on (provider, key): all five binding columns,
+// harness codex, and no vendor credential or Codex authority.
+func (c *cjFix) wantBoundCodex(r store.Run, provider, key uuid.UUID) {
+	c.t.Helper()
+	if r.Kind != "judge" || r.Harness != "codex" {
+		c.t.Fatalf("judge kind=%q harness=%q, want a codex judge", r.Kind, r.Harness)
+	}
+	if !r.ModelProviderID.Valid || uuid.UUID(r.ModelProviderID.Bytes) != provider || !r.ModelProviderRevision.Valid || r.ModelProviderRevision.Int32 != 1 ||
+		r.ModelProviderKeyMode.String != "user_key" || !r.ModelProviderKeySecretID.Valid || uuid.UUID(r.ModelProviderKeySecretID.Bytes) != key ||
+		!r.ModelProviderKeyRev.Valid {
+		c.t.Fatalf("judge binding = %+v, want provider %s rev 1 key %s", bindingOfRun(r), provider, key)
+	}
+	if r.CodexSecretID.Valid || r.CodexAuthMode.Valid || r.AnthropicSecretID.Valid || r.CredentialOverrideSecretID.Valid {
+		c.t.Fatalf("a Codex provider judge carries vendor authority: codex=%v auth=%v anthropic=%v override=%v",
+			r.CodexSecretID, r.CodexAuthMode, r.AnthropicSecretID, r.CredentialOverrideSecretID)
+	}
+}
+
+// TestCodexProviderJudgeCreateLiveDB: a Codex judge for an owner with a selected, usable Codex
+// source is bound to it at creation, on the automatic and the manual path, with no vendor Codex
+// credential and no skip. The owner also holds a usable vendor Codex default, so a vendor fallback
+// would create a different row and fail the test.
+func TestCodexProviderJudgeCreateLiveDB(t *testing.T) {
+	t.Run("automatic", func(t *testing.T) {
+		c := newCjFix(t)
+		target := c.newTarget("codex")
+		c.auto(target)
+		c.wantBoundCodex(c.mustJudge(target), c.provider, c.key)
+		c.wantNoSkip(target)
+	})
+	t.Run("manual", func(t *testing.T) {
+		c := newCjFix(t)
+		target := c.newTarget("codex")
+		created, err := c.manual(target)
+		if err != nil {
+			t.Fatalf("manual: %v", err)
+		}
+		c.wantBoundCodex(mustRun(t, c.env, created.ID), c.provider, c.key)
+		c.wantNoSkip(target)
+	})
+	t.Run("claude target judged on codex", func(t *testing.T) {
+		c := newCjFix(t)
+		target := c.newTarget("claude")
+		c.auto(target)
+		c.wantBoundCodex(c.mustJudge(target), c.provider, c.key)
+	})
+	t.Run("unset source is the vendor codex judge", func(t *testing.T) {
+		c := newCjFix(t)
+		c.env.exec(`UPDATE users SET codex_provider_id = NULL, codex_provider_scope_id = NULL WHERE id = $1`, c.userID)
+		target := c.newTarget("codex")
+		c.auto(target)
+		r := c.mustJudge(target)
+		if b := bindingOfRun(r); b != (bindingParams{}) {
+			t.Fatalf("a vendor Codex judge carries a provider binding: %+v", b)
+		}
+		if r.Harness != "codex" || !r.CodexSecretID.Valid {
+			t.Fatalf("vendor judge harness=%q codex secret=%v, want codex with its own credential", r.Harness, r.CodexSecretID)
+		}
+	})
+	t.Run("an anthropic judge pin change does not affect the codex judge", func(t *testing.T) {
+		c := newCjFix(t)
+		pin := c.env.seedAnthropicSecret(t, c.userID, "pin-"+uuid.NewString(), false)
+		c.env.exec(`UPDATE users SET judge_anthropic_bind_mode = 'pinned', judge_anthropic_secret_id = $2 WHERE id = $1`, c.userID, pin)
+		target := c.newTarget("codex")
+		c.auto(target)
+		c.wantBoundCodex(c.mustJudge(target), c.provider, c.key)
+		manualTarget := c.newTarget("codex")
+		created, err := c.manual(manualTarget)
+		if err != nil {
+			t.Fatalf("manual with an Anthropic pin: %v", err)
+		}
+		c.wantBoundCodex(mustRun(t, c.env, created.ID), c.provider, c.key)
+	})
+	// The pin DRIFTS inside creation: it is written between the lane decision and the locked re-read,
+	// so the decision and the re-read disagree on the Anthropic pin. The Codex lane ignores it and
+	// still freezes the Codex source.
+	for _, path := range []string{"manual", "automatic"} {
+		t.Run("an anthropic judge pin drifting during creation does not affect the codex judge/"+path, func(t *testing.T) {
+			c := newCjFix(t)
+			pin := c.env.seedAnthropicSecret(t, c.userID, "pin-"+uuid.NewString(), false)
+			ran := false
+			c.svc.judgeDecidedHook = func(context.Context) {
+				ran = true
+				c.env.exec(`UPDATE users SET judge_anthropic_bind_mode = 'pinned', judge_anthropic_secret_id = $2 WHERE id = $1`, c.userID, pin)
+			}
+			target := c.newTarget("codex")
+			var judge store.Run
+			if path == "manual" {
+				created, err := c.manual(target)
+				if err != nil {
+					t.Fatalf("manual with a drifting Anthropic pin: %v", err)
+				}
+				judge = mustRun(t, c.env, created.ID)
+			} else {
+				c.auto(target)
+				c.wantNoSkip(target)
+				judge = c.mustJudge(target)
+			}
+			if !ran {
+				t.Fatal("the decision hook never ran")
+			}
+			c.wantBoundCodex(judge, c.provider, c.key)
+		})
+	}
+}
+
+// TestCodexProviderJudgeFrozenAcrossSourceChangeLiveDB: the owner re-selects another Codex source
+// while the judge is queued; the judge keeps its frozen binding, and only the next judge binds the
+// new source.
+func TestCodexProviderJudgeFrozenAcrossSourceChangeLiveDB(t *testing.T) {
+	c := newCjFix(t)
+	target := c.newTarget("codex")
+	c.auto(target)
+	judge := c.mustJudge(target)
+	c.wantBoundCodex(judge, c.provider, c.key)
+
+	other, otherKey := c.seedCodexProviderWithMap(`{"default":{"model":"other"}}`)
+	c.selectSource(other)
+	c.wantBoundCodex(mustRun(t, c.env, judge.ID), c.provider, c.key)
+
+	next := c.newTarget("codex")
+	c.auto(next)
+	c.wantBoundCodex(c.mustJudge(next), other, otherKey)
+}
+
+// TestCodexProviderJudgeUnusableSourceLiveDB: a retired, key-less or invalid-map Codex source
+// creates no judge on either path and never falls back to the vendor Codex credential the owner
+// holds. The automatic path records provider_source_unusable (never provider_model_unmapped, a
+// Claude-only reason); the manual path is the typed ErrProviderSourceUnusable.
+func TestCodexProviderJudgeUnusableSourceLiveDB(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(c *cjFix)
+		reason string
+	}{
+		{"retired", func(c *cjFix) {
+			c.env.exec(`UPDATE model_providers SET retired_at = now() WHERE id = $1`, c.provider)
+		}, SourceUnusableRetired},
+		{"key disabled", func(c *cjFix) {
+			c.env.exec(`UPDATE user_secrets SET disabled_at = now(), enablement_rev = enablement_rev + 1 WHERE id = $1`, c.key)
+		}, SourceUnusableKeyDisabled},
+		{"model map without a default", func(c *cjFix) {
+			p, _ := c.seedCodexProviderWithMap(`{"gpt-6-sol":{"model":"y"}}`)
+			c.selectSource(p)
+		}, SourceUnusableInvalid},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := newCjFix(t)
+			tc.mutate(c)
+			auto := c.newTarget("codex")
+			c.auto(auto)
+			noJudgeAnywhere(t, c.env, auto.ID, "an unusable Codex source")
+			wantSkip(t, c.env, auto.ID, "codex", JudgeSkipProviderSourceUnusable)
+			manual := c.newTarget("codex")
+			if _, err := c.manual(manual); !isUnusable(err, tc.reason) {
+				t.Fatalf("manual err = %v, want provider_source_unusable (%s)", err, tc.reason)
+			}
+			noJudgeAnywhere(t, c.env, manual.ID, "an unusable Codex source")
+		})
+	}
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -879,7 +1132,7 @@ func TestProviderJudgeSharedDefinitionLiveDB(t *testing.T) {
 
 // TestCodexJudgeClaudeSourceOwnerLiveDB: an owner whose only source is a Claude provider still gets
 // a vendor Codex judge (automatic and manual) with their own Codex credential; setting a Codex source
-// refuses it with provider_lane_unsupported (until #4574).
+// then binds the Codex judge to it on both paths (PRD #4574 M1).
 func TestCodexJudgeClaudeSourceOwnerLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	userID, repoID := seedCodexOnlyOriginUser(t, env) // usable vendor Codex default, no Anthropic token
@@ -910,16 +1163,31 @@ func TestCodexJudgeClaudeSourceOwnerLiveDB(t *testing.T) {
 		t.Fatalf("a vendor Codex judge carries a provider binding: %+v", b)
 	}
 
-	// A Codex source refuses the Codex judge on both paths.
-	codexProvider, _ := seedCodexProviderKeyFor(t, env, userID)
+	// A Codex source binds the Codex judge on both paths, with no vendor Codex credential.
+	codexProvider, codexKey := seedCodexProviderKeyFor(t, env, userID)
 	env.exec(`UPDATE users SET codex_provider_id = $2, codex_provider_scope_id = id WHERE id = $1`, userID, codexProvider)
-	refusedAuto := seedJudgeTarget(t, env, userID, repoID, "claude", 9823)
-	svc.maybeEnqueueJudge(env.ctx, refusedAuto)
-	noJudgeAnywhere(t, env, refusedAuto.ID, "a Codex source")
-	wantSkip(t, env, refusedAuto.ID, "codex", JudgeSkipProviderLaneUnsupported)
-	refusedManual := seedJudgeTarget(t, env, userID, repoID, "claude", 9824)
-	if _, err := svc.RerunJudge(env.ctx, userID, false, refusedManual.ID); !errors.Is(err, ErrProviderLaneUnsupported) {
-		t.Fatalf("manual err = %v, want provider_lane_unsupported", err)
+	wantBound := func(r store.Run) {
+		t.Helper()
+		b := bindingOfRun(r)
+		if r.Harness != "codex" || !b.ProviderID.Valid || uuid.UUID(b.ProviderID.Bytes) != codexProvider || !b.KeySecret.Valid ||
+			uuid.UUID(b.KeySecret.Bytes) != codexKey || r.CodexSecretID.Valid || r.CodexAuthMode.Valid {
+			t.Fatalf("judge = harness %q binding %+v codex secret %v, want a Codex judge bound to %s", r.Harness, b, r.CodexSecretID, codexProvider)
+		}
 	}
-	noJudgeAnywhere(t, env, refusedManual.ID, "a Codex source")
+	boundAuto := seedJudgeTarget(t, env, userID, repoID, "claude", 9823)
+	svc.maybeEnqueueJudge(env.ctx, boundAuto)
+	autoID, _, ok := judgeForTarget(t, env, boundAuto.ID)
+	if !ok {
+		t.Fatal("automatic: want a Codex judge bound to the Codex source")
+	}
+	wantBound(mustRun(t, env, autoID))
+	if n := judgeSkipCount(t, env, boundAuto.ID); n != 0 {
+		t.Fatalf("automatic: %d judge skip(s) recorded, want none", n)
+	}
+	boundManual := seedJudgeTarget(t, env, userID, repoID, "claude", 9824)
+	created, err = svc.RerunJudge(env.ctx, userID, false, boundManual.ID)
+	if err != nil {
+		t.Fatalf("manual err = %v, want a Codex judge bound to the Codex source", err)
+	}
+	wantBound(mustRun(t, env, created.ID))
 }

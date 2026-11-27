@@ -1488,6 +1488,10 @@ WITH checker_template_pins AS MATERIALIZED (
       -- worker reporting 'issue_key_v1' (it renders the run's references by issue_key and never
       -- writes Closes #<iid>). Standalone, outside fn_worker_can_claim and @capability_aware.
       AND ('issue_key_v1' = ANY($29::text[]) OR NOT EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL))
+      -- PRD #4416 M2: a lead-lane run (fn_run_env_lane) whose repo has an enabled live variable, or that holds a
+      -- secret delivery receipt, is claimable only by a worker reporting 'run_env_v1'. Standalone, outside
+      -- fn_worker_can_claim and @capability_aware.
+      AND ('run_env_v1' = ANY($29::text[]) OR NOT (fn_run_env_lane(r.kind, r.review_target_run_id, r.egress_profile_id) AND (EXISTS (SELECT 1 FROM run_env_vars re WHERE re.user_id = r.user_id AND re.repo_id = r.repo_id AND re.retired_at IS NULL AND re.pending_delete_at IS NULL AND re.disabled_at IS NULL) OR EXISTS (SELECT 1 FROM run_env_receipts rr WHERE rr.run_id = r.id AND rr.secret))))
       AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY($29::text[]))
       AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY($29::text[]))
       AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL) OR r.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY($29::text[]))
@@ -1523,7 +1527,7 @@ WITH checker_template_pins AS MATERIALIZED (
       -- unknown claim key and start the run with no model credential. Same @worker_protocol_caps.
       AND (r.model_provider_key_mode IS NULL
            OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY($29::text[]) AND (r.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY($29::text[])))
-           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY($29::text[])))
+           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY($29::text[]) AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY($29::text[]))))
       AND (NOT (r.plan_cross_check_required OR (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan')))
            OR 'cross_check_v1' = ANY($29::text[]))
       AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
@@ -1611,6 +1615,10 @@ WITH checker_template_pins AS MATERIALIZED (
       AND (r.kind <> 'job'
            OR (NOT $11::boolean AND 'job_runner_v1' = ANY($29::text[])
                AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY($29::text[]))
+               -- PRD #4322 M1b (the claude_provider_job_v1 ROLLOUT GATE): a provider-bound job (every one
+               -- stamps model_provider_key_mode) additionally needs 'claude_provider_job_v1'; the generic
+               -- provider clause above already requires 'claude_provider_v1'. Vendor jobs are unchanged.
+               AND (r.model_provider_key_mode IS NULL OR 'claude_provider_job_v1' = ANY($29::text[]))
                -- PRD #1976 M1 (the isolated_job_v1 ROLLOUT GATE): a profile-bound job (runs.egress_profile_id)
                -- additionally needs 'isolated_job_v1', so a lane worker released before profile-bound jobs
                -- (isolated_fetch_v1 + job_runner_v1 only) never claims one. Same OUTSIDE-the-bypasses rule;
@@ -1810,6 +1818,10 @@ WITH checker_template_pins AS MATERIALIZED (
                 -- worker reporting 'issue_key_v1' (it renders the run's references by issue_key and never
                 -- writes Closes #<iid>). Standalone, outside fn_worker_can_claim and @capability_aware.
                 AND ('issue_key_v1' = ANY(p.protocol_capabilities) OR NOT EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL))
+                -- PRD #4416 M2: a lead-lane run (fn_run_env_lane) whose repo has an enabled live variable, or that holds a
+                -- secret delivery receipt, is claimable only by a worker reporting 'run_env_v1'. Standalone, outside
+                -- fn_worker_can_claim and @capability_aware.
+                AND ('run_env_v1' = ANY(p.protocol_capabilities) OR NOT (fn_run_env_lane(r.kind, r.review_target_run_id, r.egress_profile_id) AND (EXISTS (SELECT 1 FROM run_env_vars re WHERE re.user_id = r.user_id AND re.repo_id = r.repo_id AND re.retired_at IS NULL AND re.pending_delete_at IS NULL AND re.disabled_at IS NULL) OR EXISTS (SELECT 1 FROM run_env_receipts rr WHERE rr.run_id = r.id AND rr.secret))))
                 AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(p.protocol_capabilities))
                 AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(p.protocol_capabilities))
       AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL) OR r.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY(p.protocol_capabilities))
@@ -1832,7 +1844,7 @@ WITH checker_template_pins AS MATERIALIZED (
                 -- provider-bound run to a peer that lacks its engine's provider capability and could never claim it.
                 AND (r.model_provider_key_mode IS NULL
            OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(p.protocol_capabilities) AND (r.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY(p.protocol_capabilities)))
-           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(p.protocol_capabilities)))
+           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(p.protocol_capabilities) AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(p.protocol_capabilities))))
       AND (NOT (r.plan_cross_check_required OR (r.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan')))
            OR 'cross_check_v1' = ANY(p.protocol_capabilities))
       AND (NOT (r.kind = 'cross_check' AND r.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = r.id AND pc.stage = 'plan'))
@@ -1903,6 +1915,8 @@ WITH checker_template_pins AS MATERIALIZED (
                 AND (r.kind <> 'job'
                      OR (NOT COALESCE(p.docker_enabled, false) AND 'job_runner_v1' = ANY(p.protocol_capabilities)
                          AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(p.protocol_capabilities))
+                         -- PRD #4322 M1b: and the claude_provider_job_v1 arm for a provider-bound job.
+                         AND (r.model_provider_key_mode IS NULL OR 'claude_provider_job_v1' = ANY(p.protocol_capabilities))
                          -- PRD #1976 M1: and the isolated_job_v1 arm for a profile-bound job.
                          AND (r.egress_profile_id IS NULL OR 'isolated_job_v1' = ANY(p.protocol_capabilities))))
                 AND COALESCE(codex_admission_run_eligible_at(r.id) <= now(), true)
@@ -3227,6 +3241,10 @@ WHERE run.id = $1
   -- worker reporting 'issue_key_v1' (it renders the run's references by issue_key and never
   -- writes Closes #<iid>). Standalone, outside fn_worker_can_claim and @capability_aware.
   AND ('issue_key_v1' = ANY(w.protocol_capabilities) OR NOT EXISTS (SELECT 1 FROM repos lr WHERE lr.id = run.repo_id AND lr.issue_tracker_connection_id IS NOT NULL))
+  -- PRD #4416 M2: a lead-lane run (fn_run_env_lane) whose repo has an enabled live variable, or that holds a
+  -- secret delivery receipt, is claimable only by a worker reporting 'run_env_v1'. Standalone, outside
+  -- fn_worker_can_claim and @capability_aware.
+  AND ('run_env_v1' = ANY(w.protocol_capabilities) OR NOT (fn_run_env_lane(run.kind, run.review_target_run_id, run.egress_profile_id) AND (EXISTS (SELECT 1 FROM run_env_vars re WHERE re.user_id = run.user_id AND re.repo_id = run.repo_id AND re.retired_at IS NULL AND re.pending_delete_at IS NULL AND re.disabled_at IS NULL) OR EXISTS (SELECT 1 FROM run_env_receipts rr WHERE rr.run_id = run.id AND rr.secret))))
   AND ((NOT run.repo_agent_source_required AND run.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(w.protocol_capabilities))
   AND (run.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(w.protocol_capabilities))
       AND (NOT (run.policy_preserve_required OR run.policy_pending_fresh OR (run.policy_outcome_id IS NOT NULL AND run.policy_resolved_at IS NULL) OR run.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
@@ -3241,7 +3259,7 @@ WHERE run.id = $1
   -- PRD #4320 module 5: the provider claim clause, mirrored (see ClaimRun).
   AND (run.model_provider_key_mode IS NULL
            OR (run.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities) AND (run.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities)))
-           OR (run.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities)))
+           OR (run.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities) AND (run.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities))))
       AND (NOT (run.plan_cross_check_required OR (run.kind = 'cross_check' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = run.id AND pc.stage = 'plan')))
            OR 'cross_check_v1' = ANY(w.protocol_capabilities))
       AND (NOT (run.kind = 'cross_check' AND run.harness = 'claude' AND EXISTS (SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = run.id AND pc.stage = 'plan'))
@@ -3314,6 +3332,8 @@ WHERE run.id = $1
   AND (run.kind <> 'job'
        OR (NOT COALESCE(w.docker_enabled, false) AND 'job_runner_v1' = ANY(w.protocol_capabilities)
            AND (run.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))
+           -- PRD #4322 M1b: and the claude_provider_job_v1 arm for a provider-bound job.
+           AND (run.model_provider_key_mode IS NULL OR 'claude_provider_job_v1' = ANY(w.protocol_capabilities))
            -- PRD #1976 M1: and the isolated_job_v1 arm for a profile-bound job.
            AND (run.egress_profile_id IS NULL OR 'isolated_job_v1' = ANY(w.protocol_capabilities))))
   AND (run.released_worker_id IS NULL
@@ -3717,11 +3737,16 @@ WHERE w.user_id = $1
   -- PRD #1909 M1: a job stamped with runs.job_protocol (@requires_job_files) also needs the
   -- 'job_files_v1' protocol capability; the caller passes runs.job_protocol IS NOT NULL.
   AND (NOT $2::boolean OR 'job_files_v1' = ANY(w.protocol_capabilities))
+  -- PRD #4322 M1b: a provider-bound job (@requires_provider_job: runs.model_provider_key_mode IS NOT
+  -- NULL) also needs 'claude_provider_v1' AND 'claude_provider_job_v1' (the claim clauses' conjunction).
+  AND (NOT $3::boolean
+       OR ('claude_provider_v1' = ANY(w.protocol_capabilities) AND 'claude_provider_job_v1' = ANY(w.protocol_capabilities)))
 `
 
 type CountOnlineWorkersSatisfyingJobRunnerParams struct {
-	UserID           uuid.UUID `json:"user_id"`
-	RequiresJobFiles bool      `json:"requires_job_files"`
+	UserID              uuid.UUID `json:"user_id"`
+	RequiresJobFiles    bool      `json:"requires_job_files"`
+	RequiresProviderJob bool      `json:"requires_provider_job"`
 }
 
 // PRD #1908 (D-A): how many of a user's ONLINE, non-draining, non-ephemeral, NON-docker workers
@@ -3731,7 +3756,7 @@ type CountOnlineWorkersSatisfyingJobRunnerParams struct {
 // job-runner clause can never be satisfied). Reads workers.protocol_capabilities DIRECTLY and
 // excludes docker workers, exactly the set ClaimRun's clause admits.
 func (q *Queries) CountOnlineWorkersSatisfyingJobRunner(ctx context.Context, arg CountOnlineWorkersSatisfyingJobRunnerParams) (int64, error) {
-	row := q.db.QueryRow(ctx, countOnlineWorkersSatisfyingJobRunner, arg.UserID, arg.RequiresJobFiles)
+	row := q.db.QueryRow(ctx, countOnlineWorkersSatisfyingJobRunner, arg.UserID, arg.RequiresJobFiles, arg.RequiresProviderJob)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
@@ -3818,12 +3843,13 @@ WHERE w.user_id = $1
   -- lane worker never claims an unbound run, so it is never a satisfier here.
   AND NOT w.isolated_lane
   AND (
-    ($2::text = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities) AND ($3::text <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities)))
+    ($2::text = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities) AND ($3::text <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities)) AND ($3::text <> 'job' OR 'claude_provider_job_v1' = ANY(w.protocol_capabilities)))
     OR ($2::text = 'codex'
         AND 'codex_provider_v1' = ANY(w.protocol_capabilities)
         AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
         AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)
-        AND 'codex_runtime_v3' = ANY(w.protocol_capabilities))
+        AND 'codex_runtime_v3' = ANY(w.protocol_capabilities)
+        AND ($3::text <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities)))
   )
 `
 
@@ -16331,6 +16357,10 @@ WHERE r.status = 'queued'
         -- worker reporting 'issue_key_v1' (it renders the run's references by issue_key and never
         -- writes Closes #<iid>). Standalone, outside fn_worker_can_claim and @capability_aware.
         AND ('issue_key_v1' = ANY(w.protocol_capabilities) OR NOT EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL))
+        -- PRD #4416 M2: a lead-lane run (fn_run_env_lane) whose repo has an enabled live variable, or that holds a
+        -- secret delivery receipt, is claimable only by a worker reporting 'run_env_v1'. Standalone, outside
+        -- fn_worker_can_claim and @capability_aware.
+        AND ('run_env_v1' = ANY(w.protocol_capabilities) OR NOT (fn_run_env_lane(r.kind, r.review_target_run_id, r.egress_profile_id) AND (EXISTS (SELECT 1 FROM run_env_vars re WHERE re.user_id = r.user_id AND re.repo_id = r.repo_id AND re.retired_at IS NULL AND re.pending_delete_at IS NULL AND re.disabled_at IS NULL) OR EXISTS (SELECT 1 FROM run_env_receipts rr WHERE rr.run_id = r.id AND rr.secret))))
         AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(w.protocol_capabilities))
         AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(w.protocol_capabilities))
       AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL) OR r.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
@@ -16343,7 +16373,7 @@ WHERE r.status = 'queued'
   -- PRD #4320 module 5: the provider claim clause, mirrored (see ClaimRun).
   AND (r.model_provider_key_mode IS NULL
            OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities) AND (r.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities)))
-           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities)))
+           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities) AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities))))
                  AND (
                      NOT (
                          r.harness = 'codex'
@@ -16407,6 +16437,7 @@ WHERE r.status = 'queued'
         -- 'job_runner_v1'), ClaimRun's non-bypassable clause; the same arm sits in the free-slot test.
         AND (r.kind <> 'job' OR (NOT COALESCE(w.docker_enabled, false) AND 'job_runner_v1' = ANY(w.protocol_capabilities)
                                  AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))
+                                 AND (r.model_provider_key_mode IS NULL OR 'claude_provider_job_v1' = ANY(w.protocol_capabilities))
                                  AND (r.egress_profile_id IS NULL OR 'isolated_job_v1' = ANY(w.protocol_capabilities))))
   )
   AND NOT EXISTS (
@@ -16447,6 +16478,10 @@ WHERE r.status = 'queued'
         -- worker reporting 'issue_key_v1' (it renders the run's references by issue_key and never
         -- writes Closes #<iid>). Standalone, outside fn_worker_can_claim and @capability_aware.
         AND ('issue_key_v1' = ANY(w.protocol_capabilities) OR NOT EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL))
+        -- PRD #4416 M2: a lead-lane run (fn_run_env_lane) whose repo has an enabled live variable, or that holds a
+        -- secret delivery receipt, is claimable only by a worker reporting 'run_env_v1'. Standalone, outside
+        -- fn_worker_can_claim and @capability_aware.
+        AND ('run_env_v1' = ANY(w.protocol_capabilities) OR NOT (fn_run_env_lane(r.kind, r.review_target_run_id, r.egress_profile_id) AND (EXISTS (SELECT 1 FROM run_env_vars re WHERE re.user_id = r.user_id AND re.repo_id = r.repo_id AND re.retired_at IS NULL AND re.pending_delete_at IS NULL AND re.disabled_at IS NULL) OR EXISTS (SELECT 1 FROM run_env_receipts rr WHERE rr.run_id = r.id AND rr.secret))))
         AND ((NOT r.repo_agent_source_required AND r.repo_agent_source_commit IS NULL) OR 'repo_agent_source_v1' = ANY(w.protocol_capabilities))
         AND (r.agent_source_requested IS NULL OR 'agent_source_request_v1' = ANY(w.protocol_capabilities))
       AND (NOT (r.policy_preserve_required OR r.policy_pending_fresh OR (r.policy_outcome_id IS NOT NULL AND r.policy_resolved_at IS NULL) OR r.policy_required_head IS NOT NULL) OR 'provider_policy_hold_v1' = ANY(w.protocol_capabilities))
@@ -16459,7 +16494,7 @@ WHERE r.status = 'queued'
   -- PRD #4320 module 5: the provider claim clause, mirrored (see ClaimRun).
   AND (r.model_provider_key_mode IS NULL
            OR (r.harness = 'claude' AND 'claude_provider_v1' = ANY(w.protocol_capabilities) AND (r.kind <> 'judge' OR 'claude_provider_judge_v1' = ANY(w.protocol_capabilities)))
-           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities)))
+           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities) AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities))))
                  AND (
                      NOT (
                          r.harness = 'codex'
@@ -16521,6 +16556,7 @@ WHERE r.status = 'queued'
         AND r.required_capabilities <@ fn_effective_worker_caps(w.capabilities, COALESCE(w.docker_enabled, false))
         AND (r.kind <> 'job' OR (NOT COALESCE(w.docker_enabled, false) AND 'job_runner_v1' = ANY(w.protocol_capabilities)
                                  AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))
+                                 AND (r.model_provider_key_mode IS NULL OR 'claude_provider_job_v1' = ANY(w.protocol_capabilities))
                                  AND (r.egress_profile_id IS NULL OR 'isolated_job_v1' = ANY(w.protocol_capabilities))))
         AND (r.kind = 'cross_check' OR w.max_concurrent_runs IS NULL
              OR (SELECT count(*) FROM runs r2
@@ -16762,16 +16798,23 @@ WHERE r.status = 'queued'
   -- original leading AND something to attach to.
   AND (
       TRUE
+  -- PRD #4322 M1b: the generic arm never decides a job. A provider-bound job would satisfy this
+  -- arm's model_provider_key_mode demand disjunct, so the job arm below (which carries the
+  -- job-runner and provider-job capabilities) is the only decider for kind 'job'. The conjunct
+  -- sits INSIDE this first AND chain, before the OR, so it cannot gate the job arm.
+  AND r.kind <> 'job'
   -- Orphan PLAN children retain the legacy capability-gap provisioning path;
   -- the CODE exclusion above keeps known CODE children on their own worker.
   -- PRD #2865: a GUARDED run (ci_config_guard) is demand too: with no worker reporting
   -- ci_config_guard_v1 online, only a freshly provisioned worker can claim it.
   -- PRD #4173: a run on a LINKED repo is demand too: with no worker reporting issue_key_v1 online,
   -- only a freshly provisioned worker can claim it.
+  -- PRD #4416 M2: a lead-lane run with enabled live variables or a secret receipt is demand too: with no
+  -- worker reporting run_env_v1 online, only a freshly provisioned worker can claim it.
   -- PRD #4320 / #4505: a provider-bound run (model_provider_key_mode set) is demand too. Provider
   -- execution is activated, so a fresh ephemeral worker can claim it; fn_placement_admitting_workers'
   -- provider clause (migration 00486) lets an online capable idle worker suppress it below.
-  AND (r.checkpoint_coordinates IS NOT NULL OR cardinality(r.required_capabilities) > 0 OR r.model_provider_key_mode IS NOT NULL OR r.plan_cross_check_required OR r.kind = 'cross_check' OR r.ci_config_guard OR r.repo_agent_source_required OR EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL) OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $3::boolean, r.repo_id, r.kind, r.egress_profile_id, $4::uuid[])
+  AND (r.checkpoint_coordinates IS NOT NULL OR cardinality(r.required_capabilities) > 0 OR r.model_provider_key_mode IS NOT NULL OR r.plan_cross_check_required OR r.kind = 'cross_check' OR r.ci_config_guard OR r.repo_agent_source_required OR EXISTS (SELECT 1 FROM repos lr WHERE lr.id = r.repo_id AND lr.issue_tracker_connection_id IS NOT NULL) OR (fn_run_env_lane(r.kind, r.review_target_run_id, r.egress_profile_id) AND (EXISTS (SELECT 1 FROM run_env_vars re WHERE re.user_id = r.user_id AND re.repo_id = r.repo_id AND re.retired_at IS NULL AND re.pending_delete_at IS NULL AND re.disabled_at IS NULL) OR EXISTS (SELECT 1 FROM run_env_receipts rr WHERE rr.run_id = r.id AND rr.secret))) OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $3::boolean, r.repo_id, r.kind, r.egress_profile_id, $4::uuid[])
       -- PRD #3252: a lead-lane run whose owner has a planning value set is demand too: with no
       -- worker reporting its harness phase capability online, only a freshly provisioned worker can claim it
       -- (required_capabilities stays '{}' for it). The same predicate text as every claim site.
@@ -16816,6 +16859,9 @@ WHERE r.status = 'queued'
         AND 'job_runner_v1' = ANY(wj.protocol_capabilities)
         -- PRD #1909 M1: and 'job_files_v1' for a stamped job (runs.job_protocol).
         AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(wj.protocol_capabilities))
+        -- PRD #4322 M1b: and both provider capabilities for a provider-bound job.
+        AND (r.model_provider_key_mode IS NULL
+             OR ('claude_provider_v1' = ANY(wj.protocol_capabilities) AND 'claude_provider_job_v1' = ANY(wj.protocol_capabilities)))
         -- PRD #1976 M1: and 'isolated_job_v1' for a profile-bound job (runs.egress_profile_id).
         AND (r.egress_profile_id IS NULL OR 'isolated_job_v1' = ANY(wj.protocol_capabilities))
   ))
@@ -25660,10 +25706,13 @@ WITH candidates AS MATERIALIZED (
   -- PRD #3250: a pending Fresh grant blocks the ordinary resume EXCEPT on a run_override_unavailable
   -- hold whose episode is resolved: that park (ParkRunOverrideUnavailableRun) restored a grant its
   -- undelivered claim consumed, so the owner's resume may requeue it and the next claim consumes it.
+  -- PRD #4416: the same holds for a run_env_history_unavailable hold (ParkRunEnvHistoryUnavailableRun
+  -- restores the same undelivered-claim grant); an unresolved episode stays refused by the last clause.
   AND NOT (runs.hold_reason IS NOT DISTINCT FROM 'codex_policy_hold'
            OR (runs.policy_pending_fresh
-               AND NOT (runs.hold_reason IS NOT DISTINCT FROM 'run_override_unavailable'
-                        AND (runs.policy_outcome_id IS NOT NULL AND runs.policy_resolved_at IS NOT NULL)))
+               AND NOT ((runs.hold_reason IS NOT DISTINCT FROM 'run_override_unavailable'
+                         AND (runs.policy_outcome_id IS NOT NULL AND runs.policy_resolved_at IS NOT NULL))
+                        OR runs.hold_reason IS NOT DISTINCT FROM 'run_env_history_unavailable'))
            OR (runs.policy_outcome_id IS NOT NULL AND runs.policy_resolved_at IS NULL))
   -- issue #3194: a base-attestation hold is owner-resolved by recovery, never resumed.
   AND runs.hold_reason IS DISTINCT FROM 'base_attestation_missing'
@@ -25767,10 +25816,13 @@ WHERE runs.id = $6 AND runs.user_id = $7
   -- PRD #3250: a pending Fresh grant blocks the ordinary resume EXCEPT on a run_override_unavailable
   -- hold whose episode is resolved: that park (ParkRunOverrideUnavailableRun) restored a grant its
   -- undelivered claim consumed, so the owner's resume may requeue it and the next claim consumes it.
+  -- PRD #4416: the same holds for a run_env_history_unavailable hold (ParkRunEnvHistoryUnavailableRun
+  -- restores the same undelivered-claim grant); an unresolved episode stays refused by the last clause.
   AND NOT (runs.hold_reason IS NOT DISTINCT FROM 'codex_policy_hold'
            OR (runs.policy_pending_fresh
-               AND NOT (runs.hold_reason IS NOT DISTINCT FROM 'run_override_unavailable'
-                        AND (runs.policy_outcome_id IS NOT NULL AND runs.policy_resolved_at IS NOT NULL)))
+               AND NOT ((runs.hold_reason IS NOT DISTINCT FROM 'run_override_unavailable'
+                         AND (runs.policy_outcome_id IS NOT NULL AND runs.policy_resolved_at IS NOT NULL))
+                        OR runs.hold_reason IS NOT DISTINCT FROM 'run_env_history_unavailable'))
            OR (runs.policy_outcome_id IS NOT NULL AND runs.policy_resolved_at IS NULL))
   -- issue #3194: a base-attestation hold is owner-resolved by recovery, never resumed.
   AND runs.hold_reason IS DISTINCT FROM 'base_attestation_missing'
@@ -26060,6 +26112,41 @@ func (q *Queries) ResumeWorkerRecoveryEpisode(ctx context.Context, arg ResumeWor
 	var i ResumeWorkerRecoveryEpisodeRow
 	err := row.Scan(&i.ID, &i.UserID, &i.Status)
 	return i, err
+}
+
+const runEnvWorkerMissingForRun = `-- name: RunEnvWorkerMissingForRun :one
+SELECT COALESCE((EXISTS (
+  SELECT 1 FROM runs r
+  WHERE r.id = $1
+    AND fn_run_env_lane(r.kind, r.review_target_run_id, r.egress_profile_id)
+    AND (EXISTS (SELECT 1 FROM run_env_vars re WHERE re.user_id = r.user_id AND re.repo_id = r.repo_id AND re.retired_at IS NULL AND re.pending_delete_at IS NULL AND re.disabled_at IS NULL)
+         OR EXISTS (SELECT 1 FROM run_env_receipts rr WHERE rr.run_id = r.id AND rr.secret))
+) AND NOT EXISTS (
+  SELECT 1 FROM workers w
+  WHERE w.user_id = $2
+    AND w.status = 'online'
+    AND fn_worker_accepts_new_intake(w)
+    AND NOT w.ephemeral
+    AND NOT w.isolated_lane
+    AND 'run_env_v1' = ANY(w.protocol_capabilities)
+)), false)::boolean AS missing
+`
+
+type RunEnvWorkerMissingForRunParams struct {
+	RunID  uuid.UUID `json:"run_id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+// PRD #4416 M2: true when the run receives repo variables (a lead-lane run whose repo has an
+// enabled live variable, or that holds a secret delivery receipt: the same predicate as ClaimRun's
+// standalone run_env_v1 clause) and none of the user's ONLINE, intake-accepting, non-ephemeral,
+// non-lane workers self-reports 'run_env_v1'. Drives the queued-reason resolver's run_env rung.
+// Mirrors IssueKeyWorkerMissingForRepo's worker filters.
+func (q *Queries) RunEnvWorkerMissingForRun(ctx context.Context, arg RunEnvWorkerMissingForRunParams) (bool, error) {
+	row := q.db.QueryRow(ctx, runEnvWorkerMissingForRun, arg.RunID, arg.UserID)
+	var missing bool
+	err := row.Scan(&missing)
+	return missing, err
 }
 
 const runGatePresentationExists = `-- name: RunGatePresentationExists :one

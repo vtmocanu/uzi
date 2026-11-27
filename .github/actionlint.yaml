@@ -1,4 +1,10 @@
 # actionlint configuration (read automatically from .github/).
+self-hosted-runner:
+  labels:
+    # actionlint 1.7.12 lacks the GitHub-hosted 26.04 labels. Drop once it knows them.
+    - ubuntu-26.04
+    - ubuntu-26.04-arm
+
 paths:
   .github/workflows/release-auto.yml:
     ignore:

@@ -2,7 +2,7 @@
 
 **Status**: Done (2026-11-07). M1 and M2 delivered on branch `agent/issue-3881`: `web/src/components/OverviewUsageCard.tsx` renders the Usage card on `/overview/next`, sharing `web/src/components/usageParts.tsx` and `web/src/lib/usageByUser.ts` with the current Overview's `UsageCard`. Screenshots beside the mock (You and Factory, both windows, desktop and 400 px, Ember and Dawn) are in `prds/mockups/3881/`. Child of epic #3873.
 
-**Design brief**: `prds/3873-overview-redesign.md` (model-fidelity rules, data readiness, reuse map, constraints, mock contract). This PRD wins where it is more specific.
+**Design brief**: `prds/done/3873-overview-redesign.md` (model-fidelity rules, data readiness, reuse map, constraints, mock contract). This PRD wins where it is more specific.
 
 **Design mock**: `prds/mockups/3873-overview-redesign-mock.html`, the "Usage" card (append `#factory` to open the Factory scope). The brief's mock contract applies: implement the mock, small consistency tweaks are fine, larger deviations go under `Mock deviations` in the PR body with a reason, and the PR carries side-by-side screenshots. The mock's Claude / Codex column is #3876, not this PRD.
 

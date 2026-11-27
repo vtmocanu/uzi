@@ -116,7 +116,7 @@ func TestPlacementAdmittingWorkersCarriesEveryInlineClause(t *testing.T) {
 		"codex_completion_interlock_v1", "codex_custom_model_v1", "cross_check_v1",
 		"cross_check_codex_lead_v1", "cross_check_semantic_plan_v1", "cross_check_owner_steering_v1",
 		"completion_semantic_publication_v1", "cross_check_code_v1", "cross_check_lane_v1",
-		"cross_check_rounds_v1", "cross_check_pins_v1", "claude_provider_v1", "claude_provider_judge_v1", "codex_provider_v1",
+		"cross_check_rounds_v1", "cross_check_pins_v1", "claude_provider_v1", "claude_provider_judge_v1", "codex_provider_v1", "codex_provider_judge_v1", "run_env_v1",
 	} {
 		want["'"+c+"' = ANY(w.protocol_capabilities)"] = 1
 	}

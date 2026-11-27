@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -56,7 +57,7 @@ function spyOnAll<T extends object>(target: T, sink: string[]): T {
 function mkCoord(root: string, on = true, spy?: string[]): RecoveryCoordinator {
   const git = spy ? spyOnAll(new SpyGit(), spy) : new FakeRecoveryGit();
   const client = spy ? spyOnAll(new FakeRecoveryClient(), spy) : new FakeRecoveryClient();
-  return new RecoveryCoordinator({
+  return new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
     client, git, log: nullLogger(), recoveryRoot: path.join(root, "recovery"), workerToken: TOKEN,
     ...(on ? { terminalPreservationTestOverride: {} } : {}),
   });
@@ -177,7 +178,7 @@ describe("terminal operation storage", () => {
     assert.equal((await store.create(rec())).kind, "exists");
     // A second coordinator (same token) reads it; a different token does not.
     assert.deepEqual(await readRec(mkCoord(root).terminalOperationStore()), preparedRec());
-    const other = new RecoveryCoordinator({
+    const other = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
       client: new FakeRecoveryClient(), git: new FakeRecoveryGit(), log: nullLogger(),
       recoveryRoot: path.join(root, "recovery"), workerToken: TOKEN + "x", terminalPreservationTestOverride: {},
     });
@@ -863,7 +864,7 @@ describe("terminal operation rediscovery", () => {
   });
 
   describe("journal-lock waits are bounded", () => {
-    const mkNowCoord = (root: string, now: () => number): RecoveryCoordinator => new RecoveryCoordinator({
+    const mkNowCoord = (root: string, now: () => number): RecoveryCoordinator => new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
       client: new FakeRecoveryClient(), git: new FakeRecoveryGit(), log: nullLogger(), recoveryRoot: path.join(root, "recovery"),
       workerToken: TOKEN, terminalPreservationTestOverride: {}, now,
     });

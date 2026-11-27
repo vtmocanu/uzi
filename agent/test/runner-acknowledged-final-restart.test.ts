@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -228,7 +229,7 @@ for (const { caller, afterUnlinkFault, liveClient } of [
     const physical = runner({ run: async () => { throw new Error("no model execution"); } },
       fakeGitlab().gitlab, token);
     const boundary = physical as unknown as BoundaryRunner;
-    const coordinator = new RecoveryCoordinator({
+    const coordinator = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
       client, git, log: nullLogger(), recoveryRoot: git.recoveryRoot, workerToken: token,
       withInventorySourceBoundary: (ctx, action) => boundary.withInventorySourceBoundary(ctx, action),
     });
@@ -431,7 +432,7 @@ for (const { caller, afterUnlinkFault, liveClient } of [
         throw new Error("post-unlink proof settlement failed");
       });
     };
-    const freshCoordinator = new RecoveryCoordinator({ client: freshClient, git: freshGit,
+    const freshCoordinator = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES, client: freshClient, git: freshGit,
       log: nullLogger(), recoveryRoot: freshGit.recoveryRoot, workerToken: token });
     assert.deepEqual(await freshCoordinator.inspect(claim.run_id), records, "MAC journals authenticate after restart");
     assert.equal(await freshCoordinator.inventoryCleanupState(claim.run_id, generation), "pending");

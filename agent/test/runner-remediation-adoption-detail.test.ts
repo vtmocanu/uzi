@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
@@ -81,7 +82,7 @@ async function drive(t: TestContext, mode: Mode, iid: number) {
   // The runner's OWN recovery coordinator (RunRunner opts.recovery): same cache, same recoveryRoot, same archive
   // client, so its own capture path is the one that meets the failing upload.
   const uploads = new UploadClient();
-  const coordinator = new RecoveryCoordinator({ client: uploads as unknown as RecoveryArchiveClient, git: cache, log: nullLogger(),
+  const coordinator = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES, client: uploads as unknown as RecoveryArchiveClient, git: cache, log: nullLogger(),
     recoveryRoot: cache.recoveryRoot, workerToken: "worker-join-token-abcdef0123456789" });
   const runner = new RunRunner(client, cache, runId => ({ homeDir: path.join(homeDir, runId), executor: {
     run: async () => { models++; throw new Error("fixture ends successor"); },

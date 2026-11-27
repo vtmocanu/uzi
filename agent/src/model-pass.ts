@@ -42,10 +42,12 @@ import { ProviderLaneUnsupportedError, sdkCredentialFromBinding } from "./provid
 import type { SdkQueryFn } from "./sdk-executor.js"; // type-only — erased at runtime, so no import cycle
 import type { CodexExecutionAuthority } from "./codex/select.js"; // type-only — erased at runtime, no construction here
 import type { CodexAdviceHarnessFactory } from "./codex/codex-executor.js"; // type-only — the injected seam, never constructed here
+import { AdviceCallTimeoutError } from "./codex/codex-advice-harness.js";
 import type {
   AdviceRequest,
   AdviceResultPolicy,
   AdviceUsageSnapshot,
+  HarnessTerminal,
 } from "./harness.js"; // type-only — erased at runtime; harness.ts has no SDK import, so no cycle
 
 /** Options for runReadOnlyModelPass — one tool-less, repo-isolated model turn. */
@@ -121,7 +123,30 @@ export interface ReadOnlyModelPassOpts {
     /** PRD #2603: "deny" ⇒ the call may not refresh the shared credential (see
      *  CodexAdviceHarnessBuildParams.refresh). Existing callers pass none. */
     readonly refresh?: "deny";
+    /** Issue #4574, judge only: the pass-owned settlement record the provider judge settles from.
+     *  Every other caller passes none, and the pass then behaves exactly as before. */
+    readonly settlement?: ModelPassSettlement;
   };
+}
+
+/**
+ * Issue #4574: the pass-owned settlement record of one provider-bound Codex JUDGE pass. The judge
+ * creates it with every presence flag false and passes it in `codex.settlement`; runCodexAdviceModelPass
+ * is the only writer. The judge settles from it by IDENTITY (the raw advice terminal, the exact error
+ * its policy threw, the exact run-promise rejection, the exact value the pass threw), never from
+ * message text, so a cleanup failure, a finally-block throw, a timeout or an abort can never be read
+ * as the classified provider outcome. The presence flags exist because `undefined` is a throwable value.
+ */
+export interface ModelPassSettlement {
+  terminalSeen: boolean;
+  terminal?: { isError: boolean; classification?: HarnessTerminal["codexClassification"] };
+  policyErrorSet: boolean;
+  policyError?: unknown;
+  rejectionSet: boolean;
+  rejection?: unknown;
+  stop?: "timeout" | "aborted";
+  escapedSet: boolean;
+  escaped?: unknown;
 }
 
 /** The closed reasons a Codex model pass failed because its credential could not be used
@@ -195,11 +220,13 @@ function linkExternalAbort(
   signal: AbortSignal | undefined,
   abort: AbortController,
   label: string,
+  onExternalAbort?: () => void,
 ): { aborted: Promise<never>; unlink(): void } | undefined {
   if (!signal) return undefined;
   let onAbort: (() => void) | undefined;
   const aborted = new Promise<never>((_, reject) => {
     onAbort = () => {
+      onExternalAbort?.();
       abort.abort();
       reject(new Error(`${label} model call aborted`));
     };
@@ -599,7 +626,10 @@ async function runCodexAdviceModelPass(
   const owned = ownedSummaryFactories.has(codex.buildHarness);
   const deadlineAt = Date.now() + opts.timeoutMs;
   const abort = new AbortController();
-  const external = linkExternalAbort(opts.signal, abort, opts.label);
+  const settlement = codex.settlement;
+  const external = linkExternalAbort(opts.signal, abort, opts.label, () => {
+    if (settlement && settlement.stop === undefined) settlement.stop = "aborted";
+  });
   const text = opts.log.redactDiagnostic ? (s: string) => opts.log.redactDiagnostic!(s) : undefined;
   const scope: ProviderScope | undefined = codex.binding.authMode === "provider"
     ? providerScope(codex.binding.providerBinding.credential, opts.log, opts.label) : text ? {
@@ -609,6 +639,7 @@ async function runCodexAdviceModelPass(
   let timer: NodeJS.Timeout | undefined;
   const timeout = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
+      if (settlement && settlement.stop === undefined) settlement.stop = "timeout";
       abort.abort();
       reject(new Error(`${opts.label} model call exceeded ${opts.timeoutMs}ms`));
     }, opts.timeoutMs);
@@ -619,13 +650,27 @@ async function runCodexAdviceModelPass(
   const stopped = (): boolean => abort.signal.aborted || Date.now() >= deadlineAt - DEADLINE_SLACK_MS;
   const policy: AdviceResultPolicy = {
     onTerminal: (t, { isError }) => {
+      // Issue #4574: the settlement sees the raw terminal first, and records nothing once a stop is set.
+      if (settlement && settlement.stop === undefined) {
+        settlement.terminalSeen = true;
+        settlement.terminal = { isError, ...(t.codexClassification ? { classification: t.codexClassification } : {}) };
+      }
       if (!isError) return;
       const message = `${opts.label} model call returned an error result`;
-      if (!stopped()) {
-        if (refreshDenied) throw new ModelPassCredentialError("refresh_denied", message);
-        if (terminalCategory(t) === "authentication") throw new ModelPassCredentialError("credential_rejected", message);
+      const failure = (): Error => {
+        if (!stopped()) {
+          if (refreshDenied) return new ModelPassCredentialError("refresh_denied", message);
+          if (terminalCategory(t) === "authentication") return new ModelPassCredentialError("credential_rejected", message);
+        }
+        return new Error(message);
+      };
+      // The error is created, recorded and then thrown: the judge matches the run-promise rejection to it by identity.
+      const error = failure();
+      if (settlement && settlement.stop === undefined) {
+        settlement.policyErrorSet = true;
+        settlement.policyError = error;
       }
-      throw new Error(message);
+      throw error;
     },
   };
   const request: AdviceRequest = {
@@ -642,7 +687,7 @@ async function runCodexAdviceModelPass(
     ...(opts.thinking !== undefined ? { thinking: opts.thinking } : {}),
     ...(usage.observe ? { usageObserver: usage.observe } : {}),
   };
-  const runPromise = (async (): Promise<string> => {
+  const runBody = async (): Promise<string> => {
     const params = {
       runId: codex.runId,
       claimGeneration: codex.claimGeneration,
@@ -672,13 +717,34 @@ async function runCodexAdviceModelPass(
       }
       throw err;
     }
+  };
+  // Issue #4574: only the judge (a settlement) wraps the body; every other advice caller races runBody()
+  // itself, so its promise-job ordering against the timer and an external abort is unchanged.
+  const runPromise: Promise<string> = !settlement ? runBody() : (async (): Promise<string> => {
+    // Record the exact rejection of the WHOLE body (factory build, harness.run, its cleanup, its policy
+    // error). A timeout shaped rejection is a stop, however it arrived.
+    try {
+      return await runBody();
+    } catch (err) {
+      settlement.rejectionSet = true;
+      settlement.rejection = err;
+      if (settlement.stop === undefined && (err instanceof AdviceCallTimeoutError || stopped())) settlement.stop = "timeout";
+      throw err;
+    }
   })();
   try {
     const result = await Promise.race(external ? [runPromise, timeout, external.aborted] : [runPromise, timeout]);
     return scope ? scope.text(result) : result;
   } catch (err) {
     // The run promise has already classified credential evidence.
-    throw scope ? scope.thrown(err) : err;
+    const thrown = scope ? scope.thrown(err) : err;
+    // The exact value thrown, computed once (sanitization may return a different object): the judge
+    // matches its caught value to this by identity. A throw from the finally below is never recorded.
+    if (settlement) {
+      settlement.escapedSet = true;
+      settlement.escaped = thrown;
+    }
+    throw thrown;
   } finally {
     if (timer) clearTimeout(timer);
     external?.unlink();
@@ -729,7 +795,10 @@ const ADVICE_FAILURE_REASON_LEN = 500;
  *  sweep excludes judge runs, fact 12). NEVER the verdict/review POST — the caller posts that
  *  separately, before this. The message fence is 0: a judge/review trace is a single advisory usage
  *  frame that never gates api sub-work, so no fence is needed and none can strand the outcome.
- *  Undefined (a test without spill, or a store that failed closed) ⇒ today's un-journaled report. */
+ *  Undefined (a test without spill, or a store that failed closed) ⇒ today's un-journaled report.
+ *
+ *  `scrub` (issue #4574, provider judge only) removes the gateway key's forms from the reported
+ *  failure_reason and from the log line's error text; absent, both are byte-identical to before. */
 export async function safeReportFailed(
   client: Pick<WorkerClient, "reportState">,
   log: Logger,
@@ -739,6 +808,7 @@ export async function safeReportFailed(
   cause?: unknown,
   claimGeneration?: number,
   terminalDeps?: TerminalOutboxDeps,
+  scrub?: (s: string) => string,
 ): Promise<void> {
   try {
     const body: StateRequest =
@@ -751,7 +821,7 @@ export async function safeReportFailed(
           }
         : {
             status: "failed",
-            failure_reason: reason.slice(0, ADVICE_FAILURE_REASON_LEN),
+            failure_reason: (scrub ? scrub(reason) : reason).slice(0, ADVICE_FAILURE_REASON_LEN),
             claim_generation: claimGeneration,
           };
     await postTerminalState(terminalDeps, client, {
@@ -762,6 +832,6 @@ export async function safeReportFailed(
       body,
     });
   } catch (err) {
-    log.warn(`${label} failed-state report failed`, { run_id: runId, error: errMessage(err) });
+    log.warn(`${label} failed-state report failed`, { run_id: runId, error: scrub ? scrub(errMessage(err)) : errMessage(err) });
   }
 }

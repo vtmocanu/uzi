@@ -1,0 +1,89 @@
+{
+  "scope": {
+    "route": "",
+    "user": ""
+  },
+  "generated_at": "0001-01-01T00:00:00Z",
+  "window": "",
+  "timezone": "",
+  "from": "0001-01-01T00:00:00Z",
+  "to": "0001-01-01T00:00:00Z",
+  "history_start": null,
+  "bucket_width_days": 0,
+  "buckets": null,
+  "rolling": null,
+  "selected_user": "",
+  "filters": {
+    "repo": null,
+    "harness": null,
+    "kinds": null
+  },
+  "excluded_kind_selected": null,
+  "occupancy": {
+    "time_basis": "",
+    "unit": "",
+    "population": {
+      "candidates": 0,
+      "with_interval": 0,
+      "without_start": 0,
+      "invalid_interval": 0,
+      "end_from_status_since": 0,
+      "ongoing": 0,
+      "cross_check_kind_included": 0
+    },
+    "limitations": null,
+    "window": {
+      "run_seconds": 0,
+      "duration_seconds": 0,
+      "average_concurrent_runs": null,
+      "reason": null
+    },
+    "buckets": null
+  },
+  "usage_wait": {
+    "time_basis": "",
+    "cohort": "",
+    "basis": "",
+    "current": {
+      "count": 0,
+      "n": 0,
+      "share": null,
+      "reason": null
+    },
+    "buckets": null
+  },
+  "not_tracked": null,
+  "gauges": {
+    "anthropic": {
+      "provider": "",
+      "status": "",
+      "reason": null,
+      "time_basis": "",
+      "effective_scope": {
+        "user": "",
+        "provider": "",
+        "unattributed_selectors": null,
+        "reason": null
+      },
+      "truncated": false,
+      "set_state": null,
+      "identities": null
+    },
+    "codex": {
+      "provider": "",
+      "status": "",
+      "reason": null,
+      "time_basis": "",
+      "effective_scope": {
+        "user": "",
+        "provider": "",
+        "unattributed_selectors": null,
+        "reason": null
+      },
+      "truncated": false,
+      "set_state": null,
+      "vault_state_basis": "",
+      "identities": null
+    }
+  }
+}

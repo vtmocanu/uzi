@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 // Issue #2969 M1: the coordinator side of a predecessor FINAL. A lower generation's guarded hold is settled while a
 // later claim generation of the same run executes. Everything here drives the REAL RecoveryCoordinator through
 // operateFrozenInventory with a `predecessor` option; only the api client, the Git producer and the runner's
@@ -168,7 +169,7 @@ async function harness(opts: HarnessOptions = {}) {
     },
   };
   const log = nullLogger();
-  const coordinator = new RecoveryCoordinator({
+  const coordinator = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
     recoveryRoot: path.join(root, "journal"), workerToken: "local-worker-fixture", log, client: client as never, git: git as never,
     now: () => s.now, isExecuting: () => s.executing,
     withInventorySourceBoundary: async (ctx, action) => {

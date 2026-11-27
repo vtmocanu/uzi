@@ -4058,6 +4058,13 @@ export interface HarnessDecision {
   other_weekly_reset_at: string | null;
 }
 
+/** PRD #4416 M2: one variable delivered to a run's current claim; never a value. */
+export interface RunInjectedEnvVar {
+  name: string;
+  scope: string;
+  secret: boolean;
+}
+
 /** PRD #4123: one allowlisted action in a weekly-limit block (Go WeeklyLimitFixDTO). `command`
  *  is rendered once by the server, the same string on every surface; it is absent with
  *  command_unavailable "label" when the target label is not command-safe, and absent for a
@@ -4104,6 +4111,8 @@ export interface WeeklyLimitSummary {
 }
 
 export interface Run {
+  /** PRD #4416 M2: the variables the current claim delivered (names only, owner-only). */
+  injected_env?: RunInjectedEnvVar[];
   /** PRD #4123: owner-only weekly-limit block; absent unless the run's credential is parked on its weekly
    *  limit (and, from M2, near it). */
   weekly_limit?: WeeklyLimit;
@@ -5283,7 +5292,7 @@ export interface RunListItem extends Run {
  *  or ordering reads only these keys; the run detail page fetches the full Run. */
 export type RunSummaryItem = Omit<
   RunListItem,
-  "plan_md" | "repo_agents" | "repo_agent_source_commit" | "issue_description" | "preserved_patch"
+  "plan_md" | "repo_agents" | "repo_agent_source_commit" | "issue_description" | "preserved_patch" | "injected_env"
   | "reset_state_digest" | "milestone_reconciliations" | "milestone_reconciliations_next_before_gate_revision"
   | "semantic_gate" | "completion_pending" | "semantic_drift"
   | "capability_provenance" | "lead_config" | "created_issues"
@@ -5807,9 +5816,9 @@ export interface PendingJudge {
 
 // JudgeSkip is the recorded reason the AUTOMATIC judge of a run was skipped (issue #3257,
 // apitypes.JudgeSkipDTO): the judge could not start. The reasons are no_usable_credential,
-// credential_disabled, codex_pool_unavailable, provider_lane_unsupported (now recorded only for
-// a Codex judge whose owner has a Codex model-provider source; older Claude rows are historical,
-// since Claude judges now run on providers), provider_source_unusable and
+// credential_disabled, codex_pool_unavailable, provider_lane_unsupported (no longer recorded:
+// older Claude and Codex rows are historical, since both judges now run on providers),
+// provider_source_unusable and
 // provider_model_unmapped. A third sibling key on
 // the review envelope, always present and null when nothing was skipped; the server sets it
 // only when `review` and `pending_judge` are both null (read precedence review > pending >
@@ -7036,6 +7045,472 @@ export interface AnalyticsSpendDTO extends AnalyticsEnvelopeDTO {
   cache_read: AnalyticsCacheReadDTO;
   top_runs: AnalyticsTopRunDTO[];
   breakdown: AnalyticsBreakdownDTO;
+}
+
+// ── Reliability analytics (issue #4685) ──────────────────────────────────────
+// Mirrors the Reliability types of api/internal/apitypes/analytics.go: GET
+// /api/analytics/reliability and GET /api/admin/analytics/reliability. It reuses the envelope,
+// outcome classes and nullable number above. A failure rate is failed / finished; a breakdown
+// row or rolling point over fewer than five finished runs is null with insufficient_runs and
+// keeps its raw counts.
+
+export interface AnalyticsReliabilityBlockDTO {
+  finished: number;
+  outcomes: AnalyticsOutcomesDTO;
+  failure_rate: AnalyticsNullableNumberDTO;
+  requeued_runs: number;
+}
+
+export interface AnalyticsReliabilityTotalsDTO {
+  current: AnalyticsReliabilityBlockDTO;
+  /** Absent for window=all. */
+  previous?: AnalyticsReliabilityBlockDTO;
+}
+
+export interface AnalyticsReliabilityCellDTO {
+  /** Zero-based position in the response's buckets array. */
+  index: number;
+  finished: number;
+  outcomes: AnalyticsOutcomesDTO;
+}
+
+export interface AnalyticsReliabilityCauseDTO {
+  rank: number;
+  is_other: boolean;
+  /** Null for the Other row. */
+  origin: string | null;
+  runs: number;
+  share: number;
+}
+
+export interface AnalyticsReliabilityCausesDTO {
+  failed: number;
+  items: AnalyticsReliabilityCauseDTO[];
+}
+
+export interface AnalyticsReliabilityPointDTO {
+  /** Zero-based position in the response's rolling array. */
+  index: number;
+  finished: number;
+  failed: number;
+  /** Null with a reason: insufficient_runs below five finished runs, or not_applicable. */
+  value: number | null;
+  reason: string | null;
+}
+
+export interface AnalyticsReliabilityHarnessSeriesDTO {
+  harness: string;
+  points: AnalyticsReliabilityPointDTO[];
+}
+
+export interface AnalyticsReliabilityRollingDTO {
+  overall: AnalyticsReliabilityPointDTO[];
+  harnesses: AnalyticsReliabilityHarnessSeriesDTO[];
+}
+
+export interface AnalyticsReliabilityRowDTO {
+  rank: number;
+  is_other: boolean;
+  key: string | null;
+  /** User email or repo path; null otherwise and for a repo the caller may not see. */
+  label: string | null;
+  id: string | null;
+  /** The row's finished runs. */
+  n: number;
+  outcomes: AnalyticsOutcomesDTO;
+  failure_rate: AnalyticsNullableNumberDTO;
+  requeued_runs: number;
+}
+
+export interface AnalyticsReliabilityBreakdownDTO {
+  dimension: string;
+  rows: AnalyticsReliabilityRowDTO[];
+}
+
+export interface AnalyticsReliabilityLatestFailureDTO {
+  failed_at: string;
+  origin: string;
+  run_id: string;
+  user_id: string;
+  completed_since_last_failure: number;
+}
+
+export interface AnalyticsReliabilityNeedsLandingDTO {
+  runs: number;
+  /** Always "work_may_already_have_landed". */
+  caveat: string;
+}
+
+export interface AnalyticsReliabilityDTO extends AnalyticsEnvelopeDTO {
+  /** "all" for an admin response spanning every user, else the user id. */
+  selected_user: string;
+  /** False, with reason "supporting_kinds_only", when the kind filter selects no delivery kind. */
+  applicable: boolean;
+  reason: string | null;
+  totals: AnalyticsReliabilityTotalsDTO;
+  /** series[i] is the outcome cell of buckets[i]. */
+  series: AnalyticsReliabilityCellDTO[];
+  causes: AnalyticsReliabilityCausesDTO;
+  rolling_failure_rate: AnalyticsReliabilityRollingDTO;
+  breakdown: AnalyticsReliabilityBreakdownDTO;
+  /** Null when the scope has no failure. */
+  latest_failure: AnalyticsReliabilityLatestFailureDTO | null;
+  needs_landing: AnalyticsReliabilityNeedsLandingDTO;
+}
+
+// ── Capacity analytics (issue #4731) ─────────────────────────────────────────
+// GET /api/analytics/capacity and GET /api/admin/analytics/capacity. Every slice is
+// non-null on the wire. A null value always travels with a reason from a closed set.
+
+export interface AnalyticsCapacityFiltersDTO {
+  /** The authorized repo filter, null when none was given. */
+  repo: string | null;
+  harness: "claude" | "codex" | null;
+  /** The run kinds the measures cover; chat is never listed. */
+  kinds: string[];
+}
+
+export interface AnalyticsCapacityPopulationDTO {
+  /** Sum of with_interval, without_start and invalid_interval. */
+  candidates: number;
+  with_interval: number;
+  without_start: number;
+  invalid_interval: number;
+  end_from_status_since: number;
+  ongoing: number;
+  cross_check_kind_included: number;
+}
+
+/** The closed set of occupancy limitation codes the server emits. */
+export type AnalyticsCapacityLimitationCode =
+  | "elapsed_envelope_includes_waits"
+  | "claim_and_resume_history_not_recovered"
+  | "lane_assignment_history_limited"
+  | "missing_start_excluded"
+  | "invalid_interval_excluded"
+  | "end_from_status_since"
+  | "ongoing_end_is_generated_at"
+  | "cross_check_kind_not_on_lane_included";
+
+export interface AnalyticsCapacityLimitationDTO {
+  code: AnalyticsCapacityLimitationCode;
+  /** Runs the limit applies to; null when it describes the method. */
+  runs: number | null;
+}
+
+export interface AnalyticsCapacityOccupancyCellDTO {
+  run_seconds: number;
+  duration_seconds: number;
+  /** Null with a reason when the duration is zero. */
+  average_concurrent_runs: number | null;
+  reason: "zero_duration_bucket" | "zero_duration_range" | null;
+}
+
+export interface AnalyticsCapacityOccupancyBucketDTO extends AnalyticsCapacityOccupancyCellDTO {
+  index: number;
+}
+
+export interface AnalyticsCapacityOccupancyDTO {
+  time_basis: "interval_overlap";
+  unit: "average_concurrent_runs";
+  population: AnalyticsCapacityPopulationDTO;
+  limitations: AnalyticsCapacityLimitationDTO[];
+  window: AnalyticsCapacityOccupancyCellDTO;
+  buckets: AnalyticsCapacityOccupancyBucketDTO[];
+}
+
+export interface AnalyticsCapacityUsageWaitCellDTO {
+  count: number;
+  n: number;
+  /** Null with no_applicable_runs when n is zero. */
+  share: number | null;
+  reason: "no_applicable_runs" | null;
+}
+
+export interface AnalyticsCapacityUsageWaitBucketDTO extends AnalyticsCapacityUsageWaitCellDTO {
+  index: number;
+}
+
+export interface AnalyticsCapacityUsageWaitDTO {
+  time_basis: "created_at";
+  cohort: "creation";
+  basis: "limit_wait_count";
+  current: AnalyticsCapacityUsageWaitCellDTO;
+  buckets: AnalyticsCapacityUsageWaitBucketDTO[];
+}
+
+export interface AnalyticsCapacityNotTrackedDTO {
+  measure: "historical_provider_headroom" | "slot_count" | "utilization" | "parked_duration";
+  /** Always null. */
+  value: number | null;
+  reason: "not_tracked";
+}
+
+export interface AnalyticsCapacityEffectiveScopeDTO {
+  user: string;
+  provider: "anthropic" | "codex";
+  /** The request selectors the gauge could not honor, in the order repo then kind. */
+  unattributed_selectors: ("repo" | "kind")[];
+  /** "shared_quota_not_attributable" when the list is not empty. */
+  reason: "shared_quota_not_attributable" | null;
+}
+
+export interface AnalyticsCapacityGaugeBaseDTO {
+  provider: "anthropic" | "codex";
+  status: "available" | "unavailable" | "not_selected";
+  /** Null when available. */
+  reason: "gauge_unavailable" | "vault_status_unavailable" | "not_selected" | null;
+  time_basis: "current_observation";
+  effective_scope: AnalyticsCapacityEffectiveScopeDTO;
+  truncated: boolean;
+  /** Null unless available; identities are cut at 200. */
+  set_state: "empty" | "complete" | "truncated" | null;
+}
+
+export interface AnalyticsCapacityAnthropicIdentityDTO {
+  secret_id: string;
+  label: string;
+  is_default: boolean;
+  /** user_id and email are set on an admin all-users response, null otherwise. */
+  user_id: string | null;
+  email: string | null;
+  limits: MyRateLimits;
+}
+
+export interface AnalyticsCapacityAnthropicGaugeDTO extends AnalyticsCapacityGaugeBaseDTO {
+  identities: AnalyticsCapacityAnthropicIdentityDTO[];
+}
+
+export interface AnalyticsCapacityCodexIdentityDTO extends CodexAccountRateLimit {
+  user_id: string | null;
+  email: string | null;
+}
+
+export interface AnalyticsCapacityCodexGaugeDTO extends AnalyticsCapacityGaugeBaseDTO {
+  vault_state_basis: "live_observation";
+  identities: AnalyticsCapacityCodexIdentityDTO[];
+}
+
+export interface AnalyticsCapacityGaugesDTO {
+  anthropic: AnalyticsCapacityAnthropicGaugeDTO;
+  codex: AnalyticsCapacityCodexGaugeDTO;
+}
+
+export interface AnalyticsCapacityDTO extends AnalyticsEnvelopeDTO {
+  /** "all" for an admin response spanning every user, else the user id. */
+  selected_user: string;
+  filters: AnalyticsCapacityFiltersDTO;
+  /** "chat" when kind=chat was requested (outside the population), else null. */
+  excluded_kind_selected: "chat" | null;
+  occupancy: AnalyticsCapacityOccupancyDTO;
+  usage_wait: AnalyticsCapacityUsageWaitDTO;
+  not_tracked: AnalyticsCapacityNotTrackedDTO[];
+  gauges: AnalyticsCapacityGaugesDTO;
+}
+
+// Issue #4730: the Quality response (GET /api/analytics/quality and
+// /api/admin/analytics/quality). Mirrors api/internal/apitypes/analytics_quality.go.
+
+/** Applicability header of one Quality measure; reason is null when applicable. */
+export interface AnalyticsQualitySectionDTO {
+  applicable: boolean;
+  reason: string | null;
+  time_basis: string;
+}
+
+export interface AnalyticsQualityReworkGroupsDTO {
+  zero: number;
+  one: number;
+  two: number;
+  three_plus: number;
+}
+
+export interface AnalyticsQualityReworkBucketDTO {
+  index: number;
+  prs: number;
+  groups: AnalyticsQualityReworkGroupsDTO;
+}
+
+export interface AnalyticsQualityReworkDTO extends AnalyticsQualitySectionDTO {
+  applicable_prs: number;
+  groups: AnalyticsQualityReworkGroupsDTO;
+  buckets: AnalyticsQualityReworkBucketDTO[];
+  unwitnessed_prs: number;
+  unverified_links: number;
+  shared_external_prs: number;
+  shared_detection_unavailable: number;
+  /** Always "retained_runs_only". */
+  retention: string;
+  /** Always null with reason "not_tracked". */
+  merge_day_activity: AnalyticsNullableNumberDTO;
+  run_end_to_merge_seconds: AnalyticsNullableNumberDTO;
+}
+
+export interface AnalyticsQualityCIFixBucketDTO {
+  index: number;
+  runs: number;
+  finished: number;
+  in_flight: number;
+  outcomes: AnalyticsOutcomesDTO;
+}
+
+export interface AnalyticsQualityCIFixDTO extends AnalyticsQualitySectionDTO {
+  runs: number;
+  finished: number;
+  in_flight: number;
+  outcomes: AnalyticsOutcomesDTO;
+  buckets: AnalyticsQualityCIFixBucketDTO[];
+}
+
+export interface AnalyticsQualityPlanResultsDTO {
+  approve: number;
+  revise: number;
+  block: number;
+  failed: number;
+}
+
+export interface AnalyticsQualityCodeResultsDTO {
+  completed: number;
+  failed: number;
+}
+
+export interface AnalyticsQualityClassesDTO {
+  passed: number;
+  raised_issues: number;
+  didnt_finish: number;
+  replaced: number;
+  unclassified: number;
+}
+
+export interface AnalyticsQualityCheckerHarnessDTO {
+  claude: number;
+  codex: number;
+  unknown: number;
+}
+
+export interface AnalyticsQualityPlanBucketDTO {
+  index: number;
+  decided: number;
+  stored_result: AnalyticsQualityPlanResultsDTO;
+  classes: AnalyticsQualityClassesDTO;
+}
+
+export interface AnalyticsQualityCodeBucketDTO {
+  index: number;
+  decided: number;
+  stored_result: AnalyticsQualityCodeResultsDTO;
+  classes: AnalyticsQualityClassesDTO;
+}
+
+export interface AnalyticsQualityPlanUndatedDTO {
+  /** Always "not_applied". */
+  window: string;
+  count: number;
+  stored_result: AnalyticsQualityPlanResultsDTO;
+}
+
+export interface AnalyticsQualityCodeUndatedDTO {
+  /** Always "not_applied". */
+  window: string;
+  count: number;
+  stored_result: AnalyticsQualityCodeResultsDTO;
+}
+
+export interface AnalyticsQualityPlanStageDTO extends AnalyticsQualitySectionDTO {
+  decided_in_window: number;
+  stored_result: AnalyticsQualityPlanResultsDTO;
+  classes: AnalyticsQualityClassesDTO;
+  checker_harness: AnalyticsQualityCheckerHarnessDTO;
+  undated: AnalyticsQualityPlanUndatedDTO;
+  buckets: AnalyticsQualityPlanBucketDTO[];
+}
+
+export interface AnalyticsQualityCodeStageDTO extends AnalyticsQualitySectionDTO {
+  decided_in_window: number;
+  stored_result: AnalyticsQualityCodeResultsDTO;
+  classes: AnalyticsQualityClassesDTO;
+  checker_harness: AnalyticsQualityCheckerHarnessDTO;
+  undated: AnalyticsQualityCodeUndatedDTO;
+  buckets: AnalyticsQualityCodeBucketDTO[];
+}
+
+export interface AnalyticsQualityEffectiveFiltersDTO {
+  /** Null when no repo filter was applied. */
+  repo: string | null;
+  /** Null when no harness filter was applied. */
+  harness: string | null;
+  kinds: string[];
+}
+
+export interface AnalyticsQualityPendingDTO extends AnalyticsQualitySectionDTO {
+  /** Always "not_applied". */
+  window: string;
+  total: number;
+  plan: number;
+  code: number;
+  effective_filters: AnalyticsQualityEffectiveFiltersDTO;
+}
+
+export interface AnalyticsQualityCrossCheckDTO {
+  plan: AnalyticsQualityPlanStageDTO;
+  code: AnalyticsQualityCodeStageDTO;
+  pending: AnalyticsQualityPendingDTO;
+}
+
+export interface AnalyticsQualityJudgeCandidatesDTO {
+  total: number;
+  completed: number;
+  failed: number;
+}
+
+export interface AnalyticsQualityJudgeCompleteDTO {
+  total: number;
+  ideal: number;
+  ok: number;
+  issues: number;
+}
+
+export interface AnalyticsQualityJudgeEligibleDTO {
+  total: number;
+  unreviewed: number;
+  unreviewed_skipped: number;
+  failed: number;
+  complete: AnalyticsQualityJudgeCompleteDTO;
+}
+
+export interface AnalyticsQualityJudgeExcludedDTO {
+  cancelled: number;
+  in_flight: number;
+  skip_origin: number;
+  reviewed_excluded: number;
+}
+
+export interface AnalyticsQualityJudgeBucketDTO {
+  index: number;
+  eligible: number;
+  complete: number;
+  /** Null with reason "no_applicable_runs" when eligible is zero. */
+  coverage: AnalyticsNullableNumberDTO;
+}
+
+export interface AnalyticsQualityJudgeDTO extends AnalyticsQualitySectionDTO {
+  candidates: AnalyticsQualityJudgeCandidatesDTO;
+  eligible: AnalyticsQualityJudgeEligibleDTO;
+  excluded: AnalyticsQualityJudgeExcludedDTO;
+  coverage: AnalyticsNullableNumberDTO;
+  buckets: AnalyticsQualityJudgeBucketDTO[];
+  /** Always "retained_target_properties". */
+  selection: string;
+  limitations: string[];
+}
+
+export interface AnalyticsQualityDTO extends AnalyticsEnvelopeDTO {
+  /** "all" for an admin response spanning every user, else the user id. */
+  selected_user: string;
+  rework: AnalyticsQualityReworkDTO;
+  ci_fix: AnalyticsQualityCIFixDTO;
+  cross_check: AnalyticsQualityCrossCheckDTO;
+  judge: AnalyticsQualityJudgeDTO;
 }
 
 // Issue #4729: the scoped run Flow response (GET /api/analytics/flow and

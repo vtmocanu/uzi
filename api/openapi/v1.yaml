@@ -62,8 +62,11 @@ paths:
       operationId: createJob
       summary: Create a job
       description: >-
-        Queues a job that runs as the token's user, on that user's own Anthropic
-        credential. Needs the jobs:run scope. A product token may create only the job
+        Queues a job that runs as the token's user, on that user's own Claude source:
+        their Anthropic credential, or their model provider when they selected one
+        and the job names no site list (the provider binding is frozen onto the job
+        at creation; a provider job never parks, and a provider refusal fails it).
+        Needs the jobs:run scope. A product token may create only the job
         types its product allows. The job starts queued and runs to completion with no
         approval step; poll GET /jobs/{id} for progress. Naming a site list in
         egress_profile runs the job on the isolated lane, where only that list's hosts
@@ -479,8 +482,12 @@ components:
     Conflict:
       description: >-
         The job has already finished (reason job_terminal). On POST /jobs, the owner's
-        Claude source is a model provider, which jobs do not support yet (reason
-        provider_lane_unsupported).
+        Claude source is a model provider that cannot serve the job (reason
+        provider_source_unusable: key missing or disabled, provider retired or gone,
+        or base URL no longer allowed), the provider's model map does not map the job's model (reason
+        provider_model_unmapped), or the job names a site list in egress_profile
+        while that source is a model provider, which site-list jobs do not support
+        yet (reason provider_lane_unsupported).
       content:
         application/json:
           schema:

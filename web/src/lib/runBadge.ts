@@ -188,6 +188,10 @@ export const NON_COMPLETION_HOLDS = {
   // Issue #3250: the run's chosen model or effort cannot run on its harness. RunOverrideHoldPanel owns
   // Resume and Cancel; Resume retries only if the choice has become available on that harness.
   run_override_unavailable: { tone: "warning", label: "model choice unavailable: owner hold", ownerResumable: true, attention: true, afterCompletionPhase: false, completionEarlyReturn: true, heldDeny: "always", historyParkLabel: true, ownerActionsLink: true },
+  // PRD #4416 M2: a secret variable version the run was given is missing or cannot be opened, so its output
+  // cannot be masked. RunEnvHistoryHoldPanel owns Resume (re-attempts the claim, parks again while the
+  // version is still missing) and Cancel.
+  run_env_history_unavailable: { tone: "warning", label: "variable history unavailable: owner hold", ownerResumable: true, attention: true, afterCompletionPhase: false, completionEarlyReturn: true, heldDeny: "always", historyParkLabel: true, ownerActionsLink: true },
   // Issue #3252: the runtime did not switch between the planning and implementation model or effort.
   // PhaseSwitchHoldPanel owns Resume (retries on a new claim) and Cancel.
   phase_switch_unavailable: { tone: "warning", label: "planning switch unavailable: owner hold", ownerResumable: true, attention: true, afterCompletionPhase: false, completionEarlyReturn: true, heldDeny: "always", historyParkLabel: true, ownerActionsLink: true },
@@ -932,6 +936,9 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_detai
     case "run_override_unavailable":
       return { kind: "badge", label: PARK_LABELS.run_override_unavailable, tone: "warning", pulse: false,
         title: "The run's chosen model or effort cannot run on its harness. The run waits for its owner; open the run to Resume and retry, or Cancel." };
+    case "run_env_history_unavailable":
+      return { kind: "badge", label: PARK_LABELS.run_env_history_unavailable, tone: "warning", pulse: false,
+        title: "A secret variable version this run was given can no longer be read, so its output cannot be masked. Open the run to Resume once the variable history is restored, or Cancel." };
     case "phase_switch_unavailable":
       return { kind: "badge", label: PARK_LABELS.phase_switch_unavailable, tone: "warning", pulse: false,
         title: "The runtime did not switch between the planning and implementation model or effort. The run waits for its owner; open the run to Resume and retry on a new claim, or Cancel." };

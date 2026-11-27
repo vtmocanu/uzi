@@ -3,7 +3,6 @@ package store_test
 import (
 	"context"
 	"fmt"
-	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -30,52 +29,33 @@ import (
 // test). Returns "" only via t.Skip when UZI_TEST_DATABASE_URL is unset.
 func standIsolatedDB(t *testing.T, prefix string) (context.Context, string) {
 	t.Helper()
+	ctx := context.Background()
+	db, err := createOwnedStoreTestDB(ctx, liveStoreTestDSN(t), prefix, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := db.drop(ctx); err != nil {
+			t.Logf("cleanup: %v", err)
+		}
+	})
+	return ctx, db.dsn
+}
+
+func liveStoreTestDSN(t *testing.T) string {
+	t.Helper()
 	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("UZI_TEST_DATABASE_URL not set; run via the store-IT runner for live-DB coverage")
 	}
-	ctx := context.Background()
-	name := prefix + strings.ReplaceAll(uuid.NewString(), "-", "")
-
-	adminPool, err := store.OpenPool(ctx, dsn)
-	if err != nil {
-		t.Fatalf("open admin pool: %v", err)
-	}
-	if _, err := adminPool.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()); err != nil {
-		adminPool.Close()
-		t.Fatalf("create database %s: %v", name, err)
-	}
-	adminPool.Close()
-
-	t.Cleanup(func() {
-		cleanupAdmin, err := store.OpenPool(ctx, dsn)
-		if err != nil {
-			t.Logf("cleanup: open admin pool to drop %s: %v", name, err)
-			return
-		}
-		defer cleanupAdmin.Close()
-		if _, err := cleanupAdmin.Exec(ctx,
-			"DROP DATABASE IF EXISTS "+pgx.Identifier{name}.Sanitize()+" WITH (FORCE)"); err != nil {
-			t.Logf("cleanup: drop database %s: %v", name, err)
-		}
-	})
-
-	u, err := url.Parse(dsn)
-	if err != nil {
-		t.Fatalf("parse dsn: %v", err)
-	}
-	u.Path = "/" + name
-	return ctx, u.String()
+	return dsn
 }
 
 // TestSetUserHarnessModelsLiveDB proves the grouped PATCH write returns and stores all four
 // fields, and that an unset field keeps its stored value (the PATCH contract that makes the
 // atomic grouped save non-clobbering).
 func TestSetUserHarnessModelsLiveDB(t *testing.T) {
-	ctx, dsn := standIsolatedDB(t, "harness_models_")
-	if err := store.Migrate(ctx, dsn); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
+	ctx, dsn := standHeadQueryDB(t, "harness_models_")
 	pool, err := store.OpenPool(ctx, dsn)
 	if err != nil {
 		t.Fatalf("open work pool: %v", err)

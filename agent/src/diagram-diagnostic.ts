@@ -24,7 +24,7 @@ export function diagramIdentity(claim: Claim, extraSecrets: string[] = []): { ha
   // PRD #4320: a provider claim's gateway key is redacted from the identity label like the OAuth token.
   const secrets = [claim.secrets.anthropic_oauth_token, ...(claim.secrets.provider?.credential ? providerKeyForms(claim.secrets.provider.credential) : []), ...extraSecrets];
   if (claim.secrets.codex && typeof claim.secrets.codex === "object") {
-    secrets.push(...Object.values(claim.secrets.codex).filter((v): v is string => typeof v === "string"));
+    for (const v of Object.values(claim.secrets.codex)) if (typeof v === "string") secrets.push(v);
   }
   const safe = Buffer.byteLength(model, "utf8") <= 100 && !/[\s\p{Cc}\p{Cf}\uFFFD]/u.test(model) &&
     makeTextRedactor(secrets)(model) === model && !secrets.some((secret) => secret && model.includes(secret)) && !/(?:glpat-|github_pat_|gh[pousr]_|sk-|xox[baprs]-)/i.test(model);

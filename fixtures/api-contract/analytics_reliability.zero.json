@@ -1,0 +1,53 @@
+{
+  "scope": {
+    "route": "",
+    "user": ""
+  },
+  "generated_at": "0001-01-01T00:00:00Z",
+  "window": "",
+  "timezone": "",
+  "from": "0001-01-01T00:00:00Z",
+  "to": "0001-01-01T00:00:00Z",
+  "history_start": null,
+  "bucket_width_days": 0,
+  "buckets": null,
+  "rolling": null,
+  "selected_user": "",
+  "applicable": false,
+  "reason": null,
+  "totals": {
+    "current": {
+      "finished": 0,
+      "outcomes": {
+        "completed": 0,
+        "cancelled": 0,
+        "plan_rejected": 0,
+        "base_diverged": 0,
+        "failed": 0
+      },
+      "failure_rate": {
+        "value": null,
+        "reason": null
+      },
+      "requeued_runs": 0
+    }
+  },
+  "series": null,
+  "causes": {
+    "failed": 0,
+    "items": null
+  },
+  "rolling_failure_rate": {
+    "overall": null,
+    "harnesses": null
+  },
+  "breakdown": {
+    "dimension": "",
+    "rows": null
+  },
+  "latest_failure": null,
+  "needs_landing": {
+    "runs": 0,
+    "caveat": ""
+  }
+}

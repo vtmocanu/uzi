@@ -19,7 +19,9 @@ import (
 //
 // MUTATION CHECK: neutralising the runkind.Job switch in setState turns every job subtest red.
 func TestSetStateRefusesParkingReportForJob(t *testing.T) {
-	for _, state := range []string{"paused", "awaiting_input", "awaiting_approval", "awaiting_followup"} {
+	// limit_wait joins the parking set (PRD #4322 M1b): a provider job never waits on a rate limit, and
+	// a job runner reports a limit through `failed` with the limit facts.
+	for _, state := range []string{"paused", "awaiting_input", "awaiting_approval", "awaiting_followup", "limit_wait"} {
 		t.Run("job/"+state, func(t *testing.T) {
 			wkr := worker()
 			fs := &fakeStore{runOwned: store.Run{

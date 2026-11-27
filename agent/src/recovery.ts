@@ -46,6 +46,8 @@ import path from "node:path";
 import type { Readable } from "node:stream";
 import { setTimeout as retryDelay } from "node:timers/promises";
 
+import type { NeedleResolution } from "./run-env-scan.js";
+import type { ScanNeedle } from "./run-env-forms.js";
 import { RUN_KINDS, HELD_FINAL_FALLBACK_REASONS, HELD_FINAL_RETAINED_REASONS, isRecoveryPrerequisiteClosureStatus, type HeldFinalRetainedReason } from "./protocol.js";
 import { RequestError, isRunOwnershipLost, type WorkerClient } from "./client.js";
 import type { Logger } from "./log.js";
@@ -499,6 +501,8 @@ export interface RecoveryBundleProducer {
   readonly recoveryDecodedLimitBytes?: number;
   resolveCheckpointRange?: HeldGit["resolveCheckpointRange"];
   secretScanCheckpointRange?: HeldGit["secretScanCheckpointRange"];
+  /** PRD 4416 M2: the exact-value scan of a bundle file's objects, run before every upload of that file. */
+  scanBundleForRunEnv?: GitCache["scanBundleForRunEnv"];
   rangeTouchesWorkflows?: HeldGit["rangeTouchesWorkflows"];
   changedFilesNoRenames?: HeldGit["changedFilesNoRenames"];
   checkpointPack?: HeldGit["checkpointPack"];
@@ -1042,6 +1046,11 @@ export interface RecoveryCoordinatorOptions {
     action: (prove: () => Promise<boolean>) => Promise<void>,
   ) => Promise<"passed" | "retained">;
   isExecuting?: (runId: string) => boolean;
+  /** PRD 4416 M2: where the exact-value scan needles of a run's secret variables come from when this coordinator
+   *  publishes (a bundle upload, a held or terminal pack): the live claim's set, else the api's maintenance
+   *  answer; a withhold stops the publish and keeps custody. Required so a new construction site cannot
+   *  forget it; a coordinator whose value is absent at runtime still withholds every publish (fail closed). */
+  scanNeedlesFor: (runId: string, signal?: AbortSignal) => Promise<NeedleResolution>;
   terminalRecordProtection?: (runId: string) => Promise<boolean>;
   /** Exact reports still need their authenticated generation evidence after FINAL.
    * Read synchronously so cleanup rechecks it at every destructive boundary. */
@@ -1182,6 +1191,8 @@ const INVENTORY_RECONCILE_ATTENTION_REASONS: ReadonlySet<string> = new Set([
 /** The `needs_action` reasons a live pass may retry (all need a journaled bundle). */
 const LIVE_RETRY_REASONS: ReadonlySet<string> = new Set([
   "capture_error",
+  // PRD 4416 M2: a withheld exact-value scan is retried by the live lane under its own backoff, not only at restart.
+  "publish_scan_withheld",
   "restart_upload_failed",
   "upload_transient",
   "storage_quota_exceeded",
@@ -1967,8 +1978,11 @@ export class RecoveryCoordinator {
         if (!pinned.resolveCheckpointRange || !pinned.secretScanCheckpointRange || !pinned.ancestry ||
             !pinned.rangeTouchesWorkflows || !pinned.changedFilesNoRenames || !pinned.checkpointPack) return { reason: "preparation_unavailable" };
         try {
+          // PRD 4416 M2: the pack's range is searched for the run's secret variable values, or not packed at all.
+          const packNeedles = await this.packNeedles(record.runId, input.signal);
           return await prepareFrozenHeldPinned({
             git: pinned, barePath, branch: record.branch, sourceSha: record.sourceSha, policy, deadlineMs: 30_000,
+            ...packNeedles,
             literals: [], perCommitCi: true, ciTarget: coverageContext.defaultIdentity.sha, expectDigests,
             remediationHold: async () => !await this.restrictionsAllowCapturedC(record),
           }, range);
@@ -2006,6 +2020,7 @@ export class RecoveryCoordinator {
   private readonly isExecuting: (runId: string) => boolean;
   private bootOwed: Awaited<ReturnType<NonNullable<RecoveryBundleProducer["discoverOwedCandidates"]>>> = [];
   private readonly terminalRecordProtection: RecoveryCoordinatorOptions["terminalRecordProtection"];
+  private readonly scanNeedlesFor: RecoveryCoordinatorOptions["scanNeedlesFor"];
   private readonly pendingGenerationReport: RecoveryCoordinatorOptions["pendingGenerationReport"];
   private readonly onAuthoritativeGenerationReleased: RecoveryCoordinatorOptions["onAuthoritativeGenerationReleased"];
   private readonly withTerminalSourceBoundary: RecoveryCoordinatorOptions["withTerminalSourceBoundary"];
@@ -2227,6 +2242,7 @@ export class RecoveryCoordinator {
     this.onCompletionGenerationForgotten = opts.onCompletionGenerationForgotten;
     this.isExecuting = opts.isExecuting ?? (() => false);
     this.terminalRecordProtection = opts.terminalRecordProtection;
+    this.scanNeedlesFor = opts.scanNeedlesFor;
     this.pendingGenerationReport = opts.pendingGenerationReport;
     this.onAuthoritativeGenerationReleased = opts.onAuthoritativeGenerationReleased;
     this.client = opts.client;
@@ -4102,6 +4118,8 @@ export class RecoveryCoordinator {
         git.rangeTouchesWorkflows && git.changedFilesNoRenames && git.checkpointPack
           ? await prepareFrozenHeld({ git: git as HeldGit, barePath: input.barePath,
             branch: record.branch, sourceSha: record.sourceSha, policy: record.heldPolicy!, deadlineMs: 30_000,
+            // PRD 4416 M2: the held range is searched for the run's secret variable values, or not packed at all.
+            ...await this.packNeedles(record.runId, input.signal),
             // No claim here, so no key forms: a provider-bound policy (providerKeyScan) fails closed.
             literals: [],
             remediationHold: async () => !await this.restrictionsAllowCapturedC(record) })
@@ -4408,7 +4426,7 @@ export class RecoveryCoordinator {
     const priorityEntry = index >= 0 ? this.bootOwed.splice(index, 1)[0] : undefined;
     const batch = this.bootOwed.splice(0, this.liveMaxPerPass - (priorityEntry ? 1 : 0));
     if (priorityEntry) batch.unshift(priorityEntry);
-    this.bootOwed.push(...batch); // rotate retained discoveries behind siblings; no internal retries
+    for (const owed of batch) this.bootOwed.push(owed); // rotate retained discoveries behind siblings; no internal retries
     for (const entry of batch) {
       if (signal?.aborted) break;
       const ctx = entry.context;
@@ -4819,6 +4837,13 @@ export class RecoveryCoordinator {
     }
     let current: RecoveryRecord = record;
     await this.requirePresent(current);
+    // PRD 4416 M2: nothing leaves the worker (not even a reserve) until the bundle's objects were searched for
+    // the run's secret variable values and the verdict bound to the journaled checksum that is then streamed.
+    // A hit or an unscannable byte keeps the record, the bundle and the custody exactly as they are.
+    const scanned = await this.bundleScanVerdict(record, signal);
+    if (scanned !== "clean") {
+      return this.markFailure(record, scanned === "hit" ? "publish_scan_secret_found" : "publish_scan_withheld", swallow);
+    }
     // issue #2213: synchronous check immediately before the first client call (the awaits above have
     // returned). Nothing is journaled: the record, its bundle and the pin stay exactly as they are.
     if (residueQuarantine() !== undefined) return quarantinedOutcome(current.captureId);
@@ -4922,6 +4947,41 @@ export class RecoveryCoordinator {
       server_state: status.state,
     });
     return { state: "uploaded", captureId: current.captureId };
+  }
+
+  /** The needles of a run's secret variables for a pack this coordinator is about to publish. With no wiring
+   *  or an unresolvable answer the pack is marked unscannable (fail closed). */
+  private async packNeedles(runId: string, signal?: AbortSignal): Promise<{ needles: readonly ScanNeedle[] } | { needlesUnavailable: true }> {
+    if (!this.scanNeedlesFor) return { needlesUnavailable: true };
+    try {
+      const res = await this.scanNeedlesFor(runId, signal);
+      return res.kind === "needles" ? { needles: res.needles } : { needlesUnavailable: true };
+    } catch { MaintenanceBudget.current()?.check();
+      return { needlesUnavailable: true };
+    }
+  }
+
+  /**
+   * PRD 4416 M2: the exact-value scan gate of a bundle upload. The bundle FILE is hashed against the journaled
+   * checksum (the one the upload manifest names and the server verifies), unpacked and searched, and hashed
+   * again, so the scanned bytes are the streamed bytes. `hit` and `withheld` both stop the upload; every
+   * failure (no resolver answer, a changed or unreadable file, a git error, a deadline) is `withheld`.
+   */
+  private async bundleScanVerdict(record: JournaledBundleRecord, signal?: AbortSignal): Promise<"clean" | "hit" | "withheld"> {
+    const pack = await this.packNeedles(record.runId, signal);
+    if ("needlesUnavailable" in pack) return "withheld";
+    if (pack.needles.length === 0) return "clean";
+    const scan = this.git.scanBundleForRunEnv;
+    if (!scan) return "withheld";
+    try {
+      if (!await verifyJournaledBytes(record, signal)) return "withheld";
+      const res = await scan.call(this.git, record.bundlePath, record.sourceSha, pack.needles, { deadlineMs: 120_000 });
+      if (!res.trusted) return "withheld";
+      if (res.findings.length > 0) return "hit";
+      return await verifyJournaledBytes(record, signal) ? "clean" : "withheld";
+    } catch { MaintenanceBudget.current()?.check();
+      return "withheld";
+    }
   }
 
   /**
@@ -5843,7 +5903,10 @@ export class RecoveryCoordinator {
     try {
       const records = [...(snapshot ?? await this.snapshotBootRecords())];
       if (discover) {
-        try { records.push(...await this.materializeBootInventory(signal, this.isExecuting, attempts)); }
+        try {
+          const materialized = await this.materializeBootInventory(signal, this.isExecuting, attempts);
+          for (const record of materialized) records.push(record);
+        }
         catch (err) {
           MaintenanceBudget.current()?.check();
           this.log.warn("recovery: boot materialization failed; independent journals still retried", { error: errText(err) });

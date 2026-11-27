@@ -1065,6 +1065,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     "claude_phase_models_v1",
     "claude_provider_v1",
     "claude_provider_judge_v1",
+    "claude_provider_job_v1",
     ...(process.platform === "linux" ? ["ci_artifacts_v1"] : []),
   ];
   // #4007 slice B is production-dark: its capability is never advertised in any permutation below.
@@ -1165,7 +1166,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     );
     assert.deepStrictEqual(
       caps,
-      [...ALWAYS_PRESENT_PROTOCOL_CAPS, CODEX_HARNESS_CAPABILITY, CODEX_RUNTIME_V2_CAPABILITY, CODEX_RUNTIME_V3_CAPABILITY, CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY, CODEX_PHASE_MODELS_CAPABILITY, "codex_provider_v1", "pending_outcome_scoped_claim_v1"],
+      [...ALWAYS_PRESENT_PROTOCOL_CAPS, CODEX_HARNESS_CAPABILITY, CODEX_RUNTIME_V2_CAPABILITY, CODEX_RUNTIME_V3_CAPABILITY, CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY, CODEX_PHASE_MODELS_CAPABILITY, "codex_provider_v1", "codex_provider_judge_v1", "pending_outcome_scoped_claim_v1"],
       "an advertising result appends codex_harness_v1 then codex_custom_model_v1 (PRD #1551 D6) after the always-present protocol caps (v2 by PRD #1349 M1, credential_switch_v1 by PRD #1247 M5b, wall_park_v1 by PRD #1497 M2)",
     );
   });
@@ -1204,6 +1205,19 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
       [...ALWAYS_PRESENT_PROTOCOL_CAPS, "pending_outcome_scoped_claim_v1"],
       "an absent availability result advertises only the always-present protocol caps",
     );
+  });
+
+  it("advertises run_env_v1 only under the uid split", async () => {
+    const prior = process.env.UZI_UID_SPLIT;
+    try {
+      process.env.UZI_UID_SPLIT = "1";
+      assert.ok((await advertisedCapabilities(fakeConfig()))?.includes("run_env_v1"), "advertised with the split active");
+      delete process.env.UZI_UID_SPLIT;
+      assert.ok(!(await advertisedCapabilities(fakeConfig()))?.includes("run_env_v1"), "not advertised without the split");
+    } finally {
+      if (prior === undefined) delete process.env.UZI_UID_SPLIT;
+      else process.env.UZI_UID_SPLIT = prior;
+    }
   });
 
   it("advertises codex_refresh_recovery_v1 without API protocol_features or Codex availability requirements", async () => {

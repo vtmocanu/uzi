@@ -1,3 +1,4 @@
+import { NO_SCAN_NEEDLES } from "./run-env-test-support.js";
 import { execFileSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
@@ -107,7 +108,7 @@ function build(executor: Executor, forge: { gitlab?: unknown; github?: unknown }
   const log = opts.log ?? nullLogger();
   type InventoryBoundary = NonNullable<ConstructorParameters<typeof RecoveryCoordinator>[0]["withInventorySourceBoundary"]>;
   let r: RunRunner;
-  const recovery = new RecoveryCoordinator({
+  const recovery = new RecoveryCoordinator({ ...NO_SCAN_NEEDLES,
     client: opts.archive ?? new PublicationArchive(), git: gitCache, log, recoveryRoot: gitCache.recoveryRoot, workerToken: TOKEN,
     withInventorySourceBoundary: (...args) => (r as unknown as { withInventorySourceBoundary: InventoryBoundary }).withInventorySourceBoundary(...args),
   });
@@ -752,7 +753,7 @@ it("handoff (a): the finalization pin names the recorded original head H, not th
   reset();
   const c = counts();
   const r = build(tripwireExecutor(c), { github: fakeGitHub().github }, outbox, {
-    c, extra: { recovery: new RecoveryCoordinator({ client: new FakeRecoveryClient(), git, log: nullLogger(), recoveryRoot: git.recoveryRoot, workerToken: TOKEN }) },
+    c, extra: { recovery: new RecoveryCoordinator({ ...NO_SCAN_NEEDLES, client: new FakeRecoveryClient(), git, log: nullLogger(), recoveryRoot: git.recoveryRoot, workerToken: TOKEN }) },
   });
   const rec = (r as unknown as { recovery: { pin: (input: { sourceSha: string; finalizationPin?: boolean; attemptedHeadSha?: string }) => Promise<unknown> } }).recovery;
   const real = rec.pin.bind(rec);

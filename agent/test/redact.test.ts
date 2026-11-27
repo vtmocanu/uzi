@@ -45,6 +45,13 @@ describe("makeTextRedactor", () => {
     );
   });
 
+  it("redacts two secrets that overlap in the text in full, whichever is listed first", () => {
+    const text = "x alphaalpha1234betabetabeta y";
+    assert.strictEqual(makeTextRedactor(["alphaalpha1234", "1234betabetabeta"])(text), `x ${REDACTED} y`);
+    assert.strictEqual(makeTextRedactor(["1234betabetabeta", "alphaalpha1234"])(text), `x ${REDACTED} y`);
+    assert.strictEqual(makeTextRedactor(["alphaalpha1234", "1234betabetabeta"])("a alphaalpha1234 b 1234betabetabeta c"), `a ${REDACTED} b ${REDACTED} c`);
+  });
+
   it("is an identity when no usable secret is supplied", () => {
     const redact = makeTextRedactor([undefined, null, "", "short"]);
     assert.strictEqual(redact(`keeps ${TOKEN}`), `keeps ${TOKEN}`);
@@ -95,6 +102,41 @@ describe("redaction across invisible separators", () => {
   it("a separator inside a secret shorter than the floor is still ignored", () => {
     const scrub = makeTextRedactor(["short1"]);
     assert.equal(scrub("sho​rt1"), "sho​rt1");
+  });
+});
+
+describe("makeTextRedactor over more than 64 secrets", () => {
+  const fillers = Array.from({ length: 70 }, (_, i) => `filler-secret-${String(i).padStart(3, "0")}-dummy`);
+  const first = "aaaaaaaa-1";
+  const second = "-1bbbbbbbbbbbbbbbb";
+  const zwsp = "​";
+
+  it("redacts two distinct secrets that overlap in plain text, in full", () => {
+    const scrub = makeTextRedactor([...fillers, first, second]);
+    assert.equal(scrub("x aaaaaaaa-1bbbbbbbbbbbbbbbb y"), `x ${REDACTED} y`);
+  });
+
+  it("redacts overlapping secrets split by an invisible character exactly as the per-secret path does", () => {
+    const text = `x aaaaaaaa-${zwsp}1bbbbbbbbbbbbbbbb y`;
+    const many = makeTextRedactor([...fillers, first, second]);
+    const few = makeTextRedactor([first, second]);
+    assert.equal(many(text), few(text));
+    assert.ok(!many(text).includes("bbbbbbbb"), many(text));
+  });
+
+  it("matches a secret that starts inside another match", () => {
+    const scrub = makeTextRedactor([...fillers, "abcdefgh-ijkl", "ijkl-mnopqrstu"]);
+    assert.equal(scrub("<abcdefgh-ijkl-mnopqrstu>"), `<${REDACTED}>`);
+  });
+
+  it("redacts a large text with a bounded cost", () => {
+    const scrub = makeTextRedactor([...fillers, first]);
+    const text = `${"lorem ipsum dolor ".repeat(200000)}${first}`;
+    const started = Date.now();
+    const out = scrub(text);
+    const ms = Date.now() - started;
+    assert.ok(out.endsWith(REDACTED));
+    assert.ok(ms < 5000, `took ${ms}ms`);
   });
 });
 
@@ -161,5 +203,32 @@ describe("providerKeyForms", () => {
 
   it("collapses to one form for a key every encoding leaves untouched", () => {
     assert.deepEqual(providerKeyForms("plainkey12345678"), ["plainkey12345678"]);
+  });
+});
+
+describe("makeTextRedactor with a long periodic secret", () => {
+  // A 70 000 unit secret whose 8-unit prefix recurs every 9 units: every shift of one real occurrence is a
+  // prefix candidate, but only the shifts that leave a border of the secret can be occurrences.
+  const long = ["Q9Z7W4X2", "-"].join("").repeat(8000).slice(0, 70_000);
+
+  it("redacts the one real occurrence inside plain text without withholding", () => {
+    const text = `${"a".repeat(20_000)}${long}${"b".repeat(50_000)}`;
+    const out = makeTextRedactor([long])(text);
+    assert.equal(out, `${"a".repeat(20_000)}${REDACTED}${"b".repeat(50_000)}`);
+  });
+
+  it("redacts two overlapping occurrences sharing a border as one union and keeps a partial one", () => {
+    const secret = "abcdeabc"; // border "abc"
+    assert.equal(makeTextRedactor([secret])("<abcdeabcdeabc>"), `<${REDACTED}>`);
+    assert.equal(makeTextRedactor([secret])("<abcdeab>"), "<abcdeab>");
+    assert.equal(makeTextRedactor([secret])("<abcdeabcdeab>"), `<${REDACTED}deab>`);
+  });
+
+  it("redacts every overlapping occurrence of a periodic secret and no partial one", () => {
+    const secret = "abababababababab"; // 16 units, period 2
+    const run = "ab".repeat(12); // five overlapping occurrences at shifts 0, 2, 4, 6, 8
+    assert.equal(makeTextRedactor([secret])(`<${run}>`), `<${REDACTED}>`);
+    const partial = "ab".repeat(7); // 14 units: shorter than the secret, so not an occurrence
+    assert.equal(makeTextRedactor([secret])(`<${partial}>`), `<${partial}>`);
   });
 });

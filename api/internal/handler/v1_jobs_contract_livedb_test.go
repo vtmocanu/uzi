@@ -42,10 +42,18 @@ func TestV1SpecContractLiveDB(t *testing.T) {
 	readOnly := v1MintProductToken(t, e.h.q, owner, product, []string{producttoken.ScopeJobsRead}, nil)
 	runOnly := v1MintProductToken(t, e.h.q, owner, product, []string{producttoken.ScopeJobsRun}, nil)
 	unknown := v1UnknownProductToken(t)
-	// Issue #4541: a separate provider-sourced user for the create 409 (the shared owner stays
-	// vendor-sourced, so the other create cases are unaffected).
+	// Issue #4541 and PRD #4322 M1b: a separate provider-sourced user for the create 409s (the shared
+	// owner stays vendor-sourced, so the other create cases are unaffected). The source is USABLE, so a
+	// plain job would be provider-bound (201): the lane 409 needs a site-list job, which a provider
+	// source still refuses (the lane is on for this test, above).
 	provUser, provTok := e.user()
-	e.selectProvider(provUser)
+	e.selectUsableProvider(provUser, v1ProviderMap)
+	siteListBody := fmt.Sprintf(`{"type":"research","prompt":"p","egress_profile":%q}`, e.siteList())
+	// An unmapped-model source (no sonnet) and a bare provider (no revision) for the other typed 409s.
+	unmappedUser, unmappedTok := e.user()
+	e.selectUsableProvider(unmappedUser, v1ProviderMapNoSonnet)
+	unusableUser, unusableTok := e.user()
+	e.selectProvider(unusableUser)
 
 	// Issue #1992: a production router over a CLOSED pool, so RequireV1Caller's token lookup
 	// fails with a store error (not pgx.ErrNoRows) and answers the auth 503 auth_unavailable on
@@ -112,7 +120,10 @@ func TestV1SpecContractLiveDB(t *testing.T) {
 		{name: "create 422", method: "POST", specPath: "/jobs", url: "/api/v1/jobs", token: uzc, body: `{"type":"research"}`, want: 422},
 		{name: "create 422 unknown type", method: "POST", specPath: "/jobs", url: "/api/v1/jobs", token: uzc, body: `{"type":"x","prompt":"p"}`, want: 422},
 		{name: "create 422 egress", method: "POST", specPath: "/jobs", url: "/api/v1/jobs", token: uzc, body: `{"type":"research","prompt":"p","egress_profile":""}`, want: 422},
-		{name: "create 409 provider lane", method: "POST", specPath: "/jobs", url: "/api/v1/jobs", token: provTok, body: v1MinimalJob, want: 409},
+		{name: "create 409 provider lane", method: "POST", specPath: "/jobs", url: "/api/v1/jobs", token: provTok, body: siteListBody, want: 409},
+		{name: "create 409 provider source unusable", method: "POST", specPath: "/jobs", url: "/api/v1/jobs", token: unusableTok, body: v1MinimalJob, want: 409},
+		{name: "create 409 provider model unmapped", method: "POST", specPath: "/jobs", url: "/api/v1/jobs", token: unmappedTok, body: v1MinimalJob, want: 409},
+		{name: "create 201 provider bound", method: "POST", specPath: "/jobs", url: "/api/v1/jobs", token: provTok, body: v1MinimalJob, want: 201},
 		{name: "create 404 unknown egress profile", method: "POST", specPath: "/jobs", url: "/api/v1/jobs", token: uzc, body: `{"type":"research","prompt":"p","egress_profile":"no-such-list"}`, want: 404},
 		{name: "create 503 isolated lane unavailable", method: "POST", specPath: "/jobs", url: "/api/v1/jobs", token: uzc, body: fmt.Sprintf(`{"type":"research","prompt":"p","egress_profile":%q}`, e.siteList()), want: 503,
 			pre: func() { e.enableLane(false) }},
