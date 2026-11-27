@@ -1389,8 +1389,18 @@ go_conc_expect() { # FILE WANT_BUILD WANT_PROCS (empty = absent)
     exit 1
   fi
 }
+# go_mem_expect FILE WANT (empty = absent): UZI_WORKER_GO_MEMLIMIT only.
+go_mem_expect() {
+  _gl=$(go_conc_env "$1" UZI_WORKER_GO_MEMLIMIT)
+  [ -n "$2" ] && _wl="\"$2\"" || _wl="<absent>"
+  if [ "$_gl" != "$_wl" ]; then
+    echo "FAIL: go memlimit env $_gl, expected $_wl ($3)" >&2
+    exit 1
+  fi
+}
 go_conc_render > "$WORK/go-default.yaml"
 go_conc_expect "$WORK/go-default.yaml" "" "" default
+go_mem_expect "$WORK/go-default.yaml" "" default
 printf 'workers:\n  goBuildParallelism: 2147483647\n  goMaxProcs: 2147483647\n' > "$WORK/go-values.yaml"
 go_conc_render -f "$WORK/go-values.yaml" > "$WORK/go-case.yaml"
 go_conc_expect "$WORK/go-case.yaml" 2147483647 2147483647 "values file, unquoted max"
@@ -1423,6 +1433,40 @@ go_conc_expect "$WORK/go-case.yaml" 1 1 "typed +1 decoded by helm"
 go_conc_render --set-string workers.goBuildParallelism='  ' --set-string workers.goMaxProcs= \
   > "$WORK/go-case.yaml"
 go_conc_expect "$WORK/go-case.yaml" "" "" "blank"
+# workers.goMemLimit (GOMEMLIMIT): string-only, unit required, canonical <n><unit>.
+go_conc_render --set-string workers.goMemLimit=6GiB > "$WORK/go-case.yaml"
+go_mem_expect "$WORK/go-case.yaml" 6GiB "set-string GiB"
+go_conc_render --set-string workers.goMemLimit=512MiB > "$WORK/go-case.yaml"
+go_mem_expect "$WORK/go-case.yaml" 512MiB "set-string MiB"
+go_conc_render --set-string workers.goMemLimit=007GiB > "$WORK/go-case.yaml"
+go_mem_expect "$WORK/go-case.yaml" 7GiB "leading zeros"
+go_conc_render --set-string workers.goMemLimit=2147483647GiB > "$WORK/go-case.yaml"
+go_mem_expect "$WORK/go-case.yaml" 2147483647GiB "ceiling"
+printf 'workers:\n  goMemLimit: "6GiB"\n' > "$WORK/go-values.yaml"
+go_conc_render -f "$WORK/go-values.yaml" > "$WORK/go-case.yaml"
+go_mem_expect "$WORK/go-case.yaml" 6GiB "values file quoted"
+printf 'workers:\n  goMemLimit: "\t 6GiB \t"\n' > "$WORK/go-values.yaml"
+go_conc_render -f "$WORK/go-values.yaml" > "$WORK/go-case.yaml"
+go_mem_expect "$WORK/go-case.yaml" 6GiB "values file tab/space padded"
+go_conc_render --set-string workers.goMemLimit='  ' > "$WORK/go-case.yaml"
+go_mem_expect "$WORK/go-case.yaml" "" "blank"
+MEM_DIAG="workers.goMemLimit must be a positive integer <= 2147483647 followed by MiB or GiB"
+BOM_BAD=$(printf '\357\273\2776GiB')
+NEL_BAD=$(printf '\302\2056GiB')
+for hosting in true false; do
+  for bad in 0GiB 00MiB 6gib 6G 6GB 6 1.5GiB +6GiB -6GiB 2147483648GiB off "$BOM_BAD" "$NEL_BAD"; do
+    if go_conc_render --set "workers.enabled=$hosting" --set workers.controller.enabled=false \
+      --set-string "workers.goMemLimit=$bad" > "$WORK/go-invalid.yaml" 2> "$WORK/err"; then
+      echo "FAIL: invalid workers.goMemLimit=$bad accepted (hosting=$hosting)" >&2; exit 1
+    fi
+    grep -F "$MEM_DIAG" "$WORK/err" >/dev/null || { cat "$WORK/err" >&2; exit 1; }
+  done
+  if go_conc_render --set "workers.enabled=$hosting" --set workers.controller.enabled=false \
+    --set workers.goMemLimit=6 > "$WORK/go-invalid.yaml" 2> "$WORK/err"; then
+    echo "FAIL: typed workers.goMemLimit=6 accepted (hosting=$hosting)" >&2; exit 1
+  fi
+  grep -F "$MEM_DIAG" "$WORK/err" >/dev/null || { cat "$WORK/err" >&2; exit 1; }
+done
 for hosting in true false; do
   for setting in goBuildParallelism goMaxProcs; do
     for bad in 0 -1 +1 1.5 2147483648 abc '2 -toolexec=x' 00; do
@@ -1475,11 +1519,12 @@ case "$YQ_VERSION_RAW" in
     ;;
 esac
 
-# Compose must pass exactly these two names through the agent service, empty by default.
+# Compose must pass exactly these three names through the agent service, empty by default.
 # After the yq guard above, so a missing yq reports BROKEN rather than FAIL.
 if [ "$(yq -r '.services.agent.environment.WORKER_GO_BUILD_PARALLELISM' "$REPO_DIR/docker-compose.yml")" != "\${WORKER_GO_BUILD_PARALLELISM:-}" ] ||
   [ "$(yq -r '.services.agent.environment.WORKER_GO_MAXPROCS' "$REPO_DIR/docker-compose.yml")" != "\${WORKER_GO_MAXPROCS:-}" ] ||
-  [ "$(grep -cE '^[[:space:]]*WORKER_GO_[A-Z_]+:' "$REPO_DIR/docker-compose.yml")" != 2 ]; then
+  [ "$(yq -r '.services.agent.environment.WORKER_GO_MEMLIMIT' "$REPO_DIR/docker-compose.yml")" != "\${WORKER_GO_MEMLIMIT:-}" ] ||
+  [ "$(grep -cE '^[[:space:]]*WORKER_GO_[A-Z_]+:' "$REPO_DIR/docker-compose.yml")" != 3 ]; then
   echo "FAIL: compose go concurrency env inventory" >&2; exit 1
 fi
 echo "OK: go concurrency defaults, canonical values, numeric bounds, controller-off invariants and compose inventory"
