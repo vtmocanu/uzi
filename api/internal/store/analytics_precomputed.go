@@ -89,7 +89,9 @@ type AnalyticsPrecomputeSession struct {
 // applies the session settings and tries the session advisory lock. It returns (nil, false, nil)
 // when another session holds the lock. On a setup error, an unknown try result, a busy lock or a
 // failed test fault the connection is closed before returning, so an unknown lock state never
-// survives.
+// survives. The session settings end the session on the server after 60 seconds idle, so any
+// Go-side gap over 60s (between statements inside a RunBuild fn, or between RunBuild and Publish)
+// makes the server close the connection and the build then fails.
 func OpenAnalyticsPrecomputeSession(ctx context.Context, pool *pgxpool.Pool) (*AnalyticsPrecomputeSession, bool, error) {
 	pc, err := pool.Acquire(ctx)
 	if err != nil {
@@ -154,7 +156,8 @@ func (s *AnalyticsPrecomputeSession) markBroken() {
 // Close releases the lock and ends the session. On an idle, unbroken session it runs
 // pg_advisory_unlock under ctx and reports unlocked=true only when PostgreSQL answered true; in any
 // other state unlocked is false and the lock ends with the connection. The connection is ALWAYS
-// closed (never returned to a pool). A false answer or an error is returned as an error. Close is
+// closed (never returned to a pool). Callers should pass a ctx with a deadline, since the unlock
+// query and the connection teardown run under it. A false answer or an error is returned as an error. Close is
 // idempotent: later calls return (false, nil).
 func (s *AnalyticsPrecomputeSession) Close(ctx context.Context) (unlocked bool, err error) {
 	if s.conn == nil {
@@ -208,7 +211,9 @@ func (s *AnalyticsPrecomputeSession) rollback(ctx context.Context, tx pgx.Tx) er
 // with fn's). If the rollback fails or the connection is not idle afterwards, the session is
 // marked broken and its connection closed: its lock ends with it, and nothing may publish on it.
 // The session settings (10 minute statement timeout, 60 second idle-in-transaction timeout) bound
-// the build on the server.
+// each statement and each idle gap between statements, not the whole build. A Go-side gap over 60s
+// inside fn, or between RunBuild returning and Publish, makes the server end the session, so the
+// build then fails.
 func (s *AnalyticsPrecomputeSession) RunBuild(ctx context.Context, fn func(ctx context.Context, s *AnalyticsSnapshot, counter int64) error) error {
 	if !s.Idle() {
 		return errors.New("analytics precompute: session is closed, broken or busy")
@@ -250,10 +255,15 @@ func (s *AnalyticsPrecomputeSession) build(ctx context.Context, tx pgx.Tx, fn fu
 // one INSERT per document, COMMIT. A reader of the section in one statement sees the old set
 // complete or the new set complete. generatedAt and counter are stored on every row.
 //
+// The session must still be alive: a Go-side gap over 60s since the last statement (including the
+// gap between RunBuild and Publish) lets the server end it, and Publish then fails.
+//
 // Errors: ErrAnalyticsPrecomputedInvalidated means a delete committed since the build read its
 // counter and nothing was published. An error wrapping ErrAnalyticsPrecomputePublishUnresolved
-// means COMMIT was sent and its result is unknown (the session is closed). Any other error means
-// the transaction failed before COMMIT and nothing was published.
+// means the commit returned an error or the acknowledgement was lost; the set may or may not have
+// been published (COMMIT may not have been sent if ctx was already done; that case is conservatively
+// reported unresolved) and the session is closed. Any other error means the transaction failed
+// before COMMIT and nothing was published.
 func (s *AnalyticsPrecomputeSession) Publish(ctx context.Context, section string, counter int64, generatedAt time.Time, docs []AnalyticsPrecomputedDoc) error {
 	if !s.Idle() {
 		return errors.New("analytics precompute: session is closed, broken or busy")
@@ -287,6 +297,8 @@ func (s *AnalyticsPrecomputeSession) publishTx(ctx context.Context, tx pgx.Tx, s
 		return err
 	}
 	q := New(tx)
+	// Pre-check: a missing state row is a distinct error, not ErrAnalyticsPrecomputedInvalidated
+	// (the guarded UPDATE below would report 0 rows for it). Only the error is used.
 	if _, err := q.ReadAnalyticsPrecomputeCounter(ctx); errors.Is(err, pgx.ErrNoRows) {
 		return errors.New("analytics precompute: analytics_precomputed_state row is missing")
 	} else if err != nil {

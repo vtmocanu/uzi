@@ -71,6 +71,9 @@ $$;
 -- waiting on a source row deleter B holds, and B waits on the state row". Not claimed: TRUNCATE
 -- (its statement trigger fires immediately), a session that runs SET CONSTRAINTS ... IMMEDIATE,
 -- and any future deferred trigger that takes locks of its own.
+-- The fresh-snapshot sentence above holds for READ COMMITTED deleters only. A REPEATABLE READ or
+-- SERIALIZABLE users/repos delete fails at COMMIT with SQLSTATE 40001 if a publish or failure
+-- record committed on the state row during its lifetime (it fails closed; nothing is left behind).
 CREATE CONSTRAINT TRIGGER analytics_precomputed_invalidate_users AFTER DELETE ON users
     DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION analytics_precomputed_invalidate();
 

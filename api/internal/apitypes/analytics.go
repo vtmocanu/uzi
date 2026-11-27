@@ -434,6 +434,21 @@ type AnalyticsSpendDTO struct {
 	Breakdown           AnalyticsBreakdownDTO   `json:"breakdown"`
 }
 
+// AnalyticsSnapshotMetaDTO describes a stored (precomputed) analytics document: when the build
+// that produced it took its snapshot, and whether it is older than twice the configured build
+// interval (a missed or failing build), so the SPA can say the figures are stale (issue #4771).
+type AnalyticsSnapshotMetaDTO struct {
+	GeneratedAt time.Time `json:"generated_at"`
+	Stale       bool      `json:"stale"`
+}
+
+// AnalyticsSpendSnapshotDTO is the admin all-users all-time Spend response served from a stored
+// document: the live Spend body plus a trailing snapshot member (issue #4771).
+type AnalyticsSpendSnapshotDTO struct {
+	AnalyticsSpendDTO
+	Snapshot AnalyticsSnapshotMetaDTO `json:"snapshot"`
+}
+
 // Issue #4731: the Capacity response (GET /api/analytics/capacity and GET
 // /api/admin/analytics/capacity). Every slice is non-null on the wire. A null value always
 // travels with a reason from the closed set zero_duration_bucket, zero_duration_range,

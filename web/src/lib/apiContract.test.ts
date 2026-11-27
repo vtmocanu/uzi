@@ -25,6 +25,7 @@ import type {
   AnalyticsBreakdownRowDTO,
   AnalyticsBreakdownDTO,
   AnalyticsSpendDTO,
+  AnalyticsSpendSnapshotDTO,
   AnalyticsReliabilityBlockDTO,
   AnalyticsReliabilityTotalsDTO,
   AnalyticsReliabilityCellDTO,
@@ -89,6 +90,8 @@ import analyticsReliabilityFull from "../../../fixtures/api-contract/analytics_r
 import analyticsReliabilityZero from "../../../fixtures/api-contract/analytics_reliability.zero.json";
 import analyticsOptionsFull from "../../../fixtures/api-contract/analytics_options.full.json";
 import analyticsOptionsZero from "../../../fixtures/api-contract/analytics_options.zero.json";
+import analyticsSpendSnapshotFull from "../../../fixtures/api-contract/analytics_spend_snapshot.full.json";
+import analyticsSpendSnapshotZero from "../../../fixtures/api-contract/analytics_spend_snapshot.zero.json";
 import analyticsSpendFull from "../../../fixtures/api-contract/analytics_spend.full.json";
 import analyticsSpendZero from "../../../fixtures/api-contract/analytics_spend.zero.json";
 import analyticsCapacityFull from "../../../fixtures/api-contract/analytics_capacity.full.json";
@@ -2650,6 +2653,23 @@ describe("analytics spend contract (issue #4684)", () => {
     expect(zero.totals.current.cost_usd).toBe(0);
     expect(zero.totals.current.disclosure.incomplete).toBe(false);
     expect(zero.window).toBe("");
+  });
+});
+
+describe("analytics spend snapshot contract (issue #4771)", () => {
+  type Full = typeof analyticsSpendSnapshotFull;
+  const _top: never = null as unknown as AnalyticsKeyDiff<AnalyticsSpendSnapshotDTO, Full>;
+  const _snapshot: never = null as unknown as AnalyticsKeyDiff<AnalyticsSpendSnapshotDTO["snapshot"], Full["snapshot"]>;
+  void [_top, _snapshot];
+
+  it("accepts the full fixture", () => {
+    const full: AnalyticsSpendSnapshotDTO = analyticsSpendSnapshotFull as unknown as AnalyticsSpendSnapshotDTO;
+    expect(full.snapshot.generated_at).toBe("2020-01-02T03:04:05Z");
+    expect(full.snapshot.stale).toBe(true);
+  });
+
+  it("carries a zero snapshot member on the zero fixture", () => {
+    expect(analyticsSpendSnapshotZero.snapshot).toEqual({ generated_at: "0001-01-01T00:00:00Z", stale: false });
   });
 });
 
