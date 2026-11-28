@@ -95,7 +95,7 @@ func TestAnalyticsWindowAllRefusalCoversSpendAndFlowOnly(t *testing.T) {
 	for section, wantRefused := range map[string]bool{
 		analytics.SectionSpend: true, analytics.SectionFlow: true, analytics.SectionOptions: false,
 	} {
-		_, msg := parseAnalyticsRequest(url.Values{"window": {"all"}}, true, section, caller)
+		_, msg := parseAnalyticsRequest(url.Values{"window": {"all"}}, true, section, caller, false)
 		if (msg == msgAnalyticsWindowAllAllUsers) != wantRefused {
 			t.Fatalf("%s: admin all-users window=all message %q, refused want %v", section, msg, wantRefused)
 		}

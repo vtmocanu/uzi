@@ -46,7 +46,7 @@ bill. Capacity reports no dollars.
 
 | Parameter | Values | Default | Notes |
 |---|---|---|---|
-| `window` | `7d`, `30d`, `90d`, `all` | `30d` | Calendar dates, see [Calendar](#calendar). The admin all-users scope (`user` omitted or `user=all`) has no `all`: Options lists only `7d`, `30d`, `90d` there, and Spend, Reliability, Capacity, Quality and Flow reject `window=all` with a 400. Owner and admin `user=<uuid>` keep `all`. Options accepts and ignores `window`. |
+| `window` | `7d`, `30d`, `90d`, `all` | `30d` | Calendar dates, see [Calendar](#calendar). On the admin all-users scope (`user` omitted or `user=all`), `all` is Spend only and is served from a [scheduled snapshot](#all-time-spend-for-all-users-snapshot): Options lists it there only while `UZI_ANALYTICS_SNAPSHOT_INTERVAL` is not `0`, and Reliability, Capacity, Quality and Flow reject `window=all` with a 400 (so does Spend when the setting is `0`). Owner and admin `user=<uuid>` keep `all`. Options accepts and ignores `window`. |
 | `tz` | an IANA name | `UTC` | Must be known to both the database and the server. Empty, `Local` and names over 64 characters are invalid. |
 | `repo` | a repo UUID | none | Hyphenated 36-character form only. |
 | `harness` | `claude`, `codex` | none | |
@@ -58,9 +58,19 @@ bill. Capacity reports no dollars.
 - Every invalid value is a 400 naming its parameter (`invalid window`,
   `invalid tz`, ...). The message never echoes the value, SQL or other
   sensitive text.
-- Spend, Reliability, Capacity, Quality and Flow on the admin all-users scope with `window=all` are a 400,
-  `window all not available for all users`. It is answered before any
+- Reliability, Capacity, Quality and Flow on the admin all-users scope with `window=all` are a 400,
+  `window all not available for all users`, and so is Spend when
+  `UZI_ANALYTICS_SNAPSHOT_INTERVAL` is `0`. It is answered before any
   analytics database work (authentication runs first) and is not a 503.
+- Spend on the admin all-users scope with `window=all` and the setting on is
+  answered from the snapshot, only unfiltered and in UTC: a valid `repo`,
+  `harness` or `kind` filter, or a `tz` other than the literal `UTC`, is a 400
+  `all-time view across all users is only available unfiltered in UTC`. Values
+  rejected before any database work keep their own 400 first (`tz=Local` and
+  names over 64 characters are `invalid tz`, a malformed repo UUID is
+  `invalid repo`). Timezone names and repos that pass that syntax check are not
+  checked against the database on this path, so they get the unfiltered-in-UTC
+  400. `split` and `breakdown` are validated after these checks. See [All-time Spend for all users](#all-time-spend-for-all-users-snapshot).
 - Repeated and empty parameters are invalid (`invalid <name>`). An unknown
   parameter is a 400 `unknown parameter`. A query string that does not parse
   (a bad percent-encoding or a `;`) is a 400 `invalid query`; it is never
@@ -261,8 +271,8 @@ calendar envelope as Spend (`scope`, `generated_at`, `window`, `timezone`,
 `from`, `to`, `previous_from`, `previous_to`, `history_start`,
 `bucket_width_days`, `buckets`, `rolling`, `selected_user`), so
 [Calendar](#calendar) applies unchanged. The admin all-users scope has no
-`window=all` here either (400 `window all not available for all users`, as
-for Spend).
+`window=all` here either (400 `window all not available for all users`; only
+Spend has an [all-time snapshot](#all-time-spend-for-all-users-snapshot)).
 
 - **Cohort.** Runs are chosen by **creation time**, like Spend: a run belongs
   to the window its `created_at` falls in, whenever it finished. Only delivery
@@ -351,7 +361,8 @@ now. It takes `window`, `tz`, `repo`, `harness`, `kind` and, on the admin route,
 `user`, with the same validation and errors as Spend. It takes no `split` or
 `breakdown`. Authorization, the owner and admin scopes, admission (its own
 `capacity` slot) and the 8 second budget are as above, and `window=all` on the
-admin all-users scope is the same 400 `window all not available for all users`.
+admin all-users scope is a 400 `window all not available for all users`
+(Capacity is never served from the Spend snapshot).
 The 8 second budget covers the database snapshot only: the Codex vault
 observation runs after it (see [Provider gauges](#provider-gauges)). The
 response carries the same calendar envelope as Spend: `previous_from` and
@@ -736,6 +747,91 @@ through an index and never reads the run message log. No index was added for
 Flow. The measurement write-up is in
 [prds/done/4729-scoped-run-flow-api.md](../prds/done/4729-scoped-run-flow-api.md).
 
+## All-time Spend for all users (snapshot)
+
+Admin all-users `window=all` Spend is too slow to compute inside the 8 second
+request budget (see [Spend performance limit](#spend-performance-limit)), so the
+server builds it in the background and the request only reads the stored result.
+It is controlled by `UZI_ANALYTICS_SNAPSHOT_INTERVAL` (a Go duration, default
+`4h`; see [configuration](configuration.md#server-api)).
+
+- **Setting.** `0` turns the feature off: Options stops listing `all` for the
+  admin all-users scope and Spend answers 400 `window all not available for all
+  users`. Any other value must be a Go duration of at least `1h`; a set-but-empty,
+  whitespace-only, malformed, negative or nonzero value below `1h` aborts boot
+  with `UZI_ANALYTICS_SNAPSHOT_INTERVAL must be 0 (off) or a Go duration of at
+  least 1h`. There is no upper bound, and `24h` is the documented way to build
+  about once a day (builds are not anchored to a time of day). Compose forwards
+  the variable with unset-only expansion: unset gives `4h`, while set-but-empty
+  reaches the API and fails boot.
+- **What is stored.** Spend only, for the admin all-users scope (`user` omitted
+  or `user=all`), `window=all`, `tz=UTC` (an absent `tz` is UTC) and no `repo`,
+  `harness` or `kind` filter. Every `split` and `breakdown` valid there is
+  stored: `split` in `usage_model`, `harness`, `repo`, `kind`, `user` times
+  `breakdown` in `primary_model`, `harness`, `repo`, `kind`, `user`, 25 variants.
+  Each is the exact document the live builder returns at build time, and all
+  variants of one generation share one `generated_at` and one database snapshot.
+  A request with a filter or another timezone is a 400, see
+  [Parameters and errors](#parameters-and-errors).
+- **Serving.** Authentication and the admin check run first, and the request
+  never computes the view live. The response is the stored document's original
+  fields byte-for-byte as built, plus `snapshot`:
+  `{"generated_at": ..., "stale": ...}`. `snapshot.generated_at` is the
+  generation's captured time and equals the document's own `generated_at`.
+  `stale` is true when the snapshot's age is strictly greater than twice the
+  interval. The response carries `Cache-Control: private, no-store`.
+- **Pending.** With no published snapshot (a fresh install, before the first
+  build, or after a deletion) the answer is 503 `analytics snapshot pending,
+  retry later` with `Retry-After: 60`. A read that times out is a 503 with
+  `Retry-After: 1`, as on the live path.
+- **Building.** A sweeper pass, registered before the usage-fold pass, does
+  no database work and only starts the background check, which reads the stored
+  state; at most one background build runs per replica. A build
+  starts only when a variant is missing or the oldest stored variant is at least
+  one interval old. A cross-replica session advisory lock lets one replica build
+  at a time (a replica that finds it busy checks again after a minute). The lock
+  is held on one dedicated database session, so it needs session-level
+  connections: behind a transaction-mode pooler (such as PgBouncer in
+  transaction mode) it does not hold, and two replicas can build at once. A whole
+  build is bounded to 10 minutes and is cancelled on shutdown. After a failed
+  build the next attempt waits a shared backoff, 5 minutes doubling to 1 hour,
+  shared across replicas through the database (if recording the failure itself
+  fails, only the local delay applies). A deletion that races a build discards
+  it, and the retry waits 1 minute doubling to 1 hour. A failed or timed-out
+  build keeps the previous set. If the commit acknowledgement is lost the
+  outcome is unresolved and the next check decides; that check comes after the
+  local failure backoff (5 minutes doubling), not at the next sweeper tick.
+- **Publication.** One transaction replaces the whole set, so a reader sees the
+  previous complete set or the new one, never a mix.
+- **After an upgrade.** If an upgrade changes the Spend document, the previous
+  generation keeps being served until a build publishes successfully. It can
+  stay visible longer than one interval when builds fail or back off.
+- **Deletion.** Deleting a user or a repo (a run goes with its repo, and deleting
+  a forge connection cascades to its repos) removes every stored snapshot
+  document in the same transaction, through deferred triggers at commit, and
+  advances an invalidation counter, so a build whose database snapshot predates the deletion
+  never publishes. This holds whatever the setting is: with it at `0`, a deletion
+  still clears an old generation, so re-enabling cannot expose it. A read already
+  in flight may return the prior document. Only deletions invalidate: renaming a
+  repo or changing a user's email shows in the snapshot from the next build.
+- **For maintainers.** The lock order is source rows, then the state row (at
+  commit), then the snapshot documents. That order holds for row deletes through
+  the deferred triggers; it is not claimed for `TRUNCATE` (its trigger fires
+  immediately), for an explicit `SET CONSTRAINTS ... IMMEDIATE`, or for any
+  future deferred trigger that takes locks of its own. A `REPEATABLE READ` or `SERIALIZABLE`
+  user or repo delete can fail with SQLSTATE `40001` if a publish or failure
+  record committed meanwhile; it fails closed.
+  The invalidation counter moves once per deleting transaction (a marker on the
+  state row stops later firings from updating it again, so a large cascade does
+  not cost one update per row; every firing still clears the documents). The
+  trigger function pins its `search_path` with `pg_temp` last, so a session
+  cannot shadow the state or document tables with temporary tables.
+
+Code: `api/internal/handler/analytics_precomputed.go` (serving, builder),
+`api/internal/analyticsprecompute/scheduler.go` (scheduler),
+`api/internal/store/analytics_precomputed.go` and migration
+`00559_analytics_precomputed_docs.sql` (storage, triggers, lock).
+
 ## Spend performance limit
 
 Measured on a synthetic 120,000-run seed (845,988 usage legs, 200 owners with
@@ -748,19 +844,23 @@ about 20%: owner `30d` about 0.29 s, owner `90d` about 0.51 s):
 | Owner `30d` | about 0.25 s |
 | Owner `90d` | about 0.43 s |
 | Admin all-users `30d` | about 1.3 s |
-| Admin all-users `window=all` (measured, not offered) | about 10 s |
+| Admin all-users `window=all` (measured live; the live path does not compute it) | about 10 s |
 
-**Decision:** admin all-users `window=all` is not offered. Options does not
-list `all` for that scope, and Spend and Reliability answer 400 `window all not
-available for all users` before any analytics database work (authentication runs first). The measured 10 s is over the 8 second
-budget, so the request would otherwise have been a 503. All-time stays
-available for the owner route and for admin `user=<uuid>`; owner `all` Spend
-measured about 1.8 s (statement-level median, custom plan) on the same seed, and
-end-to-end request latency was not measured. Per-run, per-model totals for finished runs now exist (#4700) and make
+**Decision:** the live path never computes admin all-users `window=all`. The
+measured 10 s is over the 8 second budget, so a live request would have been a
+503. Per-run, per-model totals for finished runs now exist (#4700) and make
 admin all-users `7d`, `30d` and `90d` about 36 to 43% faster on the same seed once the backfill is complete (with nothing stored they were up to about 4 to 5% slower). All-time still misses the 8 second
 budget in the steady state, even with every run stored, because the cost is in building the Spend document over every
-run, not in reading the totals. It stays unavailable (owner decision, 2026-11-27); see
-[ADR-4700](../adr/4700-run-usage-model-folds.md).
+run, not in reading the totals. Reliability, Capacity, Quality and Flow therefore
+still answer 400 `window all not available for all users` before any analytics
+database work (authentication runs first). Spend is served from a precomputed
+snapshot instead (owner decision, 2026-11-27, #4771; see
+[All-time Spend for all users](#all-time-spend-for-all-users-snapshot) and
+[ADR-4700](../adr/4700-run-usage-model-folds.md)). All-time stays
+available live for the owner route and for admin `user=<uuid>`; owner `all` Spend
+measured about 1.8 s (statement-level median, custom plan) on the same seed, and
+end-to-end request latency was not measured. The build time of the snapshot is
+reported in the PR for #4771; it is not measured in this page.
 
 **Reliability.** Measured on the same seed generator (120,000 runs, 846,668
 usage legs, 200 owners, 1,250 repos; the #4685 re-seed, not byte-identical to

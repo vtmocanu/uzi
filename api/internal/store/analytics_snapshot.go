@@ -46,28 +46,43 @@ func RunAnalyticsSnapshot(ctx context.Context, beginner AnalyticsBeginner, fn fu
 	dctx, cancel := context.WithTimeout(ctx, AnalyticsSnapshotDeadline)
 	defer cancel()
 
-	tx, err := beginner.BeginTx(dctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	tx, snap, err := beginAnalyticsTx(dctx, beginner, []string{
+		"SET LOCAL statement_timeout = '8s'",
+		// JIT off: the custom plans of the admin-all Spend statement are costed above jit_above_cost
+		// and PostgreSQL then JIT-compiles about 446 functions, 6.4-7.3s per call at 120k runs
+		// (admin 30d: 8.2-8.4s with JIT, 1.3s without). Issue #4684 m5 plan and runtime evidence.
+		"SET LOCAL jit = off",
+	})
+	if tx != nil {
+		defer func() {
+			rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), analyticsRollbackTimeout)
+			defer rcancel()
+			if rerr := tx.Rollback(rctx); rerr != nil && !errors.Is(rerr, pgx.ErrTxClosed) {
+				slog.Debug("analytics snapshot rollback failed", "err", rerr)
+			}
+		}()
+	}
 	if err != nil {
 		return err
 	}
-	defer func() {
-		rctx, rcancel := context.WithTimeout(context.WithoutCancel(ctx), analyticsRollbackTimeout)
-		defer rcancel()
-		if rerr := tx.Rollback(rctx); rerr != nil && !errors.Is(rerr, pgx.ErrTxClosed) {
-			slog.Debug("analytics snapshot rollback failed", "err", rerr)
-		}
-	}()
+	return fn(dctx, snap)
+}
 
-	if _, err := tx.Exec(dctx, "SET LOCAL statement_timeout = '8s'"); err != nil {
-		return err
+// beginAnalyticsTx begins a REPEATABLE READ READ ONLY transaction on beginner, runs each of
+// settings (SET LOCAL statements) on it and returns the handle fn receives. It is shared by
+// RunAnalyticsSnapshot and the precompute session's RunBuild. A begin failure returns a nil tx. A
+// settings failure returns the open tx together with the error: the caller must roll it back.
+func beginAnalyticsTx(ctx context.Context, beginner AnalyticsBeginner, settings []string) (pgx.Tx, *AnalyticsSnapshot, error) {
+	tx, err := beginner.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return nil, nil, err
 	}
-	// JIT off: the custom plans of the admin-all Spend statement are costed above jit_above_cost
-	// and PostgreSQL then JIT-compiles about 446 functions, 6.4-7.3s per call at 120k runs
-	// (admin 30d: 8.2-8.4s with JIT, 1.3s without). Issue #4684 m5 plan and runtime evidence.
-	if _, err := tx.Exec(dctx, "SET LOCAL jit = off"); err != nil {
-		return err
+	for _, stmt := range settings {
+		if _, err := tx.Exec(ctx, stmt); err != nil {
+			return tx, nil, err
+		}
 	}
-	return fn(dctx, &AnalyticsSnapshot{Q: New(tx), tx: tx})
+	return tx, &AnalyticsSnapshot{Q: New(tx), tx: tx}, nil
 }
 
 // ClassifyAnalyticsErr maps statement-timeout (SQLSTATE 57014), network timeouts and context

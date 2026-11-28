@@ -81,6 +81,23 @@ type AgentTemplateAllocation struct {
 	CreatedAt  pgtype.Timestamptz `json:"created_at"`
 }
 
+type AnalyticsPrecomputedDocRecord struct {
+	Section      string             `json:"section"`
+	VariantKey   string             `json:"variant_key"`
+	GeneratedAt  pgtype.Timestamptz `json:"generated_at"`
+	Invalidation int64              `json:"invalidation"`
+	Document     []byte             `json:"document"`
+}
+
+type AnalyticsPrecomputedState struct {
+	ID              bool               `json:"id"`
+	Invalidation    int64              `json:"invalidation"`
+	Publications    int64              `json:"publications"`
+	FailureCount    int32              `json:"failure_count"`
+	LastFailureAt   pgtype.Timestamptz `json:"last_failure_at"`
+	InvalidatedXact pgtype.Uint64      `json:"invalidated_xact"`
+}
+
 type AnthropicRateLimit struct {
 	UserSecretID     uuid.UUID          `json:"user_secret_id"`
 	UserID           uuid.UUID          `json:"user_id"`

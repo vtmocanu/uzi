@@ -24,6 +24,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vtmocanu/uzi/api/internal/agentsource"
+	"github.com/vtmocanu/uzi/api/internal/analyticsprecompute"
 	"github.com/vtmocanu/uzi/api/internal/anthropic"
 	"github.com/vtmocanu/uzi/api/internal/codexauth"
 	"github.com/vtmocanu/uzi/api/internal/codexusagepoller"
@@ -891,7 +892,7 @@ func run() error {
 	// History retention (issue #4695): off unless UZI_HISTORY_RETENTION is set (24h or more).
 	historyRetention := historyretention.New(pool, cfg.HistoryRetention)
 
-	sweep := sweeper.New(wsvc, cfg.SweepInterval,
+	sweepPasses := []sweeper.Pass{
 		sweeper.Pass{
 			Name: "vault_browser_slots_expired",
 			Run: func(ctx context.Context) (int64, error) {
@@ -1129,7 +1130,25 @@ func run() error {
 		// can still delay that sweep: by its 5 s parent deadline plus a detached cleanup rollback
 		// that runs after it (at most 2 s, store.usageFolderRollbackTimeout), so about 7 s.
 		usageFoldPass,
-	)
+	}
+	// Stored analytics documents (issue #4771): inserted immediately before the last pass, so the
+	// usage fold pass stays last. The pass only schedules a background build and returns at once, so
+	// it delays no other pass. Nothing is constructed or registered when the setting is 0.
+	var analyticsPrecompute *analyticsprecompute.Scheduler
+	sweepPasses, analyticsPrecompute = wireAnalyticsPrecompute(ctx, pool, cfg.AnalyticsSnapshotInterval, sweepPasses)
+	if analyticsPrecompute != nil {
+		// Registered after the deferred pool.Close, so it runs first (LIFO) on every return, the
+		// early startup-error returns (TLS setup, listener bind) included. It cancels the process
+		// context and joins any running build before the pool closes; Stop also makes later
+		// Pass calls launch nothing. A Pass that raced the cancel and started a build before Stop
+		// ran is still joined here, and that build fails fast on the cancelled context.
+		// The calls are idempotent; the normal shutdown path below repeats them in its own order.
+		defer func() {
+			stop()
+			analyticsPrecompute.Stop()
+		}()
+	}
+	sweep := sweeper.New(wsvc, cfg.SweepInterval, sweepPasses...)
 	// Admin-health loop-beat: the run-liveness sweeper is one of the four loops (PRD #1484
 	// M2). Registered before Boot so the loops check has its baseline from api start.
 	sweep.SetBeat(func() { healthBeats.Beat("sweeper") })
@@ -1862,6 +1881,11 @@ func run() error {
 	}
 	stop() // cancel ctx so the poller + sweeper + reconciler Run return (covers the server-error path too)
 	bgWG.Wait()
+	// bgWG joined the sweeper, so no pass starts a new analytics build; ctx is cancelled, which
+	// cancels a running one. Join it before the deferred pool.Close.
+	if analyticsPrecompute != nil {
+		analyticsPrecompute.Stop()
+	}
 	// The HTTP server has drained, so no new inline Notify can be fired; wait for
 	// any in-flight ones to finish before the deferred pool.Close so they don't
 	// race a closing pool.
