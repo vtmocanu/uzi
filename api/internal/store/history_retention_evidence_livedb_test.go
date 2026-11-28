@@ -70,11 +70,12 @@ import (
 //	UZI_EVIDENCE_SMOKE_SECONDS         smoke length (default 300)
 //	UZI_EVIDENCE_COLD_TABLE / _CASE / _SETUP / _SETUP_ID / _LABEL   see ColdEvidenceLiveDB
 //
-// Labels. Every record that supports a claim carries coverage_reasons (settings that narrow the run
+// Labels. The compressed, smoke and preflight records carry coverage_reasons (settings that narrow the run
 // below the evidence fixture: fewer tables, candidates or rows, a changed arrival rate or codex
 // variant, autovacuum off, a short or non-btree smoke) and run_reasons (what this run itself
 // observed: short or failed ticks, a wall-clock or error stop, a residual backlog, a probe error).
-// Only a record with both lists empty is qualifying.
+// Only a record with both lists empty is qualifying. Warm and cold records are unlabelled
+// measurements; a cold record is bound to its setup instead.
 //
 // Measurements use the production session (store.OpenHistoryRetentionSession, DeleteBatch, a fresh
 // connection per tick, 300 ms statement timeout and 200 ms lock timeout). Run without -race.
@@ -346,6 +347,9 @@ func newHeFx(t *testing.T, admin bool) *heFx {
 		fx.codex = "max"
 	}
 	if fx.tables, fx.cands, err = heParseSelectors(); err != nil {
+		t.Fatal(err)
+	}
+	if err := heCheckPRArrivals(fx.prArrivals()); err != nil {
 		t.Fatal(err)
 	}
 	if admin {
@@ -716,6 +720,15 @@ func heRequiredTicks(s heSpec, offFrac float64, mode string, arrivals int) (int,
 
 func (fx *heFx) specFor(table store.HistoryRetentionTable, arrivals int, start time.Time) heSpec {
 	return heSpec{table: table, n: heRows(), arrivals: arrivals, start: start}
+}
+
+// heCheckPRArrivals bounds UZI_EVIDENCE_PR_ARRIVALS: below 1 divides by zero in heSpec.stepUS, and a
+// batch cannot outpace heMaxBatch or more arrivals per tick.
+func heCheckPRArrivals(n int) error {
+	if n < 1 || n >= int(heMaxBatch) {
+		return fmt.Errorf("UZI_EVIDENCE_PR_ARRIVALS=%d outside [1, %d]", n, heMaxBatch-1)
+	}
+	return nil
 }
 
 func (fx *heFx) prArrivals() int { return heEnvInt("UZI_EVIDENCE_PR_ARRIVALS", heDefaultPRArrivals) }
@@ -1296,7 +1309,7 @@ func TestHistoryRetentionSeedEvidenceLiveDB(t *testing.T) {
 
 // TestHistoryRetentionWarmEvidenceLiveDB runs cases (c), (a) and (b) for every selected
 // table and candidate index. Each (table, candidate) starts from a freshly seeded fixture, and every
-// committing case, (a) and (b), is preceded by its own reseed and ANALYZE because it deletes
+// committing case, (a) and (b), is preceded by its own reseed (which ends in VACUUM (ANALYZE)) because it deletes
 // committed rows; the seed time each case started from is its seed_seconds.
 func TestHistoryRetentionWarmEvidenceLiveDB(t *testing.T) {
 	fx := newHeFx(t, true)
@@ -1312,7 +1325,6 @@ func TestHistoryRetentionWarmEvidenceLiveDB(t *testing.T) {
 				caseSeed := seedD
 				if c.commit {
 					caseSeed = fx.reseed(spec)
-					fx.exec(`ANALYZE ` + string(table))
 				}
 				fx.runCase(spec, cand, c, caseSeed)
 			}
@@ -1450,8 +1462,8 @@ func heRunReasons(f heRunFacts) []string {
 			r = append(r, fmt.Sprintf("%d %s", c.n, c.what))
 		}
 	}
-	if f.Residual > 0 {
-		r = append(r, fmt.Sprintf("residual backlog of %d eligible rows at the probe cutoff", f.Residual))
+	if _, reason := heNearEmptyGate(f.Residual); reason != "" {
+		r = append(r, reason)
 	}
 	if f.NoopDeleted > 0 {
 		r = append(r, fmt.Sprintf("near-empty probes deleted %d rows", f.NoopDeleted))
@@ -1523,7 +1535,9 @@ func (fx *heFx) tableStats(table store.HistoryRetentionTable) map[string]any {
 // TestHistoryRetentionCompressedEvidenceLiveDB runs the compressed-time drain over the selected
 // tables together, one candidate profile at a time (the same candidate on every selected table).
 // Mode backlog starts with a 90% backlog (case b); mode churn starts with a 5% backlog and then
-// keeps arrivals and expiries in step for 1.1 retention windows (case d). Arrivals per 15 s tick:
+// keeps arrivals and expiries in step for heRequiredTicks ticks (158,334 for pr_history_events at the
+// defaults), so an all-table churn run at the default UZI_EVIDENCE_MAX_MINUTES=20 is wall-capped and
+// non-qualifying: raise the cap and/or narrow the tables. Arrivals per 15 s tick:
 // 250 per sample table and UZI_EVIDENCE_PR_ARRIVALS (default 6) for pr_history_events. The cutoff
 // advances 15 s per tick. Default autovacuum runs and no manual VACUUM is issued during the run.
 // The tick budget defaults to the most any selected table needs (heRequiredTicks); a run whose
@@ -1743,6 +1757,15 @@ type heProbe struct {
 	NoopDeleted int64
 }
 
+// heNearEmptyGate decides whether the near-empty probes may run: only on a drained table. The reason
+// is the run reason a residual backlog adds.
+func heNearEmptyGate(residual int64) (runProbes bool, reason string) {
+	if residual > 0 {
+		return false, fmt.Sprintf("residual backlog of %d eligible rows at the probe cutoff", residual)
+	}
+	return true, ""
+}
+
 // nearEmptyProbe counts the rows still eligible at the cutoff of the last tick (everything below it
 // should be gone). With any left no near-empty probe runs: a probe that deletes is not near-empty.
 func (fx *heFx) nearEmptyProbe(mode, cand string, table store.HistoryRetentionTable, r *heTabRun, done int) heProbe {
@@ -1751,17 +1774,18 @@ func (fx *heFx) nearEmptyProbe(mode, cand string, table store.HistoryRetentionTa
 	var p heProbe
 	p.Residual = fx.one(`SELECT count(*) FROM `+string(table)+` WHERE `+heEligibleWhere(table), cut)
 	kv := map[string]any{"table": fx.tableLabel(table), "cand": cand, "mode": mode, "residual_backlog": p.Residual}
-	if p.Residual > 0 {
+	if runProbes, _ := heNearEmptyGate(p.Residual); !runProbes {
 		kv["near_empty_valid"] = false
 	} else {
 		p.Valid = true
 		kv["near_empty_valid"] = true
 		x, err := fx.explainE(table, cut, heMaxBatch)
 		if err != nil {
-			fx.t.Fatalf("near-empty probe explain %s: %v", table, err)
-		}
-		for a, b := range x.kv() {
-			kv[a] = b
+			p.Errors = append(p.Errors, "explain: "+err.Error())
+		} else {
+			for a, b := range x.kv() {
+				kv[a] = b
+			}
 		}
 		var del []float64
 		for i := 0; i < 5; i++ {
@@ -1902,6 +1926,38 @@ func (heStubSweeper) Sweep(context.Context) (workersvc.SweepResult, error) {
 	return workersvc.SweepResult{}, nil
 }
 
+// heSmokeFacts is what a smoke run observed about itself.
+type heSmokeFacts struct {
+	GatePass     bool
+	TickErrors   int
+	UnknownLines int
+	TimeoutLines int
+	Ticks        int
+	Seconds      int // the configured smoke length
+}
+
+// heSmokeRunReasons lists everything that makes a smoke run non-qualifying: a failed gate, any pass
+// error, any unknown-outcome or repeated-timeout log line, and fewer ticks than the configured length
+// allows (one per 15 s, less one for the engine's start edge).
+func heSmokeRunReasons(f heSmokeFacts) []string {
+	r := []string{}
+	if !f.GatePass {
+		r = append(r, "smoke gate failed")
+	}
+	for _, c := range []struct {
+		n    int
+		what string
+	}{{f.TickErrors, "tick errors"}, {f.UnknownLines, "unknown delete outcome log lines"}, {f.TimeoutLines, "repeated statement timeout log lines"}} {
+		if c.n > 0 {
+			r = append(r, fmt.Sprintf("%d %s", c.n, c.what))
+		}
+	}
+	if floor := f.Seconds/int(heTick/time.Second) - 1; f.Ticks < floor {
+		r = append(r, fmt.Sprintf("ticks observed %d below the floor of %d", f.Ticks, floor))
+	}
+	return r
+}
+
 // TestHistoryRetentionSmokeEvidenceLiveDB runs the production historyretention.Pass under a real
 // sweeper.Engine (stub Sweeper, a timing decorator around the unchanged Pass) at the production
 // 15 s interval, driving Run only, retention 24h, on the 1M-row fixture with the chosen indexes.
@@ -2013,10 +2069,8 @@ func TestHistoryRetentionSmokeEvidenceLiveDB(t *testing.T) {
 	kv["indexes"] = fmt.Sprint(idx)
 	kv["server_version"] = fx.serverVersion()
 	coverage := fx.coverageReasons(true, idx)
-	run := []string{}
-	if !pass2 {
-		run = append(run, "smoke gate failed")
-	}
+	run := heSmokeRunReasons(heSmokeFacts{GatePass: pass2, TickErrors: len(errTicks), Ticks: len(recs), Seconds: secs,
+		UnknownLines: strings.Count(logs, "unknown delete outcome"), TimeoutLines: strings.Count(logs, "repeated statement timeouts")})
 	kv["coverage_reasons"], kv["run_reasons"], kv["qualifying"] = coverage, run, len(coverage) == 0 && len(run) == 0
 	av := map[string]bool{}
 	for _, table := range store.HistoryRetentionTables() {

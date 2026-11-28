@@ -378,3 +378,62 @@ func TestHistoryRetentionEvidenceParseExplain(t *testing.T) {
 		}
 	}
 }
+
+func TestHistoryRetentionEvidenceSmokeRunReasons(t *testing.T) {
+	ok := heSmokeFacts{GatePass: true, Ticks: 20, Seconds: 300}
+	if r := heSmokeRunReasons(ok); len(r) != 0 {
+		t.Fatalf("a clean smoke has reasons %v", r)
+	}
+	for name, f := range map[string]heSmokeFacts{
+		"gate":      {GatePass: false, Ticks: 20, Seconds: 300},
+		"tick err":  {GatePass: true, TickErrors: 1, Ticks: 20, Seconds: 300},
+		"unknown":   {GatePass: true, UnknownLines: 1, Ticks: 20, Seconds: 300},
+		"timeout":   {GatePass: true, TimeoutLines: 1, Ticks: 20, Seconds: 300},
+		"few ticks": {GatePass: true, Ticks: 18, Seconds: 300},
+	} {
+		if r := heSmokeRunReasons(f); len(r) == 0 {
+			t.Fatalf("%s: no run reason", name)
+		}
+	}
+}
+
+func TestHistoryRetentionEvidencePRArrivalsValidator(t *testing.T) {
+	for _, n := range []int{1, 6, 999} {
+		if err := heCheckPRArrivals(n); err != nil {
+			t.Fatalf("%d refused: %v", n, err)
+		}
+	}
+	for _, n := range []int{0, -1, 1000, 5000} {
+		if err := heCheckPRArrivals(n); err == nil {
+			t.Fatalf("%d accepted", n)
+		}
+	}
+}
+
+func TestHistoryRetentionEvidenceNearEmptyGate(t *testing.T) {
+	if run, reason := heNearEmptyGate(0); !run || reason != "" {
+		t.Fatalf("drained table: run=%v reason=%q, want probes and no reason", run, reason)
+	}
+	if run, reason := heNearEmptyGate(1); run || reason == "" {
+		t.Fatalf("residual 1: run=%v reason=%q, want no probes and a reason", run, reason)
+	}
+}
+
+// Names repeated straight into the coverage check (not through the parser) never fill a slot.
+func TestHistoryRetentionEvidenceUnparsedDuplicatesAreCoverageGaps(t *testing.T) {
+	in := heCoverageDefaults()
+	in.cands = []string{"btree", "btree", "brin_on", "brin_off"}
+	in.tables = []store.HistoryRetentionTable{store.HistoryRetentionPRHistoryEvents, store.HistoryRetentionPRHistoryEvents,
+		store.HistoryRetentionAnthropicUsage, store.HistoryRetentionCodexUsage}
+	if r := heCoverageReasons(in, false); len(r) < 2 {
+		t.Fatalf("duplicate candidates and tables gave reasons %v, want both flagged", r)
+	}
+}
+
+// 890000 eligible at 994 per tick is 896 base ticks; 5% of 896 is 44.8, rounded up to 45.
+func TestHistoryRetentionEvidenceRequiredTicksCeilsHeadroom(t *testing.T) {
+	pr := heTestSpec(store.HistoryRetentionPRHistoryEvents, 1_000_000, 6)
+	if got, err := heRequiredTicks(pr, 0.90, "backlog", 6); err != nil || got != 941 {
+		t.Fatalf("PR backlog = %d, %v; want 941", got, err)
+	}
+}
