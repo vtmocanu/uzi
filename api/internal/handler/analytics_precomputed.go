@@ -104,7 +104,7 @@ func (h *Handler) serveAllTimeSpend(w http.ResponseWriter, r *http.Request, req 
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	body := make([]byte, 0, len(trimmed)+len(meta)+16)
+	var body []byte
 	body = append(body, trimmed[:len(trimmed)-1]...)
 	body = append(body, `,"snapshot":`...)
 	body = append(body, meta...)
