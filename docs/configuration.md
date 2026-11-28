@@ -1309,6 +1309,69 @@ CI-watch artifact inputs reuse sealed job-file storage, the per-owner and instan
 
 **Helm.** The chart renders `DB_STORAGE_CAPACITY_BYTES` itself from `database.simple.storage.size` (simple mode) or `postgres.cluster.storage.size` (`database.mode: cnpg`), converting the Kubernetes quantity (`8Gi`, `500M`, `8e9`, a plain byte count) to bytes, rounded up. The render fails for an invalid quantity, a nonpositive one, one above 1 EiB, or when `api.config` also sets the key (a duplicate ConfigMap key). With `database.mode: external` the chart cannot know the size: set `api.config.DB_STORAGE_CAPACITY_BYTES` as a quoted string (`DB_STORAGE_CAPACITY_BYTES: "107374182400"`); an unquoted number is parsed by Helm as a float and renders as `1.073741824e+11`, which the api rejects (`db.size` reads `na`, with only a boot warning). In simple mode the PVC comes from a StatefulSet volume claim template, so the rendered capacity is the size at creation; after expanding the PVC by hand follow the steps in the comment above `database.simple.storage.size` in `deploy/chart/values.yaml`. `task render:db-capacity-check` asserts the rendering offline (needs `helm` and `yq`; CI runs it through `task render:openshift-check`). Docker Compose: `docker-compose.yml` does not pass the variable through, so `db.size` reads `na` until you add `DB_STORAGE_CAPACITY_BYTES` to the api service's `environment`, set to the size you want to budget for the `pgdata` volume.
 
+## History retention (issue #4695)
+
+uzi records three kinds of analytics history that nothing deletes by age by default: [PR merge and close history](pr-history.md), [provider usage history](provider-usage-history.md) (Anthropic and Codex) and [worker capacity samples](worker-capacity-samples.md). Age-based expiry is opt-in.
+
+| Var | Default | Notes |
+|---|---|---|
+| `UZI_HISTORY_RETENTION` | *(unset, off)* | A Go duration (`720h`; there is no `d` unit, so 30 days is `720h`). Unset, empty, `0` and `0s` all mean off: nothing is deleted and the pass does no database work. The minimum is `24h`; there is no maximum. A negative, shorter-than-`24h` or malformed value **aborts boot** with an error naming the setting (`parseHistoryRetention` in `api/internal/config/config.go`). uzi suggests no age: choose one that matches how long you need the history. |
+
+**Helm.** There is no first-class chart value. Set it in the freeform `api.config` map, as for the other settings in this file, for example `api.config.UZI_HISTORY_RETENTION: "720h"`.
+
+### What is deleted
+
+The `history_retention` sweeper pass (`api/internal/historyretention/retention.go`) deletes ordinary history older than `statement_timestamp() - UZI_HISTORY_RETENTION`, a cutoff read from the database clock:
+
+| Table | Expiry column | Rows never deleted |
+|---|---|---|
+| `pr_history_events` | `observed_at` | `first_merge` events |
+| `anthropic_usage_samples` | `bucket_start` | none |
+| `codex_usage_samples` | `bucket_start` | none |
+| `worker_capacity_samples` | `bucket_start` | none |
+
+`pr_history_heads` is never touched. The protected records (`pr_history_heads` and `first_merge` events) keep the existing repository cascade, and the owner and repository cascades are unchanged by this setting.
+
+**Deletes are irreversible.** A database backup taken before you enable it is the only recovery.
+
+### Growth, to size an age
+
+Measured on PostgreSQL 17 with synthetic data; they are figures to size from, not predictions for your workload.
+
+- PR history: about 223 B per `pr_history_events` row and about 206 B per `pr_history_heads` row (10,000 PRs, 3 events each). Heads grow by one per PR uzi records (any state); kept `first_merge` events grow by one per merged PR.
+- Anthropic usage: about 22.9 MB per identity-year.
+- Codex usage: about 70 MB per typical identity-year and 224 MB for the largest measured; a less compressible admissible sample takes more still.
+- Worker capacity: about 22 MiB per worker-year (218 B per row).
+
+The per-profile tables are in [provider usage history](provider-usage-history.md#growth) and [worker capacity samples](worker-capacity-samples.md#growth).
+
+### Cost per tick and how a backlog drains
+
+- Each sweeper tick spends at most a 2 s client budget. A cross-replica session advisory try-lock lets a second replica skip the tick.
+- Each tick deletes at most 1000 rows per table, oldest first, and the starting table rotates between ticks.
+- Each batch runs with a 300 ms statement timeout and a 200 ms lock timeout. On a statement timeout the table's batch halves (floor 50 rows) and grows back after a success. After 5 consecutive timeouts on a table, a warning names it.
+- A table whose 50-row batch still exceeds 300 ms makes no progress, and the warning names it.
+- The first enable drains at most 1000 rows per table per tick. With full batches, that outpaces the stated sample workload of about 1000 rows per minute per table only while `SWEEP_INTERVAL` (default `15s`) is under 60 s. That is a theoretical ceiling: actual drain depends on the cadence, the committed batch sizes and failed ticks.
+
+Measured (PostgreSQL 17, 1M-row synthetic fixtures, compressed time; one workload, so indications only): with the shipped indexes there were no statement timeouts in a backlog drain or a churn run on any of the four tables. In a 5-minute real-engine smoke (about 30,000 to 35,000 expired rows per table on the 1M-row fixtures, no writer) the slowest tick took 35 ms and 20,000 rows were deleted per table in 20 ticks. A cold first batch on one table took under 16 ms including open and close (the delete statement under 14 ms); "cold" there means emptied PostgreSQL buffers, not an emptied host cache. PostgreSQL 16 was not measured.
+
+### Indexes and the boot-time build
+
+Migrations 00555 to 00558 add four btree indexes: `pr_history_events (observed_at) WHERE NOT first_merge`, and one on `bucket_start` for each of the three sample tables. They are built with `CREATE INDEX CONCURRENTLY` at boot, one non-transactional migration each, and they are built and maintained **even while retention is off**. The migration comments carry the measurements behind the choice of btree over BRIN.
+
+- **Do not drop them.** Without a valid index each batch sorts every expired row and will likely hit the statement timeout.
+- **The build can be slow.** `CREATE INDEX CONCURRENTLY` waits for transactions that modified the table before each of its two scans, then for every transaction holding an older snapshot, and the four builds run back to back. While one runs it blocks VACUUM and autovacuum on that table, and the index's write-ahead log is shipped to replicas.
+- **The API is down during the build anyway** (the chart's api Deployment uses `Recreate`), so the upgrade is not zero-downtime.
+- **A slow or blocked build can crash-loop the API.** The chart's `startupProbe` allows 300 s (`periodSeconds: 5` times `failureThreshold: 60` in `deploy/chart/values.yaml`); the kubelet kills a pod that is still migrating after that. On large tables, or with long-running database clients, raise `api.startupProbe.failureThreshold` for the upgrade.
+- **Building the index by hand first does not help.** The migration drops and rebuilds a same-named index that no migration recorded.
+- **Recovery** from an interrupted build is to restart the API: the migration is re-run from its `DROP INDEX`.
+- **Exactly one migrating API process per database**, on every deployment path. The migration relies on a single migrator, and two at once can drop each other's build. For the chart that means `api.replicaCount: 1` during the upgrade, which the chart does not enforce; for Docker Compose, one stack per database.
+- **Direct database connection.** The retention pass holds one pinned connection for its session advisory lock, so a direct connection to PostgreSQL is assumed, with no transaction-mode pooler between the API and the database.
+
+### Long-held snapshots slow retention
+
+Long-running or idle-in-transaction sessions, `pg_dump`, and lagging replicas with `hot_standby_feedback` on hold back vacuum and slow every batch, and can make it time out until they end. Retention then resumes by itself.
+
 ## Run-usage history refold (PRD #1079)
 
 Each Claude Agent SDK `query()` call reports only its own leg's cost, not a session
