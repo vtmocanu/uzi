@@ -24,6 +24,7 @@ import {
   mockBlockedRepoMeta,
   mockConnection,
   mockForgeConfig,
+  forgeTokenScenario,
   issueTrackerScenario,
   mockLinkableRepo,
   mockForgeBoard,
@@ -91,6 +92,16 @@ connections = [
     bot_username: "uzi-bot-gh",
   },
 ];
+// #4817: a forge-token-* scenario seeds an expired / expiring / unverified token on the
+// GitHub connection (conn-1 stays healthy) so the owner banner is reachable in the demo.
+const tokenScenarioReport = forgeTokenScenario(mockScenario(), Date.now());
+if (tokenScenarioReport) {
+  connections = connections.map((c) =>
+    c.id === "conn-gh"
+      ? { ...c, privilege_report: tokenScenarioReport, privilege_status: tokenScenarioReport.status }
+      : c,
+  );
+}
 repos = [
   ...repos,
   {
