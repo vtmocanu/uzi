@@ -65,10 +65,12 @@ bill. Capacity reports no dollars.
 - Spend on the admin all-users scope with `window=all` and the setting on is
   answered from the snapshot, only unfiltered and in UTC: a valid `repo`,
   `harness` or `kind` filter, or a `tz` other than the literal `UTC`, is a 400
-  `all-time view across all users is only available unfiltered in UTC`. Invalid
-  values keep their own 400 first (`tz=Local` is `invalid tz`, a malformed repo
-  is `invalid repo`), and `split` and `breakdown` are validated after these
-  checks. See [All-time Spend for all users](#all-time-spend-for-all-users-snapshot).
+  `all-time view across all users is only available unfiltered in UTC`. Values
+  rejected before any database work keep their own 400 first (`tz=Local` and
+  names over 64 characters are `invalid tz`, a malformed repo UUID is
+  `invalid repo`). Timezone names and repos that pass that syntax check are not
+  checked against the database on this path, so they get the unfiltered-in-UTC
+  400. `split` and `breakdown` are validated after these checks. See [All-time Spend for all users](#all-time-spend-for-all-users-snapshot).
 - Repeated and empty parameters are invalid (`invalid <name>`). An unknown
   parameter is a 400 `unknown parameter`. A query string that does not parse
   (a bad percent-encoding or a `;`) is a 400 `invalid query`; it is never
@@ -782,8 +784,9 @@ It is controlled by `UZI_ANALYTICS_SNAPSHOT_INTERVAL` (a Go duration, default
   build, or after a deletion) the answer is 503 `analytics snapshot pending,
   retry later` with `Retry-After: 60`. A read that times out is a 503 with
   `Retry-After: 1`, as on the live path.
-- **Building.** A sweeper pass, registered before the usage-fold pass, only
-  checks and returns; at most one background build runs per replica. A build
+- **Building.** A sweeper pass, registered before the usage-fold pass, does
+  no database work and only starts the background check, which reads the stored
+  state; at most one background build runs per replica. A build
   starts only when a variant is missing or the oldest stored variant is at least
   one interval old. A cross-replica session advisory lock lets one replica build
   at a time (a replica that finds it busy checks again after a minute). A whole
@@ -793,7 +796,8 @@ It is controlled by `UZI_ANALYTICS_SNAPSHOT_INTERVAL` (a Go duration, default
   fails, only the local delay applies). A deletion that races a build discards
   it, and the retry waits 1 minute doubling to 1 hour. A failed or timed-out
   build keeps the previous set. If the commit acknowledgement is lost the
-  outcome is unresolved and the next check decides.
+  outcome is unresolved and the next check decides; that check comes after the
+  local failure backoff (5 minutes doubling), not at the next sweeper tick.
 - **Publication.** One transaction replaces the whole set, so a reader sees the
   previous complete set or the new one, never a mix.
 - **After an upgrade.** If an upgrade changes the Spend document, the previous
@@ -802,7 +806,7 @@ It is controlled by `UZI_ANALYTICS_SNAPSHOT_INTERVAL` (a Go duration, default
 - **Deletion.** Deleting a user or a repo (a run goes with its repo, and deleting
   a forge connection cascades to its repos) removes every stored snapshot
   document in the same transaction, through deferred triggers at commit, and
-  advances an invalidation counter, so a build that started before the deletion
+  advances an invalidation counter, so a build whose database snapshot predates the deletion
   never publishes. This holds whatever the setting is: with it at `0`, a deletion
   still clears an old generation, so re-enabling cannot expose it. A read already
   in flight may return the prior document. Only deletions invalidate: renaming a
@@ -829,7 +833,7 @@ about 20%: owner `30d` about 0.29 s, owner `90d` about 0.51 s):
 | Owner `30d` | about 0.25 s |
 | Owner `90d` | about 0.43 s |
 | Admin all-users `30d` | about 1.3 s |
-| Admin all-users `window=all` (measured, not offered) | about 10 s |
+| Admin all-users `window=all` (measured live; the live path does not compute it) | about 10 s |
 
 **Decision:** the live path never computes admin all-users `window=all`. The
 measured 10 s is over the 8 second budget, so a live request would have been a
