@@ -29,6 +29,8 @@ import (
 // The SQL is parsed with lexSQL (sql_lexer_test.go): comments, strings, quoted identifiers and
 // dollar quotes are lexed away before any keyword is looked for. A DELETE of run_usage must also be
 // scoped to the locked run (a top-level AND conjunct run_id = <the lock argument>, no top-level OR).
+// An alias hides the table name, so after ONLY (run_usage) or a quoted alias (with or without AS)
+// only <alias>.run_id qualifies; the ONLY-paren and quoted-alias forms are covered.
 //
 // Recorded limits (not detected): dynamic SQL built and run through EXECUTE format(...); COPY
 // run_usage FROM; U&"..." identifiers; functions defined at or below migration 00549; the scope of
@@ -71,7 +73,10 @@ var (
 	usageMainKwRE     = regexp.MustCompile(`(?i)^(?:INSERT|DELETE|UPDATE|MERGE|SELECT|TRUNCATE)\b`)
 	usageLockArgRE    = regexp.MustCompile(`^(?:\$\d+|@\w+|sqlc\.n?arg\(\w+\))$`)
 	usageLockExistsRE = regexp.MustCompile(`(?is)^\s*EXISTS\s*\(\s*SELECT\b.*\bFROM\s+lk\b.*\)\s*$`)
-	usageAliasRE      = regexp.MustCompile(`(?is)^\s*\*?\s*(?:AS\s+)?([A-Za-z_]\w*)`)
+	// The alias after the target: an optional closing ")" (ONLY (t)) and "*", an optional AS, then a
+	// bare word or a quoted identifier (group 1; its interior is x-filled in the mask).
+	usageAliasRE     = regexp.MustCompile(`(?is)^\s*\)?\s*\*?\s*(?:AS\s+)?([A-Za-z_]\w*|"[^"]*")`)
+	usageAliasSkipRE = regexp.MustCompile(`^\s*\)?\s*\*?`)
 )
 
 // usageWrite is one run_usage writer found in a statement: its span in the statement, and its
@@ -239,12 +244,16 @@ func deleteScopeReason(norm, mask string, w usageWrite, arg string) string {
 	quals := []string{`run_usage`, `"run_usage"`}
 	// An alias hides the table name (PostgreSQL), so with one only <alias>.run_id qualifies; a
 	// run_usage.run_id would resolve to some USING item.
-	if m := usageAliasRE.FindStringSubmatch(mask[w.end:]); m != nil {
-		switch strings.ToUpper(m[1]) {
+	// The alias is read from the mask (quote interiors filled) and its text taken from norm.
+	tail := mask[w.end:]
+	if m := usageAliasRE.FindStringSubmatchIndex(tail); m != nil {
+		switch strings.ToUpper(tail[m[2]:m[3]]) {
 		case "WHERE", "USING", "RETURNING":
 		default:
-			quals = []string{regexp.QuoteMeta(m[1])}
+			quals = []string{regexp.QuoteMeta(norm[w.end+m[2] : w.end+m[3]])}
 		}
+	} else if rest := strings.TrimSpace(usageAliasSkipRE.ReplaceAllString(tail, "")); rest != "" && rest[0] != ';' {
+		return "DELETE target is followed by something other than an alias, WHERE, USING or RETURNING"
 	}
 	q := `(?:(?:` + strings.Join(quals, "|") + `)\s*\.\s*)?run_id`
 	a := regexp.QuoteMeta(arg)
@@ -357,7 +366,7 @@ func writesRunUsage(s string) bool {
 }
 
 func TestWritesRunUsageGoLiterals(t *testing.T) {
-	for _, s := range []string{"'; DELETE FROM run_usage; --'", "x' DELETE FROM run_usage '", "DELETE FROM /* c */ run_usage WHERE x", "DELETE FROM run_usage /*", "DELETE\vFROM\vrun_usage\vWHERE x", "TRUNCATE run_usage\v;", "WITH d AS (DELETE FROM run_usage) SELECT 1", "DELETE FROM ONLY (run_usage)"} {
+	for _, s := range []string{"'; DELETE FROM run_usage; --'", "x' DELETE FROM run_usage '", "DELETE FROM /* c */ run_usage WHERE x", "DELETE FROM run_usage /*", "DELETE\vFROM\vrun_usage\vWHERE x", "TRUNCATE run_usage\v;", "WITH d AS (DELETE FROM run_usage) SELECT 1", "DELETE FROM ONLY (run_usage)", "x' DELETE\vFROM\vrun_usage '"} {
 		if !writesRunUsage(s) {
 			t.Errorf("writesRunUsage(%q) = false, want true", s)
 		}
@@ -383,6 +392,10 @@ func TestRunUsageWriterClassifier(t *testing.T) {
 		"WITH lk AS (SELECT fn_run_usage_fold_lock($1) AS ok) DELETE FROM public.\"run_usage\" WHERE run_id = $1 AND EXISTS (SELECT 1 FROM lk WHERE lk.ok)",
 		"WITH lk AS (SELECT fn_run_usage_fold_lock($1) AS ok) DELETE FROM run_usage AS ru WHERE $1 = ru.run_id AND EXISTS (SELECT 1 FROM lk WHERE lk.ok) RETURNING 1",
 		"WITH lk AS (SELECT fn_run_usage_fold_lock(sqlc.arg(run_id)) AS ok) DELETE FROM run_usage WHERE run_usage.run_id = sqlc.arg(run_id) AND x BETWEEN 1 AND 2 AND EXISTS (SELECT 1 FROM lk WHERE lk.ok OR true)",
+		// Aliases after ONLY (...) and quoted aliases qualify through the alias.
+		"WITH lk AS (SELECT fn_run_usage_fold_lock($1) AS ok) DELETE FROM ONLY (run_usage) ru WHERE ru.run_id = $1 AND EXISTS (SELECT 1 FROM lk)",
+		"WITH lk AS (SELECT fn_run_usage_fold_lock($1) AS ok) DELETE FROM run_usage \"ru\" WHERE \"ru\".run_id = $1 AND EXISTS (SELECT 1 FROM lk)",
+		"WITH lk AS (SELECT fn_run_usage_fold_lock($1) AS ok) DELETE FROM run_usage AS \"ru\" WHERE \"ru\".run_id = $1 AND EXISTS (SELECT 1 FROM lk)",
 		// Not run_usage, quoted or qualified or not.
 		"DELETE FROM run_usage_fold_state WHERE x",
 		"DELETE FROM \"run_usage_model_folds\" WHERE x",
@@ -483,6 +496,8 @@ func TestRunUsageWriterClassifier(t *testing.T) {
 		{"WITH lk AS (SELECT fn_run_usage_fold_lock(@id) AS ok) SELECT 1 FROM lk; DELETE FROM run_usage", "not the single run_usage writer"},
 		// Lexer-level hiding.
 		{"SELECT E'a'\n'\\' /* ';\nDELETE FROM run_usage;\nSELECT ' */ '", "no WITH clause"},
+		// A vertical tab inside the whitespace that continues an E string keeps the E mode.
+		{"SELECT E'a'\v\n'\\' /* ';\nDELETE FROM run_usage;\nSELECT ' */ '", "no WITH clause"},
 		{"SELECT 1 -- x\rDELETE FROM run_usage WHERE run_id = $1", "no WITH clause"},
 		// Adjacent quotes: no whitespace before a quoted target.
 		{"DELETE FROM\"run_usage\" WHERE run_id = $1", "no WITH clause"},
@@ -505,6 +520,13 @@ func TestRunUsageWriterClassifier(t *testing.T) {
 		{lk1 + "DELETE FROM run_usage WHERE run_id = $1::uuid AND" + lkOK, "lacks a run_id"},
 		// An alias hides the table name: run_usage.run_id resolves to the USING item.
 		{lk1 + "DELETE FROM run_usage AS ru USING other AS run_usage WHERE run_usage.run_id = $1 AND" + lkOK, "lacks a run_id"},
+		// The alias is found past ONLY (...)'s closing paren, and as a quoted identifier.
+		{lk1 + "DELETE FROM ONLY (run_usage) AS ru USING other AS run_usage WHERE run_usage.run_id = $1 AND" + lkOK, "lacks a run_id"},
+		{lk1 + "DELETE FROM ONLY (run_usage) ru USING other AS run_usage WHERE run_usage.run_id = $1 AND" + lkOK, "lacks a run_id"},
+		{lk1 + "DELETE FROM run_usage \"ru\" USING other AS run_usage WHERE run_usage.run_id = $1 AND" + lkOK, "lacks a run_id"},
+		{lk1 + "DELETE FROM run_usage AS \"ru\" USING other AS run_usage WHERE run_usage.run_id = $1 AND" + lkOK, "lacks a run_id"},
+		// Fail closed on a token after the target that is not an alias or a clause keyword.
+		{lk1 + "DELETE FROM run_usage (a) WHERE run_id = $1 AND" + lkOK, "something other than an alias"},
 	}
 	for _, c := range reasons {
 		norm, mask, err := lexSQL(c.sql)

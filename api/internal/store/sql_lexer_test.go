@@ -34,7 +34,7 @@ import (
 //
 // Not handled (recorded limits of the guard built on this lexer): dynamic SQL assembled and run
 // through EXECUTE format(...); COPY run_usage FROM; U&"..." / U&'...' escapes; function bodies
-// defined at or below migration 00549, which the migration scan skips; and TRUNCATE ... CASCADE,
+// defined at or below migration 00549, which the migration scan skips; TRUNCATE ... CASCADE,
 // which empties run_usage through its foreign key (migration 00062) without naming it; and a
 // function or DO body given as a single-quoted string (AS 'DELETE FROM run_usage'), which is lexed
 // as a string.
