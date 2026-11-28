@@ -476,6 +476,18 @@ Full `test:api`, `test:web`, `test:web-browser`, `gate:repo`, `scan:secrets` and
 - **D28. M2 dispatch and merge gating (lead and buddy, delegated by the owner, 2026-11-28).**
   - Q1: M2 dispatches now; its merge waits until #4770's M1 section passes, since M2 opens the spending path.
   - Q2: one gated run with the internal order. The authority change is coupled, and a split adds a temporary refusal arm and a review round. The fallback split recorded under M2 applies only if the plan exceeds the owner's budget.
+- **D29. M2 dispatch authorization and the prerequisite review (M2 delivery, 2026-11-28).**
+  - **Authorization:** the owner gave the explicit dispatch go on 2026-11-28, recorded by the maintainer's lead session and stated in the human plan reviewer's instruction. The run uses the approved, filed issue text, and plan approval was the start signal. This one go covers M2 as a whole, as one gated run (D28 Q2), so the internal units m1 to m5 need no further go.
+  - **Prerequisite review** of the landed #4324 and #4505 seams, read-only at `aaaa7123c`:
+    - Pass, with existing tests:
+      - the admin probe (`TestOperatorTestFollowsNoRedirectLiveDB`, `TestOperatorTestCaptureRefusalsLiveDB`);
+      - the M1 acknowledgment (`TestOperatorCreateAndPatchLiveDB`);
+      - redaction at every runner, keyed only on `claim.secrets.provider.credential` (`agent/test/provider-consumer-census.test.ts`);
+      - the exact-key upload gates (`job-outputs-capture.test.ts`, `runner-provider-key-upload-scan.test.ts`), which fail closed on a scanner error;
+      - claimless held recovery (`frozen-held-pinned.test.ts`, `recovery-inventory.test.ts`), which returns `scan_untrusted` with no literals.
+    - **Gap found:** no test showed that the claim fences (`frozenProviderKeyID`, `lockedProviderRefusal`, `assembleProviderBinding`) refuse a non-`user_key` binding as stale without opening it, because the 00481 runs CHECK cannot store such a mode.
+    - **Resolution (owner):** the gap is closed before any production change by `TestNonUserKeyModeIsStaleAtEveryClaimFence` (`api/internal/workersvc/provider_mode_fence_test.go`). With a fully populated binding and a provider-capable worker, all three fences refuse as stale, with no revision lookup, key lookup or key open. A baseline mutation that made `frozenProviderKeyID` accept `operator_key` turned the test red; it is green unmutated.
+    - The unknown-mode case stays green through M2. When m3 enables `operator_key`, the `operator_key` baseline case is replaced by the operator-path tests; coverage is never just deleted.
 - **History.**
   - v1 (re-anchor at `bc0348e1a`): Claude-only mode, the omitted mode CHECK, no endpoint mutation, mode-filtered admin queries, publication scans already shipped, the missing claim-time lock, the threat-model heading, the #4322 wording, the preview anchor.
   - v2 (buddy): D14, D15, D16; the checker-child case handed off.
