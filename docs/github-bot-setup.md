@@ -172,6 +172,8 @@ Write on the target repo.
 
 ## Least privilege: what uzi verifies
 
+Your own token-expiry banner (expired, expiring or unverified) works the same on GitHub; see "Your token-expiry banner" in [GitLab bot setup](./gitlab-bot-setup.md#least-privilege-what-uzi-verifies).
+
 Same posture as [GitLab bot setup](./gitlab-bot-setup.md#least-privilege-what-uzi-verifies),
 mapped onto GitHub's model:
 
