@@ -789,7 +789,10 @@ It is controlled by `UZI_ANALYTICS_SNAPSHOT_INTERVAL` (a Go duration, default
   state; at most one background build runs per replica. A build
   starts only when a variant is missing or the oldest stored variant is at least
   one interval old. A cross-replica session advisory lock lets one replica build
-  at a time (a replica that finds it busy checks again after a minute). A whole
+  at a time (a replica that finds it busy checks again after a minute). The lock
+  is held on one dedicated database session, so it needs session-level
+  connections: behind a transaction-mode pooler (such as PgBouncer in
+  transaction mode) it does not hold, and two replicas can build at once. A whole
   build is bounded to 10 minutes and is cancelled on shutdown. After a failed
   build the next attempt waits a shared backoff, 5 minutes doubling to 1 hour,
   shared across replicas through the database (if recording the failure itself
