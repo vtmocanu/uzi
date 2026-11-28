@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -66,13 +67,14 @@ import (
 // connection per tick, 300 ms statement timeout and 200 ms lock timeout). Run without -race.
 
 const (
-	heDBName      = "hrev"
-	heTick        = 15 * time.Second
-	heStmtTimeout = 300 * time.Millisecond
-	heLockTimeout = 200 * time.Millisecond
-	heMaxBatch    = int32(1000)
-	heSampleArr   = 250
-	heMarker      = "recovery-reset-v1"
+	heDBName            = "hrev"
+	heTick              = 15 * time.Second
+	heStmtTimeout       = 300 * time.Millisecond
+	heLockTimeout       = 200 * time.Millisecond
+	heMaxBatch          = int32(1000)
+	heDefaultPRArrivals = 6
+	heSampleArr         = 250
+	heMarker            = "recovery-reset-v1"
 	// heEvidenceMarker marks only the hrev database this harness created. An ordinary LiveDB
 	// database that happens to be named hrev carries heMarker alone and is refused.
 	heEvidenceMarker = "history-retention-evidence-v1"
@@ -127,12 +129,66 @@ func heEnvInt(name string, def int) int {
 	return def
 }
 
-func heList(name string, def []string) []string {
-	v := strings.TrimSpace(os.Getenv(name))
-	if v == "" {
-		return def
+// heParseList splits a comma list, trims each name, drops repeats (first occurrence wins, order is
+// kept) and refuses a name outside allowed. An empty list selects every allowed name.
+func heParseList(raw string, allowed []string) ([]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return append([]string(nil), allowed...), nil
 	}
-	return strings.Split(v, ",")
+	var out []string
+	seen := map[string]bool{}
+	for _, name := range strings.Split(raw, ",") {
+		name = strings.TrimSpace(name)
+		if !slices.Contains(allowed, name) {
+			return nil, fmt.Errorf("unknown name %q (allowed: %s)", name, strings.Join(allowed, ","))
+		}
+		if !seen[name] {
+			seen[name] = true
+			out = append(out, name)
+		}
+	}
+	return out, nil
+}
+
+// heParseSelection resolves the raw table and candidate selectors.
+func heParseSelection(rawTables, rawCands string) ([]store.HistoryRetentionTable, []string, error) {
+	var allowed []string
+	for _, t := range store.HistoryRetentionTables() {
+		allowed = append(allowed, heShort(t))
+	}
+	shorts, err := heParseList(rawTables, allowed)
+	if err != nil {
+		return nil, nil, fmt.Errorf("UZI_EVIDENCE_TABLES: %w", err)
+	}
+	var tables []store.HistoryRetentionTable
+	for _, s := range shorts {
+		t, err := heTableByShort(s)
+		if err != nil {
+			return nil, nil, err
+		}
+		tables = append(tables, t)
+	}
+	cands, err := heParseList(rawCands, heCands)
+	if err != nil {
+		return nil, nil, fmt.Errorf("UZI_EVIDENCE_CANDS: %w", err)
+	}
+	return tables, cands, nil
+}
+
+// heParseSelectors is the only reader of UZI_EVIDENCE_TABLES and UZI_EVIDENCE_CANDS; newHeFx calls it
+// once and every phase and the label use the result.
+func heParseSelectors() ([]store.HistoryRetentionTable, []string, error) {
+	return heParseSelection(os.Getenv("UZI_EVIDENCE_TABLES"), os.Getenv("UZI_EVIDENCE_CANDS"))
+}
+
+// heRequireOptIn skips the calling test unless the operator opted in, before anything reads or
+// parses the rest of the environment.
+func heRequireOptIn(t *testing.T) {
+	t.Helper()
+	if os.Getenv("UZI_HISTORY_RETENTION_EVIDENCE") != "1" {
+		t.Skip("UZI_HISTORY_RETENTION_EVIDENCE=1 not set; opt-in evidence harness")
+	}
 }
 
 type heFx struct {
@@ -145,22 +201,23 @@ type heFx struct {
 	user   uuid.UUID
 	codex  string
 	tables []store.HistoryRetentionTable
+	cands  []string
 	// version is the server_version read on the marker check's own backend by requireEvidenceMarker.
 	version string
 }
 
-func heTableByShort(s string) store.HistoryRetentionTable {
+func heTableByShort(s string) (store.HistoryRetentionTable, error) {
 	switch s {
 	case "pr":
-		return store.HistoryRetentionPRHistoryEvents
+		return store.HistoryRetentionPRHistoryEvents, nil
 	case "anthropic":
-		return store.HistoryRetentionAnthropicUsage
+		return store.HistoryRetentionAnthropicUsage, nil
 	case "codex":
-		return store.HistoryRetentionCodexUsage
+		return store.HistoryRetentionCodexUsage, nil
 	case "worker":
-		return store.HistoryRetentionWorkerCapacitySample
+		return store.HistoryRetentionWorkerCapacitySample, nil
 	}
-	panic("unknown table " + s)
+	return "", fmt.Errorf("unknown table %q", s)
 }
 
 func heShort(t store.HistoryRetentionTable) string {
@@ -251,9 +308,7 @@ func TestHistoryRetentionEvidenceDSN(t *testing.T) {
 // the history tables, and none runs on fx.pool, before the first measured tick.
 func newHeFx(t *testing.T, admin bool) *heFx {
 	t.Helper()
-	if os.Getenv("UZI_HISTORY_RETENTION_EVIDENCE") != "1" {
-		t.Skip("UZI_HISTORY_RETENTION_EVIDENCE=1 not set; opt-in evidence harness")
-	}
+	heRequireOptIn(t)
 	logPath := os.Getenv("UZI_EVIDENCE_LOG")
 	if !filepath.IsAbs(logPath) {
 		t.Fatalf("UZI_EVIDENCE_LOG must be an absolute path, got %q", logPath)
@@ -271,8 +326,8 @@ func newHeFx(t *testing.T, admin bool) *heFx {
 	if v := os.Getenv("UZI_EVIDENCE_CODEX"); v == "max" {
 		fx.codex = "max"
 	}
-	for _, s := range heList("UZI_EVIDENCE_TABLES", []string{"pr", "anthropic", "codex", "worker"}) {
-		fx.tables = append(fx.tables, heTableByShort(s))
+	if fx.tables, fx.cands, err = heParseSelectors(); err != nil {
+		t.Fatal(err)
 	}
 	if admin {
 		ap, err := pgxpool.New(ctx, base)
@@ -308,7 +363,7 @@ func newHeFx(t *testing.T, admin bool) *heFx {
 	}
 	t.Cleanup(pool.Close)
 	fx.pool = pool
-	fx.log.rec("env", map[string]any{"server_version": fx.serverVersion(), "rows": heRows(), "diagnostic_overrides": heDiagnosticReasons(fx, false)})
+	fx.log.rec("env", map[string]any{"server_version": fx.serverVersion(), "rows": heRows(), "coverage_reasons": fx.coverageReasons(false, nil)})
 	if admin {
 		fx.ensureOwner()
 	}
@@ -398,32 +453,128 @@ func (fx *heFx) requireEvidenceDatabase(p *pgxpool.Pool) {
 // serverVersion returns the version read by requireEvidenceMarker; it runs no query.
 func (fx *heFx) serverVersion() string { return fx.version }
 
-// heDiagnosticReasons lists every override that makes a run diagnostic only: fewer rows than the
-// 1,000,000 of the evidence fixture, a smoke shorter than 300 s, a table or candidate selector
-// that narrows coverage, or UZI_EVIDENCE_NO_AV=1 (autovacuum off during a compressed run). Empty
-// means the run is qualifying. forSmoke counts only the overrides that affect the smoke: the
-// candidate selector and the autovacuum switch only apply to the compressed runs.
-func heDiagnosticReasons(fx *heFx, forSmoke bool) []string {
-	var r []string
-	if n := heRows(); n < 1_000_000 {
-		r = append(r, fmt.Sprintf("UZI_EVIDENCE_ROWS=%d (below 1000000)", n))
+// heCoverageIn is everything the coverage label looks at: the fixture and selector settings of a run.
+type heCoverageIn struct {
+	tables       []store.HistoryRetentionTable
+	cands        []string
+	rows         int
+	noAV         bool
+	prArrivals   int
+	codex        string
+	smokeSeconds int
+	smokeIdx     map[store.HistoryRetentionTable]string
+}
+
+// heCoverageReasons lists every setting that narrows what a run covers below the evidence fixture:
+// fewer tables or candidates (compared as sets, so a repeated name never fills a slot), fewer rows
+// than 1,000,000, autovacuum off, a non-default pr_history_events arrival rate or codex jsonb
+// variant, and, for the smoke, a non-btree index or fewer than 300 seconds. Empty means the settings
+// cover the fixture; the run itself is judged separately by heRunReasons. smoke selects the smoke
+// subset (the candidate selector, autovacuum switch and PR arrivals apply only to compressed runs).
+func heCoverageReasons(in heCoverageIn, smoke bool) []string {
+	r := []string{}
+	if in.rows < 1_000_000 {
+		r = append(r, fmt.Sprintf("UZI_EVIDENCE_ROWS=%d (below 1000000)", in.rows))
 	}
-	if n := heEnvInt("UZI_EVIDENCE_SMOKE_SECONDS", 300); n < 300 {
-		r = append(r, fmt.Sprintf("UZI_EVIDENCE_SMOKE_SECONDS=%d (below 300)", n))
+	var want, have []string
+	for _, t := range store.HistoryRetentionTables() {
+		want = append(want, string(t))
 	}
-	if len(fx.tables) < len(store.HistoryRetentionTables()) {
-		r = append(r, fmt.Sprintf("UZI_EVIDENCE_TABLES selects %d of %d tables", len(fx.tables), len(store.HistoryRetentionTables())))
+	for _, t := range in.tables {
+		have = append(have, string(t))
 	}
-	if forSmoke {
+	if !heSameSet(have, want) {
+		r = append(r, fmt.Sprintf("UZI_EVIDENCE_TABLES selects %d of %d distinct tables", len(heDistinct(have)), len(want)))
+	}
+	if in.codex != "typical" {
+		r = append(r, fmt.Sprintf("UZI_EVIDENCE_CODEX=%s (not the default typical variant)", in.codex))
+	}
+	if smoke {
+		if in.smokeSeconds < 300 {
+			r = append(r, fmt.Sprintf("UZI_EVIDENCE_SMOKE_SECONDS=%d (below 300)", in.smokeSeconds))
+		}
+		for _, t := range store.HistoryRetentionTables() {
+			if c := in.smokeIdx[t]; c != "btree" {
+				r = append(r, fmt.Sprintf("smoke index of %s is %q (production is btree)", heShort(t), c))
+			}
+		}
 		return r
 	}
-	if c := heList("UZI_EVIDENCE_CANDS", heCands); len(c) < len(heCands) {
-		r = append(r, fmt.Sprintf("UZI_EVIDENCE_CANDS selects %d of %d candidates", len(c), len(heCands)))
+	if !heSameSet(in.cands, heCands) {
+		r = append(r, fmt.Sprintf("UZI_EVIDENCE_CANDS selects %d of %d distinct candidates", len(heDistinct(in.cands)), len(heCands)))
 	}
-	if os.Getenv("UZI_EVIDENCE_NO_AV") == "1" {
+	if in.prArrivals != heDefaultPRArrivals {
+		r = append(r, fmt.Sprintf("UZI_EVIDENCE_PR_ARRIVALS=%d (default %d)", in.prArrivals, heDefaultPRArrivals))
+	}
+	if in.noAV {
 		r = append(r, "UZI_EVIDENCE_NO_AV=1 (autovacuum off during compressed runs)")
 	}
 	return r
+}
+
+func heDistinct(xs []string) []string {
+	var out []string
+	for _, x := range xs {
+		if !slices.Contains(out, x) {
+			out = append(out, x)
+		}
+	}
+	return out
+}
+
+func heSameSet(a, b []string) bool {
+	da, db := heDistinct(a), heDistinct(b)
+	if len(da) != len(db) {
+		return false
+	}
+	for _, x := range da {
+		if !slices.Contains(db, x) {
+			return false
+		}
+	}
+	return true
+}
+
+// coverageReasons builds the coverage label inputs from the parsed selectors and the environment.
+func (fx *heFx) coverageReasons(smoke bool, smokeIdx map[store.HistoryRetentionTable]string) []string {
+	return heCoverageReasons(heCoverageIn{tables: fx.tables, cands: fx.cands, rows: heRows(),
+		noAV: os.Getenv("UZI_EVIDENCE_NO_AV") == "1", prArrivals: fx.prArrivals(), codex: fx.codex,
+		smokeSeconds: heEnvInt("UZI_EVIDENCE_SMOKE_SECONDS", 300), smokeIdx: smokeIdx}, smoke)
+}
+
+// heParseSmokeIndexes resolves UZI_EVIDENCE_SMOKE_INDEXES (pr=btree,anthropic=btree,...). A table the
+// selector omits keeps the production index, btree; a malformed entry, an unknown table or candidate
+// or a repeated table is an error.
+func heParseSmokeIndexes(raw string) (map[store.HistoryRetentionTable]string, error) {
+	idx := map[store.HistoryRetentionTable]string{}
+	for _, t := range store.HistoryRetentionTables() {
+		idx[t] = "btree"
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return idx, nil
+	}
+	seen := map[store.HistoryRetentionTable]bool{}
+	for _, kv := range strings.Split(raw, ",") {
+		name, cand, ok := strings.Cut(strings.TrimSpace(kv), "=")
+		name, cand = strings.TrimSpace(name), strings.TrimSpace(cand)
+		if !ok {
+			return nil, fmt.Errorf("UZI_EVIDENCE_SMOKE_INDEXES entry %q is not table=candidate", kv)
+		}
+		t, err := heTableByShort(name)
+		if err != nil {
+			return nil, fmt.Errorf("UZI_EVIDENCE_SMOKE_INDEXES: %w", err)
+		}
+		if !slices.Contains(heCands, cand) {
+			return nil, fmt.Errorf("UZI_EVIDENCE_SMOKE_INDEXES: unknown candidate %q for %s (allowed: %s)", cand, name, strings.Join(heCands, ","))
+		}
+		if seen[t] {
+			return nil, fmt.Errorf("UZI_EVIDENCE_SMOKE_INDEXES names %s twice", name)
+		}
+		seen[t] = true
+		idx[t] = cand
+	}
+	return idx, nil
 }
 
 func (fx *heFx) exec(sql string, args ...any) {
@@ -477,18 +628,78 @@ func (s heSpec) stepUS() int64 { return int64(heTick/time.Microsecond) / int64(s
 func (s heSpec) at(g int64) time.Time {
 	return s.start.Add(time.Duration(g*s.stepUS()) * time.Microsecond)
 }
-func (s heSpec) frac(f float64) time.Time {
-	return s.at(int64(f * float64(s.n)))
-}
 
 // perBucket is the number of rows per five-minute bucket (the identity count of a sample table).
 func (s heSpec) perBucket() int64 { return int64(300*time.Second/time.Microsecond) / s.stepUS() }
+
+func (s heSpec) bucketed() bool { return s.table != store.HistoryRetentionPRHistoryEvents }
+
+// span is the time the n fixture rows cover.
+func (s heSpec) span() time.Duration { return time.Duration(int64(s.n)*s.stepUS()) * time.Microsecond }
+
+// heCaseCutoff returns the cutoff for a fixture fraction frac and the number of rows eligible under
+// it. A frac of 0 or less is a cutoff before every row. pr_history_events keeps the observation-time
+// cutoff and excludes first_merge rows (1 of every 90). The bucketed tables expire by bucket_start,
+// so a cutoff inside a five-minute bucket already makes the whole bucket eligible: the cutoff is
+// aligned up to the bucket boundary and the eligible rows are the whole buckets below it.
+func heCaseCutoff(s heSpec, frac float64) (time.Time, int64) {
+	if frac <= 0 {
+		return s.start.Add(-time.Hour), 0
+	}
+	g := min(int64(frac*float64(s.n)), int64(s.n))
+	raw := s.at(g)
+	if !s.bucketed() {
+		fm := int64(0)
+		if g >= 3 { // first_merge rows are g = 90j+2
+			fm = (g-3)/90 + 1
+		}
+		return raw, g - fm
+	}
+	cut := raw.Truncate(5 * time.Minute)
+	if cut.Before(raw) {
+		cut = cut.Add(5 * time.Minute)
+	}
+	step := s.stepUS()
+	rows := (int64(cut.Sub(s.start)/time.Microsecond) + step - 1) / step
+	return cut, min(rows, int64(s.n))
+}
+
+// heEligibleWhere is the expiry predicate of the production DELETE, with the cutoff as $1.
+func heEligibleWhere(table store.HistoryRetentionTable) string {
+	w := hrExpiryColumn(table) + ` < $1`
+	if table == store.HistoryRetentionPRHistoryEvents {
+		w += ` AND NOT first_merge`
+	}
+	return w
+}
+
+// heRequiredTicks is the number of 15 s ticks a compressed run must complete to support its claim.
+// Churn mode covers the window from the initial cutoff to the end of the fixture, one tick per 15 s.
+// Backlog mode must drain the initially eligible rows (bucket-aligned for the bucketed tables) at the
+// batch the pass can take net of the arrivals of each tick, plus 5%. An arrival rate that the batch
+// cannot outpace (arrivals of 1000 or more per tick) or below 1 is refused.
+func heRequiredTicks(s heSpec, offFrac float64, mode string, arrivals int) (int, error) {
+	if arrivals < 1 || arrivals >= int(heMaxBatch) {
+		return 0, fmt.Errorf("%s: %d arrivals per tick outside [1, %d)", s.table, arrivals, heMaxBatch)
+	}
+	cutoff0, eligible0 := heCaseCutoff(s, offFrac)
+	switch mode {
+	case "churn":
+		rem := max(s.span()-cutoff0.Sub(s.start), 0)
+		return int((rem + heTick - 1) / heTick), nil
+	case "backlog":
+		per := int64(heMaxBatch) - int64(arrivals)
+		base := (eligible0 + per - 1) / per
+		return int(base + (base*5+99)/100), nil
+	}
+	return 0, fmt.Errorf("unknown mode %q", mode)
+}
 
 func (fx *heFx) specFor(table store.HistoryRetentionTable, arrivals int, start time.Time) heSpec {
 	return heSpec{table: table, n: heRows(), arrivals: arrivals, start: start}
 }
 
-func (fx *heFx) prArrivals() int { return heEnvInt("UZI_EVIDENCE_PR_ARRIVALS", 6) }
+func (fx *heFx) prArrivals() int { return heEnvInt("UZI_EVIDENCE_PR_ARRIVALS", heDefaultPRArrivals) }
 
 func (fx *heFx) stdSpec(table store.HistoryRetentionTable) heSpec {
 	a := heSampleArr
@@ -552,14 +763,23 @@ func (fx *heFx) insertSQL(table store.HistoryRetentionTable) string {
 	        (g % 5)::int, 0, 0` + from
 }
 
-// insertRows inserts rows [from, to) of spec s.
+// insertRowsCtx inserts rows [from, to) of spec s under ctx and returns the error.
+func (fx *heFx) insertRowsCtx(ctx context.Context, s heSpec, from, to int64) error {
+	var err error
+	if s.table == store.HistoryRetentionPRHistoryEvents { // its statement has no identity parameter
+		_, err = fx.pool.Exec(ctx, fx.insertSQL(s.table), from, to, s.start, s.stepUS())
+	} else {
+		_, err = fx.pool.Exec(ctx, fx.insertSQL(s.table), from, to, s.start, s.stepUS(), s.perBucket())
+	}
+	return err
+}
+
+// insertRows inserts rows [from, to) of spec s and fails the test on an error (fixture seeding).
 func (fx *heFx) insertRows(s heSpec, from, to int64) {
 	fx.t.Helper()
-	if s.table == store.HistoryRetentionPRHistoryEvents { // its statement has no identity parameter
-		fx.exec(fx.insertSQL(s.table), from, to, s.start, s.stepUS())
-		return
+	if err := fx.insertRowsCtx(fx.ctx, s, from, to); err != nil {
+		fx.t.Fatalf("insert %s rows [%d,%d): %v", s.table, from, to, err)
 	}
-	fx.exec(fx.insertSQL(s.table), from, to, s.start, s.stepUS(), s.perBucket())
 }
 
 // reseed empties the table and loads spec s, then VACUUM ANALYZE so the heap, visibility map and
@@ -758,6 +978,8 @@ type heExplain struct {
 	ExecMS        float64
 	Dirtied, Wrte int64
 	StatIO        map[string]int64
+	// ObsUnavailable is set, and StatIO nil, when the per-relation counters could not be read.
+	ObsUnavailable string
 }
 
 func heParseBuffers(line string) (hit, read, dirt, wr int64) {
@@ -788,9 +1010,11 @@ func heParseBuffers(line string) (hit, read, dirt, wr int64) {
 	return
 }
 
-func (fx *heFx) statio(conn *pgxpool.Conn, table store.HistoryRetentionTable) map[string]int64 {
+func (fx *heFx) statio(conn *pgxpool.Conn, table store.HistoryRetentionTable) (map[string]int64, error) {
 	fx.t.Helper()
-	_, _ = conn.Exec(fx.ctx, `SELECT pg_stat_force_next_flush()`)
+	if _, err := conn.Exec(fx.ctx, `SELECT pg_stat_force_next_flush()`); err != nil {
+		return nil, fmt.Errorf("pg_stat_force_next_flush: %w", err)
+	}
 	cols := []string{"heap_blks_read", "heap_blks_hit", "idx_blks_read", "idx_blks_hit", "toast_blks_read", "toast_blks_hit", "tidx_blks_read", "tidx_blks_hit"}
 	vals := make([]int64, len(cols))
 	ptrs := make([]any, len(cols))
@@ -801,13 +1025,13 @@ func (fx *heFx) statio(conn *pgxpool.Conn, table store.HistoryRetentionTable) ma
 	        coalesce(toast_blks_read,0), coalesce(toast_blks_hit,0), coalesce(tidx_blks_read,0), coalesce(tidx_blks_hit,0)
 	        FROM pg_statio_user_tables WHERE relname = $1`, string(table))
 	if err := row.Scan(ptrs...); err != nil {
-		return map[string]int64{}
+		return nil, fmt.Errorf("pg_statio_user_tables: %w", err)
 	}
 	m := map[string]int64{}
 	for i, c := range cols {
 		m[c] = vals[i]
 	}
-	return m
+	return m, nil
 }
 
 // explain runs the production DELETE of one batch under EXPLAIN (ANALYZE, BUFFERS) with a custom
@@ -822,7 +1046,7 @@ func (fx *heFx) explain(table store.HistoryRetentionTable, cutoff time.Time, bat
 	}
 	defer conn.Release()
 	var ex heExplain
-	before := fx.statio(conn, table)
+	before, errBefore := fx.statio(conn, table)
 	mustExec := func(sql string) {
 		if _, err := conn.Exec(fx.ctx, sql); err != nil {
 			fx.t.Fatalf("explain setup: %v\n%s", err, sql)
@@ -858,7 +1082,11 @@ func (fx *heFx) explain(table store.HistoryRetentionTable, cutoff time.Time, bat
 	rows.Close()
 	mustExec(`ROLLBACK`)
 	mustExec(`DEALLOCATE hrev_p`)
-	after := fx.statio(conn, table)
+	after, errAfter := fx.statio(conn, table)
+	if err := errors.Join(errBefore, errAfter); err != nil {
+		ex.ObsUnavailable = err.Error()
+		return ex
+	}
 	ex.StatIO = map[string]int64{}
 	for k, v := range after {
 		ex.StatIO[k] = v - before[k]
@@ -867,8 +1095,14 @@ func (fx *heFx) explain(table store.HistoryRetentionTable, cutoff time.Time, bat
 }
 
 func (e heExplain) kv() map[string]any {
-	return map[string]any{"buf_hit": e.Hit, "buf_read": e.Read, "buf_dirtied": e.Dirtied, "buf_written": e.Wrte,
-		"explain_exec_ms": e.ExecMS, "statio_delta": e.StatIO, "plan": e.Plan}
+	m := map[string]any{"buf_hit": e.Hit, "buf_read": e.Read, "buf_dirtied": e.Dirtied, "buf_written": e.Wrte,
+		"explain_exec_ms": e.ExecMS, "plan": e.Plan}
+	if e.ObsUnavailable != "" {
+		m["obs_unavailable"] = e.ObsUnavailable
+	} else {
+		m["statio_delta"] = e.StatIO
+	}
+	return m
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -879,9 +1113,11 @@ type heCase struct {
 	frac   float64 // fraction of the fixture expired; 0 means a cutoff before every row
 	ticks  int
 	commit bool
+	// drain extends ticks to the batches the eligible rows need, so the case ends with none left.
+	drain bool
 }
 
-var heWarmCases = []heCase{{"c", 0, 25, false}, {"a", 0.0205, 21, true}, {"b", 0.90, 40, true}}
+var heWarmCases = []heCase{{"c", 0, 25, false, false}, {"a", 0.0205, 21, true, true}, {"b", 0.90, 40, true, false}}
 
 func (fx *heFx) tableLabel(table store.HistoryRetentionTable) string {
 	if table == store.HistoryRetentionCodexUsage {
@@ -892,16 +1128,11 @@ func (fx *heFx) tableLabel(table store.HistoryRetentionTable) string {
 
 func (fx *heFx) runCase(spec heSpec, cand string, c heCase) {
 	fx.t.Helper()
-	cutoff := spec.start.Add(-time.Hour)
-	if c.frac > 0 {
-		cutoff = spec.frac(c.frac)
+	cutoff, eligibleExp := heCaseCutoff(spec, c.frac)
+	if c.drain {
+		c.ticks = max(c.ticks, int((eligibleExp+int64(heMaxBatch)-1)/int64(heMaxBatch)))
 	}
-	col := heExpiryCol(spec.table)
-	where := col + ` < $1`
-	if spec.table == store.HistoryRetentionPRHistoryEvents {
-		where += ` AND NOT first_merge`
-	}
-	expired := fx.one(`SELECT count(*) FROM `+string(spec.table)+` WHERE `+where, cutoff)
+	expired := fx.one(`SELECT count(*) FROM `+string(spec.table)+` WHERE `+heEligibleWhere(spec.table), cutoff)
 	before := fx.one(`SELECT count(*) FROM ` + string(spec.table))
 	ex := fx.explain(spec.table, cutoff, heMaxBatch)
 	var del, open, closeMS []float64
@@ -921,7 +1152,7 @@ func (fx *heFx) runCase(spec heSpec, cand string, c heCase) {
 	}
 	after := fx.one(`SELECT count(*) FROM ` + string(spec.table))
 	kv := map[string]any{"table": fx.tableLabel(spec.table), "cand": cand, "case": c.name, "ticks": c.ticks,
-		"expired_before": expired, "count_before": before, "count_after": after, "confirmed_deleted": deleted,
+		"expired_before": expired, "eligible_expected": eligibleExp, "count_before": before, "count_after": after, "confirmed_deleted": deleted,
 		"median_ms": heQuant(del, 0.5), "p95_ms": heQuant(del, 0.95), "max_ms": heMaxF(del), "first_ms": del[0],
 		"open_median_ms": heQuant(open, 0.5), "close_median_ms": heQuant(closeMS, 0.5), "errors": errs,
 		"tick_ms": heRound(del), "tick_deleted": perTick}
@@ -962,7 +1193,7 @@ func TestHistoryRetentionWarmEvidenceLiveDB(t *testing.T) {
 	fx := newHeFx(t, true)
 	for _, table := range fx.tables {
 		spec := fx.stdSpec(table)
-		for _, cand := range heList("UZI_EVIDENCE_CANDS", heCands) {
+		for _, cand := range fx.cands {
 			seedD := fx.reseed(spec)
 			build := fx.setIndex(table, cand)
 			kv := fx.sizes(table, cand).kv()
@@ -1000,20 +1231,20 @@ func newPassState(tables []store.HistoryRetentionTable) *hePassState {
 
 // passTick runs one emulated tick over the selected tables: visit in counter order, one adaptive
 // batch per table, continue past a known rollback, end at an unknown outcome or the work deadline.
-func (fx *heFx) passTick(ps *hePassState, cutoffs map[store.HistoryRetentionTable]time.Time) ([]heTickRes, time.Duration) {
+// Session open and close failures belong to no table and are returned apart as passErrs.
+func (fx *heFx) passTick(state *hePassState, cutoffs map[store.HistoryRetentionTable]time.Time) (out []heTickRes, passErrs []string, el time.Duration) {
 	fx.t.Helper()
 	start := time.Now()
 	cleanupCtx, cancelC := context.WithDeadline(fx.ctx, start.Add(2*time.Second))
 	defer cancelC()
 	workCtx, cancelW := context.WithDeadline(cleanupCtx, start.Add(1750*time.Millisecond))
 	defer cancelW()
-	var out []heTickRes
 	sess, ok, err := store.OpenHistoryRetentionSession(workCtx, cleanupCtx, fx.pool, heStmtTimeout, heLockTimeout)
 	if err != nil || !ok {
-		return []heTickRes{{Err: fmt.Sprintf("unknown: open ok=%v err=%v", ok, err)}}, time.Since(start)
+		return nil, []string{fmt.Sprintf("open ok=%v err=%v", ok, err)}, time.Since(start)
 	}
-	first := ps.counter
-	ps.counter++
+	first := state.counter
+	state.counter++
 	all := store.HistoryRetentionTables()
 	for i := 0; i < len(all) && workCtx.Err() == nil; i++ {
 		table := all[(first+uint64(i))%uint64(len(all))]
@@ -1021,7 +1252,7 @@ func (fx *heFx) passTick(ps *hePassState, cutoffs map[store.HistoryRetentionTabl
 		if !sel {
 			continue
 		}
-		ctl := ps.batch[table]
+		ctl := state.batch[table]
 		r := heTickRes{Table: table, Batch: ctl.Limit()}
 		r.N, r.Err = fx.deleteOn(workCtx, sess, table, cutoff, r.Batch, &r)
 		switch r.Err {
@@ -1036,20 +1267,119 @@ func (fx *heFx) passTick(ps *hePassState, cutoffs map[store.HistoryRetentionTabl
 		}
 	}
 	if _, err := sess.Close(cleanupCtx); err != nil {
-		out = append(out, heTickRes{Err: "unknown: close: " + err.Error()})
+		passErrs = append(passErrs, "close: "+err.Error())
 	}
-	return out, time.Since(start)
+	return out, passErrs, time.Since(start)
+}
+
+// Delete outcome kinds of one table in one tick (heErrKind of heTickRes.Err).
+const (
+	heKindOK       = ""
+	heKindUnknown  = "unknown"
+	heKindTimeout  = "statement_timeout"
+	heKindRollback = "other_rollback" // any other known rollback code, lock timeout 55P03 included
+	heKindSkipped  = "skipped"
+)
+
+// heErrKind classifies a tick error string. Only an empty error is a confirmed count.
+func heErrKind(e string) string {
+	switch {
+	case e == "":
+		return heKindOK
+	case e == "57014":
+		return heKindTimeout
+	case e == "skipped":
+		return heKindSkipped
+	case strings.HasPrefix(e, "unknown"):
+		return heKindUnknown
+	}
+	return heKindRollback
+}
+
+// How a compressed run's tick loop ended.
+const (
+	heStopComplete     = "ticks_complete"
+	heStopWallCap      = "wall_cap"
+	heStopArrivalError = "arrival_error"
+)
+
+// heRunFacts is what one table's compressed run observed, the input of the run label.
+type heRunFacts struct {
+	Required, Confirmed int // ticks required; ticks that ended in a confirmed count
+	Stop                string
+	Unknown, Timeouts   int
+	Rollbacks, Skipped  int
+	Residual            int64 // rows still eligible at the probe cutoff
+	PassErrors          int
+	ProbeErrors         int
+	NoopDeleted         int64
+}
+
+// heRunReasons lists everything that makes the run itself non-qualifying. A tick counts toward the
+// required count only on a confirmed count, and every failed delete outcome, a wall-clock or error
+// stop, a residual backlog, a pass error, a probe error or a probe that deleted rows disqualifies the
+// run even when the required count was reached.
+func heRunReasons(f heRunFacts) []string {
+	r := []string{}
+	if f.Confirmed < f.Required {
+		r = append(r, fmt.Sprintf("ticks short: %d confirmed of %d required", f.Confirmed, f.Required))
+	}
+	if f.Stop != heStopComplete {
+		r = append(r, "stop_reason="+f.Stop)
+	}
+	for _, c := range []struct {
+		n    int
+		what string
+	}{{f.Unknown, "unknown delete outcomes"}, {f.Timeouts, "statement timeouts"}, {f.Rollbacks, "other known rollbacks (lock timeouts included)"},
+		{f.Skipped, "skipped table ticks"}, {f.PassErrors, "pass errors"}, {f.ProbeErrors, "probe errors"}} {
+		if c.n > 0 {
+			r = append(r, fmt.Sprintf("%d %s", c.n, c.what))
+		}
+	}
+	if f.Residual > 0 {
+		r = append(r, fmt.Sprintf("residual backlog of %d eligible rows at the probe cutoff", f.Residual))
+	}
+	if f.NoopDeleted > 0 {
+		r = append(r, fmt.Sprintf("near-empty probes deleted %d rows", f.NoopDeleted))
+	}
+	return r
 }
 
 type heTabRun struct {
-	spec       heSpec
-	arrivals   int
-	offset     time.Duration // initial backlog: cutoff starts this far past the fixture start
-	delByTick  []int64
-	msByTick   []float64
-	batchByTk  []int32
-	errByTick  []string
-	backlogEnd int // first tick whose batch came back short and clean; -1 while a backlog exists
+	spec      heSpec
+	arrivals  int
+	cutoff0   time.Time // the initial cutoff: the backlog is every eligible row below it
+	eligible0 int64
+	required  int
+	delByTick []int64
+	msByTick  []float64
+	batchByTk []int32
+	errByTick []string
+	// firstShort is the first tick whose batch came back short and clean, -1 if none. A short batch
+	// can precede more backlog (a lock skipped rows), so it is informational and never a drain claim.
+	firstShort int
+}
+
+// kinds counts the delete outcome kinds over the observed ticks.
+func (r *heTabRun) kinds() (confirmed, unknown, timeouts, rollbacks, skipped, lockTO int) {
+	for _, e := range r.errByTick {
+		switch heErrKind(e) {
+		case heKindOK:
+			confirmed++
+		case heKindUnknown:
+			unknown++
+		case heKindTimeout:
+			timeouts++
+		case heKindSkipped:
+			skipped++
+		default:
+			rollbacks++
+			if e == "55P03" {
+				lockTO++
+			}
+		}
+	}
+	return
 }
 
 // autovacuumState reads the table's actual autovacuum_enabled reloption from pg_class.reloptions
@@ -1059,16 +1389,20 @@ func (fx *heFx) autovacuumState(table store.HistoryRetentionTable) (off bool, re
 	fx.t.Helper()
 	if err := fx.pool.QueryRow(fx.ctx, `SELECT EXISTS (SELECT 1 FROM unnest(coalesce(reloptions, '{}'::text[])) o
 		          WHERE lower(o) ~ '^autovacuum_enabled=(false|off|0|no|f|n)$'), coalesce(reloptions::text, '')
-	        FROM pg_class WHERE oid = $1::regclass`, string(table)).Scan(&off, &reloptions); err != nil {
+		        FROM pg_class WHERE oid = $1::regclass`, string(table)).Scan(&off, &reloptions); err != nil {
 		fx.t.Fatalf("read reloptions of %s: %v", table, err)
 	}
 	return off, reloptions
 }
 
+// tableStats reads the table's statistics counters; when they cannot be read it returns only
+// obs_unavailable, never zeros.
 func (fx *heFx) tableStats(table store.HistoryRetentionTable) map[string]any {
 	var live, dead, av, aav, ins int64
-	_ = fx.pool.QueryRow(fx.ctx, `SELECT n_live_tup, n_dead_tup, autovacuum_count, autoanalyze_count, n_tup_ins
-	        FROM pg_stat_user_tables WHERE relname = $1`, string(table)).Scan(&live, &dead, &av, &aav, &ins)
+	if err := fx.pool.QueryRow(fx.ctx, `SELECT n_live_tup, n_dead_tup, autovacuum_count, autoanalyze_count, n_tup_ins
+	        FROM pg_stat_user_tables WHERE relname = $1`, string(table)).Scan(&live, &dead, &av, &aav, &ins); err != nil {
+		return map[string]any{"obs_unavailable": "pg_stat_user_tables: " + err.Error()}
+	}
 	return map[string]any{"n_live_tup": live, "n_dead_tup": dead, "autovacuum_count": av, "autoanalyze_count": aav, "n_tup_ins": ins}
 }
 
@@ -1078,25 +1412,37 @@ func (fx *heFx) tableStats(table store.HistoryRetentionTable) map[string]any {
 // keeps arrivals and expiries in step for 1.1 retention windows (case d). Arrivals per 15 s tick:
 // 250 per sample table and UZI_EVIDENCE_PR_ARRIVALS (default 6) for pr_history_events. The cutoff
 // advances 15 s per tick. Default autovacuum runs and no manual VACUUM is issued during the run.
+// The tick budget defaults to the most any selected table needs (heRequiredTicks); a run whose
+// arrival rate the batch cannot outpace is refused before anything is seeded.
 func TestHistoryRetentionCompressedEvidenceLiveDB(t *testing.T) {
 	fx := newHeFx(t, true)
 	mode := os.Getenv("UZI_EVIDENCE_MODE")
 	if mode != "backlog" && mode != "churn" {
 		t.Fatalf("UZI_EVIDENCE_MODE must be backlog or churn, got %q", mode)
 	}
-	defTicks := 4400
 	offFrac := 0.05
 	if mode == "backlog" {
-		defTicks, offFrac = 1100, 0.90
+		offFrac = 0.90
+	}
+	required := map[store.HistoryRetentionTable]int{}
+	defTicks := 0
+	for _, table := range fx.tables {
+		spec := fx.stdSpec(table)
+		n, err := heRequiredTicks(spec, offFrac, mode, spec.arrivals)
+		if err != nil {
+			t.Fatalf("refusing to run: %v", err)
+		}
+		required[table] = n
+		defTicks = max(defTicks, n)
 	}
 	ticks := heEnvInt("UZI_EVIDENCE_TICKS", defTicks)
 	wall := time.Duration(heEnvInt("UZI_EVIDENCE_MAX_MINUTES", 20)) * time.Minute
-	for _, cand := range heList("UZI_EVIDENCE_CANDS", heCands) {
-		fx.compressedRun(mode, cand, ticks, offFrac, wall)
+	for _, cand := range fx.cands {
+		fx.compressedRun(mode, cand, ticks, offFrac, wall, required)
 	}
 }
 
-func (fx *heFx) compressedRun(mode, cand string, ticks int, offFrac float64, wall time.Duration) {
+func (fx *heFx) compressedRun(mode, cand string, ticks int, offFrac float64, wall time.Duration, required map[store.HistoryRetentionTable]int) {
 	fx.t.Helper()
 	runs := map[store.HistoryRetentionTable]*heTabRun{}
 	for _, table := range fx.tables {
@@ -1112,115 +1458,178 @@ func (fx *heFx) compressedRun(mode, cand string, ticks int, offFrac float64, wal
 		fx.t.Cleanup(func() {
 			_, _ = fx.pool.Exec(context.Background(), `ALTER TABLE `+string(table)+` RESET (autovacuum_enabled)`)
 		})
-		spanDur := time.Duration(int64(spec.n)*spec.stepUS()) * time.Microsecond
-		runs[table] = &heTabRun{spec: spec, arrivals: spec.arrivals, offset: time.Duration(offFrac * float64(spanDur)), backlogEnd: -1}
+		cutoff0, eligible0 := heCaseCutoff(spec, offFrac)
+		runs[table] = &heTabRun{spec: spec, arrivals: spec.arrivals, cutoff0: cutoff0, eligible0: eligible0, required: required[table], firstShort: -1}
 		kv := fx.sizes(table, cand).kv()
 		kv["table"], kv["cand"], kv["mode"], kv["after"] = fx.tableLabel(table), cand, mode, "run_start"
 		kv["autovacuum_off"], kv["reloptions"] = fx.autovacuumState(table)
 		kv["server_version"] = fx.serverVersion()
+		kv["eligible_initial"], kv["ticks_required"] = eligible0, required[table]
 		for k, v := range fx.tableStats(table) {
 			kv[k] = v
 		}
 		fx.log.rec("sizes", kv)
 	}
-	ps := newPassState(fx.tables)
+	state := newPassState(fx.tables)
 	deadline := time.Now().Add(wall)
+	// Arrivals run under the run's wall deadline too, so a stuck insert cannot outlive the cap.
+	arrCtx, cancelArr := context.WithDeadline(fx.ctx, deadline)
+	defer cancelArr()
 	done := 0
+	stop, stopDetail := heStopComplete, ""
 	var passMS []float64
-	var cutoffs map[store.HistoryRetentionTable]time.Time
+	var passErrs []string
 	insMS := map[store.HistoryRetentionTable][]float64{}
 	var slowSamples []map[string]any
-	for k := 0; k < ticks && time.Now().Before(deadline); k++ {
-		cutoffs = map[store.HistoryRetentionTable]time.Time{}
+tickLoop:
+	for k := 0; k < ticks; k++ {
+		if !time.Now().Before(deadline) {
+			stop = heStopWallCap
+			break
+		}
+		cutoffs := map[store.HistoryRetentionTable]time.Time{}
 		for _, table := range fx.tables {
 			r := runs[table]
 			t0 := time.Now()
-			fx.insertRows(r.spec, int64(r.spec.n+k*r.arrivals), int64(r.spec.n+(k+1)*r.arrivals))
-			insMS[table] = append(insMS[table], heMS(time.Since(t0)))
-			cutoffs[table] = r.spec.start.Add(r.offset).Add(time.Duration(k+1) * heTick)
-		}
-		res, el := fx.passTick(ps, cutoffs)
-		passMS = append(passMS, heMS(el))
-		got := map[store.HistoryRetentionTable]heTickRes{}
-		for _, x := range res {
-			if x.Table != "" {
-				got[x.Table] = x
+			if err := fx.insertRowsCtx(arrCtx, r.spec, int64(r.spec.n+k*r.arrivals), int64(r.spec.n+(k+1)*r.arrivals)); err != nil {
+				stop, stopDetail = heStopArrivalError, fmt.Sprintf("arrivals of %s at tick %d: %v", heShort(table), k, err)
+				if errors.Is(err, context.DeadlineExceeded) || arrCtx.Err() != nil {
+					stop = heStopWallCap
+				}
+				break tickLoop
 			}
+			insMS[table] = append(insMS[table], heMS(time.Since(t0)))
+			cutoffs[table] = r.cutoff0.Add(time.Duration(k+1) * heTick)
 		}
+		res, perrs, el := fx.passTick(state, cutoffs)
+		passMS = append(passMS, heMS(el))
+		for _, e := range perrs {
+			passErrs = append(passErrs, fmt.Sprintf("tick %d: %s", k, e))
+		}
+		got := map[store.HistoryRetentionTable]heTickRes{}
 		slow := false
 		for _, x := range res {
+			got[x.Table] = x
 			slow = slow || x.DelMS > 100
 		}
 		if slow && len(slowSamples) < 300 {
 			// What the server was doing when a batch was slow: autovacuum, checkpoints.
+			sample := map[string]any{"tick": k, "pass_ms": heMS(el)}
 			var vac, ckpt, workers int64
-			_ = fx.pool.QueryRow(fx.ctx, `SELECT (SELECT count(*) FROM pg_stat_progress_vacuum),
+			if err := fx.pool.QueryRow(fx.ctx, `SELECT (SELECT count(*) FROM pg_stat_progress_vacuum),
 			        (SELECT num_timed + num_requested FROM pg_stat_checkpointer),
-			        (SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'autovacuum worker')`).Scan(&vac, &ckpt, &workers)
-			slowSamples = append(slowSamples, map[string]any{"tick": k, "pass_ms": heMS(el), "vacuum_running": vac, "checkpoints": ckpt, "av_workers": workers,
-				"ms": func() map[string]float64 {
-					m := map[string]float64{}
-					for _, x := range res {
-						m[heShort(x.Table)] = x.DelMS
-					}
-					return m
-				}()})
+			        (SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'autovacuum worker')`).Scan(&vac, &ckpt, &workers); err != nil {
+				sample["obs_unavailable"] = err.Error()
+			} else {
+				sample["vacuum_running"], sample["checkpoints"], sample["av_workers"] = vac, ckpt, workers
+			}
+			ms := map[string]float64{}
+			for _, x := range res {
+				ms[heShort(x.Table)] = x.DelMS
+			}
+			sample["ms"] = ms
+			slowSamples = append(slowSamples, sample)
 		}
 		for _, table := range fx.tables {
 			r := runs[table]
 			x, ok := got[table]
-			if !ok { // not reached this tick (deadline or earlier unknown outcome)
+			if !ok { // not reached this tick (deadline, earlier unknown outcome or a failed session open)
 				x = heTickRes{Table: table, Err: "skipped"}
 			}
 			r.delByTick = append(r.delByTick, x.N)
 			r.msByTick = append(r.msByTick, x.DelMS)
 			r.batchByTk = append(r.batchByTk, x.Batch)
 			r.errByTick = append(r.errByTick, x.Err)
-			if r.backlogEnd < 0 && x.Err == "" && x.N < int64(x.Batch) {
-				r.backlogEnd = k
+			if r.firstShort < 0 && x.Err == "" && x.N < int64(x.Batch) {
+				r.firstShort = k
 			}
 		}
 		done = k + 1
 	}
-	for _, table := range fx.tables {
-		fx.reportCompressed(mode, cand, table, runs[table], done, ticks, insMS[table])
-	}
 	fx.log.rec("slow_ticks", map[string]any{"mode": mode, "cand": cand, "samples": slowSamples})
 	fx.log.rec("compressed_pass", map[string]any{"mode": mode, "cand": cand, "ticks_done": done, "ticks_planned": ticks,
+		"stop_reason": stop, "stop_detail": stopDetail, "pass_errors": len(passErrs), "pass_error_sample": heSample(passErrs),
 		"pass_median_ms": heQuant(passMS, 0.5), "pass_max_ms": heMaxF(passMS), "pass_p99_ms": heQuant(passMS, 0.99)})
-	// near-empty tick after the run: cutoff at the last tick's value (everything below is gone)
+	// Reporting sequence, one order: the loop has ended; count what is still eligible at the probe
+	// cutoff; probe near-empty ticks only on a drained table; only then is a label emitted.
+	probes := map[store.HistoryRetentionTable]heProbe{}
 	for _, table := range fx.tables {
-		r := runs[table]
-		cut := r.spec.start.Add(r.offset).Add(time.Duration(done) * heTick)
-		ex := fx.explain(table, cut, heMaxBatch)
-		var del []float64
-		var n int64
-		for i := 0; i < 5; i++ {
-			x := fx.oneTick(table, cut, heMaxBatch)
-			del = append(del, x.DelMS)
-			n += x.N
-		}
-		kv := ex.kv()
-		kv["table"], kv["cand"], kv["mode"] = fx.tableLabel(table), cand, mode
-		kv["noop_median_ms"], kv["noop_max_ms"], kv["noop_deleted"] = heQuant(del, 0.5), heMaxF(del), n
-		sz := fx.sizes(table, cand)
-		for a, b := range sz.kv() {
-			kv[a] = b
-		}
-		for a, b := range fx.tableStats(table) {
-			kv[a] = b
-		}
-		fx.log.rec("near_empty", kv)
+		probes[table] = fx.nearEmptyProbe(mode, cand, table, runs[table], done)
+	}
+	for _, table := range fx.tables {
+		fx.reportCompressed(mode, cand, table, runs[table], heOutcome{done: done, planned: ticks, stop: stop, stopDetail: stopDetail,
+			insMS: insMS[table], probe: probes[table], passErrs: passErrs})
 	}
 }
 
-// reportCompressed evaluates the drain gate for one table: while a backlog exists, deletes exceed
-// arrivals over every complete 4-tick rotation cycle and over the whole backlog interval.
-func (fx *heFx) reportCompressed(mode, cand string, table store.HistoryRetentionTable, r *heTabRun, done, planned int, insMS []float64) {
+// heSample returns up to the first three entries of xs.
+func heSample(xs []string) []string { return append([]string{}, xs[:min(len(xs), 3)]...) }
+
+// heProbe is the pre-probe residual count and, on a drained table, the near-empty probes.
+type heProbe struct {
+	Residual    int64
+	Valid       bool // residual 0, so the probes ran and mean what they say
+	Errors      []string
+	NoopDeleted int64
+}
+
+// nearEmptyProbe counts the rows still eligible at the cutoff of the last tick (everything below it
+// should be gone). With any left no near-empty probe runs: a probe that deletes is not near-empty.
+func (fx *heFx) nearEmptyProbe(mode, cand string, table store.HistoryRetentionTable, r *heTabRun, done int) heProbe {
 	fx.t.Helper()
-	end := done // ticks [0, end) have a backlog
-	if r.backlogEnd >= 0 {
-		end = r.backlogEnd
+	cut := r.cutoff0.Add(time.Duration(done) * heTick)
+	var p heProbe
+	p.Residual = fx.one(`SELECT count(*) FROM `+string(table)+` WHERE `+heEligibleWhere(table), cut)
+	kv := map[string]any{"table": fx.tableLabel(table), "cand": cand, "mode": mode, "residual_backlog": p.Residual}
+	if p.Residual > 0 {
+		kv["near_empty_valid"] = false
+	} else {
+		p.Valid = true
+		kv["near_empty_valid"] = true
+		for a, b := range fx.explain(table, cut, heMaxBatch).kv() {
+			kv[a] = b
+		}
+		var del []float64
+		for i := 0; i < 5; i++ {
+			x := fx.oneTick(table, cut, heMaxBatch)
+			del = append(del, x.DelMS)
+			p.NoopDeleted += x.N
+			if x.Err != "" {
+				p.Errors = append(p.Errors, x.Err)
+			}
+		}
+		kv["noop_median_ms"], kv["noop_max_ms"], kv["noop_deleted"] = heQuant(del, 0.5), heMaxF(del), p.NoopDeleted
+		kv["probe_errors"], kv["probe_error_sample"] = len(p.Errors), heSample(p.Errors)
+	}
+	for a, b := range fx.sizes(table, cand).kv() {
+		kv[a] = b
+	}
+	for a, b := range fx.tableStats(table) {
+		kv[a] = b
+	}
+	fx.log.rec("near_empty", kv)
+	return p
+}
+
+// heOutcome is the run-wide part of a compressed report.
+type heOutcome struct {
+	done, planned int
+	stop          string
+	stopDetail    string
+	insMS         []float64
+	probe         heProbe
+	passErrs      []string
+}
+
+// reportCompressed emits the label of one table. The drain claim is the residual: nothing eligible
+// at the probe cutoff after the whole observed window. Cycle statistics before the first short
+// batch are informational only.
+func (fx *heFx) reportCompressed(mode, cand string, table store.HistoryRetentionTable, r *heTabRun, o heOutcome) {
+	fx.t.Helper()
+	done := o.done
+	end := done // informational window: ticks before the first clean short batch
+	if r.firstShort >= 0 {
+		end = r.firstShort
 	}
 	var cum, cycles, badCycles, worstDeficit int64
 	var cyc int64
@@ -1237,27 +1646,14 @@ func (fx *heFx) reportCompressed(mode, cand string, table store.HistoryRetention
 			cyc = 0
 		}
 	}
-	arrivalsOverBacklog := int64(end * r.arrivals)
-	var timeouts, lockTO, unknown, skipped int
-	for _, e := range r.errByTick {
-		switch {
-		case e == "57014":
-			timeouts++
-		case e == "55P03":
-			lockTO++
-		case e == "skipped":
-			skipped++
-		case e != "":
-			unknown++
-		}
-	}
+	confirmed, unknown, timeouts, rollbacks, skipped, lockTO := r.kinds()
 	var total int64
 	for _, d := range r.delByTick {
 		total += d
 	}
 	steady := r.msByTick
-	if r.backlogEnd >= 0 && r.backlogEnd < len(steady) {
-		steady = steady[r.backlogEnd:]
+	if r.firstShort >= 0 && r.firstShort < len(steady) {
+		steady = steady[r.firstShort:]
 	}
 	over300 := 0
 	for _, m := range r.msByTick {
@@ -1265,17 +1661,30 @@ func (fx *heFx) reportCompressed(mode, cand string, table store.HistoryRetention
 			over300++
 		}
 	}
-	kv := map[string]any{"table": fx.tableLabel(table), "cand": cand, "mode": mode, "ticks_done": done, "ticks_planned": planned,
-		"arrivals_per_tick": r.arrivals, "backlog_end_tick": r.backlogEnd, "backlog_ticks": end,
-		"backlog_deleted": cum, "backlog_arrivals": arrivalsOverBacklog, "backlog_whole_ok": cum > arrivalsOverBacklog || end == 0,
-		"cycles": cycles, "cycles_not_exceeding": badCycles, "worst_cycle_deficit": worstDeficit,
-		"total_deleted": total, "total_arrivals": int64(done * r.arrivals),
-		"timeouts_57014": timeouts, "lock_timeouts_55P03": lockTO, "unknown": unknown, "skipped": skipped, "ticks_over_300ms": over300,
+	covered := 1.0
+	if r.required > 0 {
+		covered = min(1, float64(confirmed)/float64(r.required))
+	}
+	kv := map[string]any{"table": fx.tableLabel(table), "cand": cand, "mode": mode, "ticks_done": done, "ticks_planned": o.planned,
+		"ticks_required": r.required, "ticks_confirmed": confirmed, "window_covered_fraction": covered,
+		"stop_reason": o.stop, "stop_detail": o.stopDetail,
+		"arrivals_per_tick": r.arrivals, "eligible_initial": r.eligible0,
+		"window_deleted": total, "window_arrivals": int64(done * r.arrivals),
+		"residual_backlog": o.probe.Residual, "near_empty_valid": o.probe.Valid,
+		"probe_errors": len(o.probe.Errors), "probe_error_sample": heSample(o.probe.Errors), "probe_noop_deleted": o.probe.NoopDeleted,
+		"pass_errors": len(o.passErrs), "pass_error_sample": heSample(o.passErrs),
+		"first_short_batch_tick": r.firstShort, "info_cycles": cycles, "info_cycles_not_exceeding": badCycles,
+		"info_worst_cycle_deficit": worstDeficit, "info_pre_short_deleted": cum,
+		"timeouts_57014": timeouts, "unknown": unknown, "other_rollbacks": rollbacks, "lock_timeouts_55P03": lockTO,
+		"skipped": skipped, "ticks_over_300ms": over300,
 		"del_median_ms": heQuant(r.msByTick, 0.5), "del_p99_ms": heQuant(r.msByTick, 0.99), "del_max_ms": heMaxF(r.msByTick),
 		"steady_median_ms": heQuant(steady, 0.5), "steady_p99_ms": heQuant(steady, 0.99), "steady_max_ms": heMaxF(steady),
-		"insert_median_ms": heQuant(insMS, 0.5), "insert_max_ms": heMaxF(insMS)}
-	reasons := heDiagnosticReasons(fx, false)
-	kv["qualifying"], kv["diagnostic_overrides"] = len(reasons) == 0, reasons
+		"insert_median_ms": heQuant(o.insMS, 0.5), "insert_max_ms": heMaxF(o.insMS)}
+	coverage := fx.coverageReasons(false, nil)
+	run := heRunReasons(heRunFacts{Required: r.required, Confirmed: confirmed, Stop: o.stop, Unknown: unknown, Timeouts: timeouts,
+		Rollbacks: rollbacks, Skipped: skipped, Residual: o.probe.Residual, PassErrors: len(o.passErrs),
+		ProbeErrors: len(o.probe.Errors), NoopDeleted: o.probe.NoopDeleted})
+	kv["coverage_reasons"], kv["run_reasons"], kv["qualifying"] = coverage, run, len(coverage) == 0 && len(run) == 0
 	// compact per-tick record: deletes per tick and latency, in 50-tick blocks to keep the log small
 	var blockDel []int64
 	var blockMax []float64
@@ -1290,13 +1699,13 @@ func (fx *heFx) reportCompressed(mode, cand string, table store.HistoryRetention
 		blockDel, blockMax = append(blockDel, s), append(blockMax, mx)
 	}
 	kv["block50_deleted"], kv["block50_max_ms"] = blockDel, heRound(blockMax)
-	if end > 0 && end <= 400 {
-		kv["backlog_delete_per_tick"] = r.delByTick[:end]
+	if len(r.delByTick) <= 400 {
+		kv["delete_per_tick"] = r.delByTick
 	}
 	fx.log.rec("compressed", kv)
-	fx.t.Logf("compressed %s %s %s: ticks %d/%d backlog_end %d, backlog deleted %d vs arrivals %d (cycles %d, not exceeding %d), steady median %.1f max %.1f ms, 57014=%d",
-		mode, fx.tableLabel(table), cand, done, planned, r.backlogEnd, cum, arrivalsOverBacklog, cycles, badCycles,
-		heQuant(steady, 0.5), heMaxF(steady), timeouts)
+	fx.t.Logf("compressed %s %s %s: ticks %d/%d (required %d, confirmed %d) stop %s residual %d, steady median %.1f max %.1f ms, 57014=%d qualifying=%v",
+		mode, fx.tableLabel(table), cand, done, o.planned, r.required, confirmed, o.stop, o.probe.Residual,
+		heQuant(steady, 0.5), heMaxF(steady), timeouts, len(coverage) == 0 && len(run) == 0)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1326,13 +1735,9 @@ func (heStubSweeper) Sweep(context.Context) (workersvc.SweepResult, error) {
 // writer runs.
 func TestHistoryRetentionSmokeEvidenceLiveDB(t *testing.T) {
 	fx := newHeFx(t, true)
-	idx := map[store.HistoryRetentionTable]string{}
-	for _, table := range store.HistoryRetentionTables() {
-		idx[table] = "none"
-	}
-	for _, kv := range heList("UZI_EVIDENCE_SMOKE_INDEXES", nil) {
-		p := strings.SplitN(kv, "=", 2)
-		idx[heTableByShort(p[0])] = p[1]
+	idx, err := heParseSmokeIndexes(os.Getenv("UZI_EVIDENCE_SMOKE_INDEXES"))
+	if err != nil {
+		t.Fatal(err)
 	}
 	const expiredRows = 30_000
 	now := time.Now().UTC()
@@ -1343,12 +1748,11 @@ func TestHistoryRetentionSmokeEvidenceLiveDB(t *testing.T) {
 		fx.reseed(spec)
 		fx.setIndex(table, idx[table])
 		fx.exec(`CHECKPOINT`)
-		var expired int64
-		where := heExpiryCol(table) + ` < now() - interval '24 hours'`
-		if table == store.HistoryRetentionPRHistoryEvents {
-			where += ` AND NOT first_merge`
+		var dbCutoff time.Time
+		if err := fx.pool.QueryRow(fx.ctx, `SELECT now() - interval '24 hours'`).Scan(&dbCutoff); err != nil {
+			t.Fatalf("read the database clock: %v", err)
 		}
-		expired = fx.one(`SELECT count(*) FROM ` + string(table) + ` WHERE ` + where)
+		expired := fx.one(`SELECT count(*) FROM `+string(table)+` WHERE `+heEligibleWhere(table), dbCutoff)
 		fx.log.rec("smoke_fixture", map[string]any{"table": string(table), "cand": idx[table], "expired_ordinary": expired,
 			"start": spec.start.Format(time.RFC3339)})
 		if expired < 25_000 {
@@ -1434,8 +1838,12 @@ func TestHistoryRetentionSmokeEvidenceLiveDB(t *testing.T) {
 	kv["per_table_delta_ok"], kv["smoke_pass"] = perTable, pass2
 	kv["indexes"] = fmt.Sprint(idx)
 	kv["server_version"] = fx.serverVersion()
-	reasons := heDiagnosticReasons(fx, true)
-	kv["qualifying"], kv["diagnostic_overrides"] = len(reasons) == 0, reasons
+	coverage := fx.coverageReasons(true, idx)
+	run := []string{}
+	if !pass2 {
+		run = append(run, "smoke gate failed")
+	}
+	kv["coverage_reasons"], kv["run_reasons"], kv["qualifying"] = coverage, run, len(coverage) == 0 && len(run) == 0
 	av := map[string]bool{}
 	for _, table := range store.HistoryRetentionTables() {
 		off, _ := fx.autovacuumState(table)
@@ -1444,9 +1852,9 @@ func TestHistoryRetentionSmokeEvidenceLiveDB(t *testing.T) {
 	kv["autovacuum_off"] = av
 	fx.log.rec("smoke", kv)
 	fx.log.rec("smoke_slog", map[string]any{"log": truncateTail(logs, 60_000)})
-	t.Logf("smoke: %d ticks, max %.0f ms, deltas %v, confirmed %d <= %d, pass=%v qualifying=%v", len(recs), maxDur, deltas, sumConfirmed, sumDelta, pass2, len(reasons) == 0)
-	if len(reasons) > 0 {
-		t.Logf("smoke is diagnostic only, not qualifying evidence: %s", strings.Join(reasons, "; "))
+	t.Logf("smoke: %d ticks, max %.0f ms, deltas %v, confirmed %d <= %d, pass=%v qualifying=%v", len(recs), maxDur, deltas, sumConfirmed, sumDelta, pass2, len(coverage) == 0 && len(run) == 0)
+	if len(coverage) > 0 {
+		t.Logf("smoke is diagnostic only, not qualifying evidence: %s", strings.Join(coverage, "; "))
 	}
 	if !pass2 {
 		t.Errorf("smoke gate failed: max tick %.0f ms (limit 2000), confirmed %d vs table delta %d (confirmed must not exceed it), per-table delta ok %v", maxDur, sumConfirmed, sumDelta, perTable)
@@ -1476,10 +1884,14 @@ func truncateTail(s string, n int) string {
 //	                           opens a separate backend first on its own pool; the tick is the
 //	                           first work on fx.pool.
 func TestHistoryRetentionColdEvidenceLiveDB(t *testing.T) {
-	table := heTableByShort(os.Getenv("UZI_EVIDENCE_COLD_TABLE"))
+	heRequireOptIn(t)
+	table, err := heTableByShort(os.Getenv("UZI_EVIDENCE_COLD_TABLE"))
+	if err != nil {
+		t.Fatalf("UZI_EVIDENCE_COLD_TABLE: %v", err)
+	}
 	if os.Getenv("UZI_EVIDENCE_COLD_SETUP") == "1" {
 		fx := newHeFx(t, true)
-		cand := heList("UZI_EVIDENCE_CANDS", []string{"none"})[0]
+		cand := fx.cands[0]
 		spec := fx.stdSpec(table)
 		fx.reseed(spec)
 		fx.setIndex(table, cand)
@@ -1491,12 +1903,12 @@ func TestHistoryRetentionColdEvidenceLiveDB(t *testing.T) {
 	}
 	fx := newHeFx(t, false)
 	spec := fx.stdSpec(table)
-	cutoff := spec.start.Add(-time.Hour)
+	cutoff, _ := heCaseCutoff(spec, 0)
 	switch os.Getenv("UZI_EVIDENCE_COLD_CASE") {
 	case "a":
-		cutoff = spec.frac(0.0205)
+		cutoff, _ = heCaseCutoff(spec, 0.0205)
 	case "b":
-		cutoff = spec.frac(0.90)
+		cutoff, _ = heCaseCutoff(spec, 0.90)
 	case "c":
 	default:
 		t.Fatal("UZI_EVIDENCE_COLD_CASE must be a, b or c")
