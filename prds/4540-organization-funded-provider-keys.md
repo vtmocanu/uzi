@@ -3,7 +3,7 @@
 **Issue**: [#4540](https://github.com/vtmocanu/uzi/issues/4540)
 **Umbrella**: #4319
 **Priority / area**: High / security
-**Status**: v7 (opus final pass APPROVE folded). Anchors verified at `d63a86d90` (2026-11-27). The provider area is unchanged since `bc0348e1a`. Split by owner decision 2026-11-27 into M1 (custody and admin Test) and M2 (recipients). **M1 delivered (owner acceptance #4770 M1 pending); M2 not started.**
+**Status**: v8 (M2 dual architecture review at `d04cf1ae` folded). M2 anchors re-verified at `cba1fb0d7` (2026-11-28); M1 (`fc9553a8`) and #4574 M2 (`529ebaa7`) changed this area since v7. Split by owner decision 2026-11-27 into M1 (custody and admin Test) and M2 (recipients). **M1 delivered (owner acceptance #4770 M1 pending); M2 not started.**
 **Entry prerequisites**: met. #4324 (PR #4656) and its Codex extension #4633 (PR #4705), #4505 (PR #4551), and #4322 M1a (judge, PR #4678) and M1b (jobs, PR #4742) are all merged. There is no implementation dependency on #4323, #4496 or #50. Each milestone needs the user's dispatch go.
 **Disposition**: one milestone per gated run, with no on-deck enrollment. Each PR is `non_closing` (`Refs #4540`). The issue closes when M2's owner acceptance passes in #4770.
 
@@ -45,10 +45,10 @@ Examples:
 
 These are recipient-trust conditions, not a promise of per-user isolation at the gateway. Use is restricted to the deploying organization's authorized users, per the umbrella's terms. Re-checking those terms is a maintainer obligation.
 
-## Current seams (verified at `d63a86d90`)
+## Current seams (verified at `cba1fb0d7`, after M1)
 
-- **Recipient fence.** The only recipient check is `credential_mode = 'per_user_key'`. It appears at 24 sites in `api/internal/store/queries/model_providers.sql`, and `api/internal/store/model_provider_visibility_sql_test.go` classifies each one.
-  - `classShared` requires that exact scope and refuses `ciphertext`/`sealed_with`. The test scans only that one file.
+- **Recipient fence.** The only recipient check is `credential_mode = 'per_user_key'`. It appears at 14 sites in `api/internal/store/queries/model_providers.sql`; M1 moved the admin statements to `IN ('per_user_key', 'operator_key')`. `api/internal/store/model_provider_visibility_sql_test.go` classifies each statement.
+  - `classShared` admits either scope form (`sharedScopeRE`) and refuses `ciphertext`/`sealed_with`. M1 added `classOperatorCustody` and a custody-table rule: a statement naming a custody table outside that class fails, except the two admin readers in `adminCustodyJoinReaders`. The test scans only that one file.
   - The shared-scope FKs and the scope CHECKs admit the nil scope for any mode. For operator definitions the fence is therefore the SQL predicate plus the handler, which narrows ADR-4324 D3.
 - **Shared lock and pre-read.**
   - `LockModelProviderForShare` serves source select (`setMyProviderSource`, `api/internal/handler/providers_source.go`), key PUT and the run freeze.
@@ -56,8 +56,8 @@ These are recipient-trust conditions, not a promise of per-user isolation at the
   - `DeleteMyProviderKey` and `PatchMyProviderKeyEnabled` (`api/internal/handler/providers.go`) start with the per-user-key mutation lock.
   - `ListRunProviderNames` returns the provider's current, mutable `p.name` to the run's owner.
 - **Admin catalogue.**
-  - Every admin query, and the `CountSharedModelProviders` cap, filter on `per_user_key`.
-  - `api/internal/handler/providers_admin.go` hardcodes `sharedProviderMode`.
+  - Every admin query, and the `CountSharedModelProviders` cap, cover both modes (M1).
+  - `api/internal/handler/providers_admin.go` has one constant per mode; per_user_key definitions refuse operator routes with 409 `provider_not_operator_key`.
   - `AdminPatchSharedProvider` refuses destination fields (ADR-4324 D5), and `decodeProviderBody` uses `DisallowUnknownFields`.
   - Writes require cookie plus CSRF admin. `uzi admin provider list|get` (`api/cmd/uzi/admin_provider.go`) is read-only.
 - **Creation.**
@@ -70,16 +70,17 @@ These are recipient-trust conditions, not a promise of per-user isolation at the
   - `runs_model_provider_key_mode_check` (migration 00481) admits `user_key` only, and the binding check is all-or-none.
   - 69 SQL sites copy the mode verbatim.
 - **Claim.**
-  - `assembleProviderBinding` opens the key. The finisher's `lockedProviderRefusal` re-checks under `beginReadCommitted` after the open and before delivery. It locks the key row `FOR SHARE NOWAIT` and the revision `FOR KEY SHARE OF r NOWAIT`, and takes no provider-row lock (ADR-4324 D7).
-  - Judges and jobs settle a provider refusal terminally (`claim_recovery.go`, the D-G arm).
+  - `assembleProviderBinding` opens the key. The finisher's `lockedProviderRefusal` re-checks after the open and before delivery. It locks the key row `FOR SHARE NOWAIT` and the revision `FOR KEY SHARE OF r NOWAIT`, and takes no provider-row lock (ADR-4324 D7).
+  - Isolation at the pin: `finishRunClaimTx` begins READ COMMITTED (`beginClaimFinish`, `claim_recovery.go`). `finishChatClaimTx` (`workersvc/chat.go`), `createRunAtomic` (`workersvc/harness_resolver.go`), `createChatRunBound` and `continueChatBound` (`workersvc/chat.go`) and `promoteCredentialDisabledRun` (`workersvc/credential_disabled.go`) begin on the plain pool at the database default.
+  - Judges and jobs settle a provider refusal terminally (`claim_recovery.go`, the D-G arm). #4574 M2's provider checker child settles lead-first as `checker_unavailable`.
   - Issue, task and chat runs park through `ParkCredentialDisabledRun` / `ParkCredentialDisabledChatRun` (`api/internal/store/queries/credential_disabled.sql`). Their reason guard admits four literals; a 0-row park becomes `errClaimRecoveryStale`.
-  - The Claude checker lane refuses any selected Claude source. `GetUserProviderLaneSources` returns ids only.
+  - The Claude checker lane refuses any selected Claude source, at creation (`checkerLaneDecision`, `workersvc/harness_resolver.go`) and at claim (`workersvc/claim_assembly.go`). `GetUserProviderLaneSources` returns ids only.
 - **Holds.**
   - `promoteCredentialDisabledRun` re-queues a `provider_destination_not_allowed` hold, and rewrites it to stale only through `RewriteProviderDestinationHoldStale` (fenced on run and generation).
   - `ListCredentialDisabledRuns` excludes `provider_binding_stale`.
   - `ResumePausedRun` refuses both existing provider holds, and `api/internal/handler/resume.go` names each one.
 - **Other.**
-  - Decrypt sinks today are exactly two: user Test and `assembleProviderBinding`. Per-user Test evidence is kept in `model_provider_key_test_results`.
+  - Decrypt sinks today are three: user Test, `assembleProviderBinding` (personal keys) and admin Test (`handler/providers_admin_probe.go`, `operatorkey.Open`, M1). Per-user Test evidence is kept in `model_provider_key_test_results`.
   - The picker derives `has_key` from the personal key join (`web/src/components/Providers.tsx`).
   - #4505 redaction (`providerKeyForms`), the pre-push key scan, the held `providerKeyScan` and #4322 M1b's job output scan are keyed on `claim.secrets.provider.credential` and ignore mode.
   - `Box.SealWithAAD` / `OpenWithAAD` (`api/internal/secretbox/secretbox.go`).
@@ -135,6 +136,12 @@ These are recipient-trust conditions, not a promise of per-user isolation at the
   - M1: the admin key writer and admin Test;
   - M2: those two plus `workersvc/provider_claim.go`.
   The AAD helper's callers are pinned the same way.
+- **M2 classifier contract.** M2 statements break M1's rules by design, so M2 adds these entries to `model_provider_visibility_sql_test.go`, each with exact predicates and pinned callers:
+  - (a) **Grant-aware recipient class.** Exact predicate: the per-user-key predicate `OR (p.owner_user_id IS NULL AND p.credential_mode = 'operator_key' AND (p.operator_all_users OR EXISTS (SELECT 1 FROM model_provider_grants g WHERE g.provider_id = p.id AND g.user_id = <entry id>)))`. Statements: `ListVisibleProviders`, `GetVisibleProviderForUse`, the select lock, `ListRunProviderNames` (entry id `r.user_id`), and the Claude part of `SetUserProviderSource` only; its Codex part keeps the per-user-key rule.
+  - (b) **Custody-status join allowance** for the two handler readers above (list and get). They may project custody presence and disabled only, never `ciphertext`, the custody `id`, `key_rev` or `set_by`. Reuse the `adminCustodyJoinReaders` leak check.
+  - (c) **Caller-pinned operator identity statements:** the selected-source resolver (it projects the custody `id` and `key_rev` for the freeze), the freeze lock, the inherit lock and the two revision twins (R8). Callers: `workersvc/provider_source.go` and `workersvc/provider_claim.go`, plus `workersvc/credential_override.go` for the resolver if it stays a direct caller.
+  - (d) **Claim sink:** the statement that reads `ciphertext`, pinned to `workersvc/provider_claim.go`. The custody `Open` caller set becomes {`handler/providers_admin_probe.go`, `workersvc/provider_claim.go`}.
+  - (e) **Grants-table marker rule.** Only these may name `model_provider_grants`, each caller-pinned: the admin grant writers and the paged admin grant reader (`handler/`), the class (a) readers, the selected-source resolver, and the internal grant checks at claim (both decisions), inherit and promotion (`workersvc/provider_claim.go`, `workersvc/provider_source.go`, `workersvc/credential_disabled.go`). Ciphertext access stays pinned separately by (d).
 - **One query file.** New queries go in `queries/model_providers.sql`, or the classifier's file list is extended.
 - **Immutability scan.** It is extended with canaries:
   - no UPDATE of a custody row's `provider_id`;
@@ -143,7 +150,18 @@ These are recipient-trust conditions, not a promise of per-user isolation at the
 
 ### R6. Grants and locks (M2)
 
-- **Grants.** `model_provider_grants(provider_id, user_id)` (PK, FK cascade to both tables), plus `model_providers.operator_all_users`. The default is no recipients. Named grants are capped at 10,000 per provider.
+- **Grants.** `model_provider_grants(provider_id, user_id)` (PK, FK cascade to both tables), plus `model_providers.operator_all_users boolean NOT NULL DEFAULT false`. The default is no recipients. Named grants are capped at 10,000 per provider.
+  - Index `model_provider_grants(user_id)` in the same migration (the table is new and empty, so no `CONCURRENTLY` file, D21). Without it the user-delete cascade and per-user reads scan up to 50 x 10,000 rows.
+  - `CHECK (NOT operator_all_users OR credential_mode IS NOT DISTINCT FROM 'operator_key')`, added NOT VALID and validated in a later file. A plain equality would let a personal row with NULL `credential_mode` pass.
+- **Admin grant API.** Routes follow the existing admin split (`handler/routes_admin.go`):
+  - `GET /api/admin/providers/{id}/grants?cursor=<user_id>&limit=<n>`: admin read-only group (`RequireAdminRO`), so `uzi admin provider get` can show it. Keyset cursor on `user_id`; `limit` defaults to 100, maximum 500. Returns `{operator_all_users, named_grant_count, grants: [{user_id, granted_at, granted_by}], next_cursor}`.
+  - `PUT /api/admin/providers/{id}/grants/{user_id}` and `DELETE` the same path: cookie plus CSRF. Idempotent: PUT of an existing grant and DELETE of a missing one both return 204 and write no audit line.
+  - `PUT /api/admin/providers/{id}/all-users` with `{enabled}`: cookie plus CSRF, idempotent.
+  - `POST /api/admin/providers/{id}/revoke-recipients`: cookie plus CSRF. Sets all-users off and deletes every named grant in one transaction; returns `{named_grants_removed}`.
+  - Every write takes `LockSharedModelProviderForEdit` (definition row) first, and refuses a `per_user_key` definition with M1's 409 `provider_not_operator_key`. Writes are allowed on a retired definition, because R11 removal must stay available after retire.
+  - Errors: unknown definition 404; unknown or deleted `user_id` 404 with reason `user_not_found`; a full cap 409 `provider_grant_cap_reached`. Bodies refuse unknown fields.
+  - `AdminSharedProviderDTO` gains `operator_all_users` and `named_grant_count`, with both `fixtures/api-contract/admin_shared_provider*.json` pairs updated and `web/src/lib/apiContract.test.ts` green.
+  - The `web/src/mocks/mockApi/providers.ts` mirror gains the same rules, with mock cases: a granted user sees the definition; an ungranted user gets 404; all-users; revoke-all; keyless, disabled and retired definitions are visible but blocked; a revoked selection.
 - **Writer invariant.** Every grant, all-users, key, edit, retire and delete write takes the definition row first: `FOR NO KEY UPDATE`, or `FOR UPDATE` for delete. A caller-order test pins this. Two writers are exempt, and the test names both exemptions explicitly:
   - a user-delete cascade of grants, which also cascades that user's runs;
   - revision prune (`PruneSharedModelProviderRevisions`), its own statement after the edit commit, with no definition lock. It deletes only revisions no run references. A frozen run references its own revision, and the retained revision `FOR KEY SHARE OF r NOWAIT` covers the prune-first order. Prune does not gain a definition lock.
@@ -155,7 +173,7 @@ These are recipient-trust conditions, not a promise of per-user isolation at the
 
 ### R7. Readers (M2)
 
-- **Public readers.** `ListVisibleProviders`, `GetVisibleProviderForUse` and `SetUserProviderSource` gain the branch `credential_mode = 'operator_key' AND (operator_all_users OR exact grant)`. An ungranted caller gets the same opaque 404 or empty result as an unknown ID.
+- **Public readers.** `ListVisibleProviders`, `GetVisibleProviderForUse` and the Claude part of `SetUserProviderSource` gain the R5 (a) branch. The Codex part of `SetUserProviderSource` keeps the per-user-key rule. An ungranted caller gets the same opaque 404 or empty result as an unknown ID.
 - **User key and Test routes.** This covers `TestMyProvider`, key PUT, key DELETE and key enable/disable. Each first runs the grant-aware pre-read (`GetVisibleProviderForUse`). DELETE and enable/disable gain that pre-read ahead of their per-user-key mutation lock. Outcomes:
   - a caller who can see the operator definition gets a 409 with a stable "the organization manages this key" message, before any key read or lock;
   - an ungranted or revoked caller gets the unknown-ID 404.
@@ -175,6 +193,7 @@ These are recipient-trust conditions, not a promise of per-user isolation at the
   - Otherwise it returns no row. The run and its frozen binding are kept.
   - The query is classified as grant-aware.
 - **Revocation and delete.** On revocation the source reference is kept; the owner can clear or replace it, and no now-private metadata is disclosed. Admin delete stays refused while anyone selects the definition, revoked users included (ADR-4324 D8).
+  - **Web control for a missing selection.** Today `web/src/components/Providers.tsx` renders a missing selection as "a provider that no longer exists", and with providers enabled its only "Stop using" control sits inside the provider row, which a revoked user no longer gets. When the selected source for an engine is absent from the visible list, render a top-level "Stop using" for that engine, with neutral copy: "This organization provider is no longer available to you. Ask an admin, or stop using it." The copy is identical for a deleted and a revoked id, so it stays opaque and discloses no name or URL. The CLI already clears it (`uzi provider use --none`).
 
 ### R8. Frozen binding (M2)
 
@@ -206,9 +225,10 @@ These are recipient-trust conditions, not a promise of per-user isolation at the
 - A permitted open may be followed by a denial; no mixed authority is ever delivered.
 - A change committed after the final decision applies at the next claim (#4320 D9).
 - **READ COMMITTED is an invariant (D18).** Revoke locks the definition row but does not update it, so a grant read after the lock sees the committed revoke only under READ COMMITTED.
-  - The finisher already begins RC (`beginReadCommitted`).
-  - Creation's authority transactions begin READ COMMITTED explicitly: the select, the freeze in `createRunAtomic` and the other freeze callers, and inherited creation. They must not rely on the database default, because the repo already tests paths under a `default_transaction_isolation = 'repeatable read'` database (`credential_switch_hold_livedb_test.go`).
-  - Admin authority transactions are RC as well.
+  - Already RC: `finishRunClaimTx` (`beginClaimFinish`), the select (`setMyProviderSource`, `withSecretLock`) and the admin writers (`withAdminTx`).
+  - Must switch to `s.beginReadCommitted`, by function: `finishChatClaimTx` and `createChatRunBound` and `continueChatBound` (`workersvc/chat.go`), `createRunAtomic` (`workersvc/harness_resolver.go`), and `promoteCredentialDisabledRun` (`workersvc/credential_disabled.go`). Any other freeze or inherit caller found by the run is added to this list, not left at the default.
+  - They must not rely on the database default, because the repo already tests paths under a `default_transaction_isolation = 'repeatable read'` database (`credential_switch_hold_livedb_test.go`). Under repeatable read, a grant read after the definition lock uses the snapshot of the transaction's first statement, so a revoke committed in between is missed and the chat claim delivers the key.
+  - The promoter needs RC too: a stale snapshot could release a destination hold instead of rewriting it to `provider_not_granted`, and a later re-grant would then let the run continue without the explicit Resume (D17).
 - **ADR-4324 D7 amendment.** It adds operator rows only:
   - admin key set/replace/disable/enable/delete;
   - grant add/remove and all-users;
@@ -222,14 +242,17 @@ These are recipient-trust conditions, not a promise of per-user isolation at the
 - **Where each reason appears.** Selection-based creation and preview, including schedule skips, return `provider_source_unusable` with detail `not_granted`. Inherited creation, the claim decisions and promotion return `provider_not_granted`.
 - **Lanes.** Issue, task and chat runs park. Widen the reason guard of both park writers in `credential_disabled.sql`. Judges and jobs fail terminally with the typed reason; jobs never park.
 - **Promoter.** A twin of `RewriteProviderDestinationHoldStale` rewrites a destination hold to `provider_not_granted`. It uses the same `id` / `user_id` / `claim_generation` fence under the run lock. `provider_not_granted` stays out of `ListCredentialDisabledRuns`, so it is never auto-promoted.
+  - **Accepted observation window.** The promoter sees a hold only during a pass (owner-requested or the sweep fallback, `workersvc/credential_disabled.go`). If a revoke and a re-grant both commit between two passes, no pass sees the revoke, and when the URL returns the destination hold re-queues under a grant that is valid by then. This is safe, because the claim decides again. The "explicit Resume" guarantee therefore holds only after a promoter pass observed the revoke.
 - **Resume (D17).** `ResumePausedRun` admits `provider_not_granted`. The next claim re-evaluates and re-parks with zero opens if the grant is still missing. `resume.go` changes nothing for this reason (no refusal arm), so it is not on the surface list; the hold copy, which says "ask an admin for access, then Resume", lives in the run DTO and the CLI and web renderers below.
 - **Creation refusal mapping.**
-  - `writeProviderCreateRefusal` (`api/internal/handler/providers_source.go`) gains an `ErrProviderNotGranted` arm: 409 with reason `provider_not_granted`. Without it, inherited creation reached from handlers falls through to a 500; this includes task follow-ups through `inheritOrigin` (`workersvc/task.go`).
+  - `writeProviderCreateRefusal` (`api/internal/handler/providers_source.go`) gains an `ErrProviderNotGranted` arm: 409 with reason `provider_not_granted`. Without it, inherited creation reached from handlers falls through to a 500. The handler-reachable inherited creations are the manual MR rework (`handler/mrrework_run.go`, through `workersvc/mr_rework.go` `InheritFrom`) and chat continuation (`handler/chat.go`, through `continueChatBound`). Task review and then-fix successors are server-enqueued, best effort (`workersvc/judge_enqueue.go` into `workersvc/task.go`); no handler reaches them, so they log the refusal and create no run.
   - `providerSourceReasonText` gains `not_granted` copy.
-  - `skipReasonForErr` (`api/internal/schedsvc/skip_reason.go`) gains a defensive arm beside its stale and destination arms. No current fire path inherits, but a future one would otherwise take the transient default and tick-storm.
+  - `skipReasonForErr` (`api/internal/schedsvc/skip_reason.go`) gains a defensive arm beside its stale and destination arms, returning a new closed-set SkipReason `provider_not_granted`: add it to `AllSkipReasons`, the TypeScript union and the mirror test (`web/src/lib/scheduleSkipReasons.test.ts`). No current fire path inherits, but a future one would otherwise take the transient default and tick-storm.
+  - `provider_not_granted` is `owner_resumable = true` (D17), unlike both existing provider holds.
 - **Surfaces** (the reason or the detail copy):
-  - API and CLI: `api/internal/apitypes/run.go`, `api/cmd/uzi/run.go`, `api/cmd/uzi/schedule_render.go`, `api/internal/handler/providers_source.go`, `api/internal/schedsvc/skip_reason.go`, `api/internal/store/queries/credential_disabled.sql`;
-  - web: `web/src/lib/apiTypes.ts`, `web/src/lib/runBadge.ts`, `web/src/lib/scheduleSkipReasons.ts`, `web/src/lib/startPreview.ts`, `web/src/components/LastRun.tsx`, `web/src/pages/RunView.tsx`;
+  - API and CLI: `api/internal/apitypes/run.go`, `api/cmd/uzi/run.go` (including `nonCompletionHolds`), `api/cmd/uzi/run_render.go`, `api/cmd/uzi/schedule_render.go`, `api/internal/handler/providers_source.go`, `api/internal/schedsvc/skip_reason.go`, `api/internal/store/queries/credential_disabled.sql`;
+  - the cross-language hold pin `fixtures/hold-reasons/presentation.json`;
+  - web: `web/src/lib/apiTypes.ts`, `web/src/lib/runBadge.ts` (the PARK config, including `ownerResumable`), `web/src/lib/scheduleSkipReasons.ts`, `web/src/lib/startPreview.ts`, `web/src/components/LastRun.tsx`, `web/src/pages/RunView.tsx`;
   - the `POST /jobs` 409 text in `api/openapi/v1.yaml`, plus `check:api-v1-compat`;
   - the `e2e/` sweep.
 
@@ -245,7 +268,7 @@ These are recipient-trust conditions, not a promise of per-user isolation at the
 
 - **Judge and jobs** (#4322 M1a, M1b) reuse the helpers and keep their settlement. Jobs spend under D9.
 - **Reachable after #4574 M2: an operator-funded Claude lead with a Codex provider checker**, at the plan and code stages. #4574's same-model guard reads the lead's revision by identity (R8). #4540 M2 owns these tests.
-- **Operator-funded Claude checker child.** #4540 M2 and #4322 M2 are serialized, and whichever lands second owns the integration tests. Until that integration lands, the Claude checker lane refuses an owner whose Claude source is in operator mode. `GetUserProviderLaneSources` gains the selected Claude definition's mode for this. Neither landing order therefore opens the path untested. See the #4322 amendment below.
+- **Operator-funded Claude checker child.** #4540 M2 and #4322 M2 are serialized, and #4540 M2 lands first. The existing blanket refusals already cover it: `checkerLaneDecision` refuses a Claude checker for any selected Claude source, and claim assembly refuses every provider-bound Claude cross-check. M2 adds no mode column to `GetUserProviderLaneSources` (it would be a dead branch) and pins the existing refusals with a test. The mode check moves to #4322 M2, which lifts the Claude-checker refusal (`prds/4322-custom-providers-server-lanes.md`, its M2 acceptance and D23).
 - **Isolated lane:** refused until #4322 M3.
 
 ### R13. Redaction, audit, docs
@@ -264,7 +287,7 @@ These are recipient-trust conditions, not a promise of per-user isolation at the
   - `docs/vault-threat-model.md`: the instance-sealed key under "What the vault protects — and what it does not" ("Not protected (by design)"), and what rotating `UZI_SECRET_KEY` does.
   - `adr/4324-admin-shared-providers.md`: the mode and engine, the narrowed D3, the M1 lock rows, migrations and rollback.
   - `specs/human.md`, AI-synced.
-- **Docs in M2.** The recipient and redirect residuals under "Residual risks (accepted)". In ADR-4324: the reader rule, the R9 D7 rows and the M2 rollback. Updates to the provider and CLI docs.
+- **Docs in M2.** The recipient and redirect residuals under "Residual risks (accepted)". In ADR-4324: the reader rule, the R9 D7 rows (the lock-order table in D19) and the M2 rollback. Updates to the provider and CLI docs. `specs/human.md`: replace the "not yet shipped (#4540 M1)" granting clause, AI-synced.
 
 ### R14. Migrations and rollback
 
@@ -273,7 +296,7 @@ These are recipient-trust conditions, not a promise of per-user isolation at the
   - M2: the grants table and all-users column, and the runs mode widening and its validation.
 - **Guarded Downs.** Each locks, then refuses while operator definitions, keys, grants or operator-bound runs exist. The M2 runs Down is permanently refused once any operator-bound run exists, terminal runs included (the 00481 convention).
 - **Image-only rollback.**
-  - Older images cannot see operator definitions.
+  - Pre-M1 images cannot see operator definitions at all; M1 images show them to admins only (the M1 admin catalogue) and to no recipient.
   - A pre-M1 image's per-user-key cap count can exceed 50.
   - Older images treat an `operator_key` binding as stale, and settle it by lane:
     - issue, task and chat claims park `provider_binding_stale`. That hold has no promoter and Resume refuses it, so it survives a re-upgrade;
@@ -333,7 +356,16 @@ These are recipient-trust conditions, not a promise of per-user isolation at the
 
 **Blocked by:** M1 and #4574 M2, because both change `claim_recovery.go` settlement and `provider_claim.go` authority. It is also serialized with #4322 M2 (R12).
 
-**Delivers:** R6 to R12; admin recipient management (user picker, count, all-users) and the incident-stop controls; the recipient badge in `web/src/components/Providers.tsx`; CLI MANAGED BY and mode rendering; the M2 audit, docs and migrations.
+**Delivers:** R6 to R12; the admin grant API (R6) and admin recipient management (user picker, count, all-users) with the incident-stop controls; the recipient badge and the missing-selection control in `web/src/components/Providers.tsx`; CLI MANAGED BY and mode rendering, and `uzi admin provider get` showing all-users and the named-grant count; the M2 audit, docs and migrations.
+
+**Internal build order** (one gated run; the plan mirrors these as its milestones):
+1. m1: schema, grant writers, admin grant API and UI, classifier entries for the writers;
+2. m2: recipient readers, select lock, resolver, user routes (409 and 404), picker, run names;
+3. m3: freeze lock, the R9 RC sites, mode dispatch, both claim decisions, settlement, promoter twin, Resume, surfaces;
+4. m4: inheritance;
+5. m5: lane rows (judge, job under D9, a Codex checker under an operator-funded lead), incident stop, CLI, docs.
+
+**Fallback split** (only if the plan exceeds the owner's budget): M2a = m1 to m3 plus m5, with one temporary fail-closed rule: `inheritProviderBinding` dispatches on the frozen mode first and refuses `operator_key` with `ErrProviderLaneUnsupported` (an existing 409 and skip reason, one test). M2b (blocked by M2a) = m4: the inherit identity lock, `ErrProviderNotGranted` at creation, the `writeProviderCreateRefusal` and `skipReasonForErr` arms, the new SkipReason and its mirrors, and the inherit acceptance rows. Order: M2a, M2b, then #4322 M2 (M2b and #4322 M2 both edit `workersvc/harness_resolver.go`).
 
 **Acceptance (mechanical):**
 - **LiveDB** (named PASS, zero SKIP, `-p 1`):
@@ -342,6 +374,11 @@ These are recipient-trust conditions, not a promise of per-user isolation at the
     - **Public select blocked:** the select returns the opaque unknown-ID 404 and leaves the user's selection unchanged.
     - **Freeze of an already-selected source blocked:** the freeze returns `provider_source_unusable` with detail `not_granted` and inserts no run.
     Both pin the separate in-lock re-read. Run both with the database default set to `repeatable read`, which pins the explicit RC begin.
+  - **Repeatable-read default, every R9 RC site.** With `default_transaction_isolation = 'repeatable read'`, a revoke committed after the transaction's first read and before its grant check (via a test hook):
+    - chat claim (`finishChatClaimTx`): parks on `provider_not_granted` with zero deliveries;
+    - inherited creation (MR rework and chat continuation): refuses `provider_not_granted` and inserts no successor;
+    - `createRunAtomic` freeze: refuses `not_granted` and inserts no run;
+    - promotion: rewrites the destination hold to `provider_not_granted`, which stays held after a re-grant until an explicit Resume.
   - **`not_granted` reachability:**
     - a selected-then-revoked definition reads `not_granted`, not `provider_missing`, at preview and create, with no URL, auth style or map;
     - a revoke between preview and freeze is refused at freeze;
@@ -350,12 +387,12 @@ These are recipient-trust conditions, not a promise of per-user isolation at the
   - **Claim:** zero opens on a preliminary denial (instrumented counter); zero deliveries on a revoke or rotation between assembly and the final check; two recipients plus an admin, both revoke/claim orders; NOWAIT contention, including against admin delete's `FOR UPDATE` cascade.
   - **Early key change (Example 3):** replace, disable/enable, and delete followed by restore, each committed before the claim. A queued old-key run refuses `provider_binding_stale` (not `provider_not_granted`) at the preliminary check, with zero opens, and never receives the replacement material.
   - **Operator identity twins:** an operator-bound run's revision is found by the twins at assembly, the final recheck, inherit and promotion. The per-user-key originals still miss it.
-  - **Creation refusal mapping:** an inherited task follow-up of a revoked run gets 409 `provider_not_granted`, not a 500. A unit test feeds `skipReasonForErr` an `ErrProviderNotGranted`.
+  - **Creation refusal mapping:** an inherited successor of a revoked run, created through the manual MR-rework route or chat continuation, answers 409 `provider_not_granted`, not a 500. A server-enqueued task successor of a revoked run logs the refusal and creates no run. A unit test feeds `skipReasonForErr` an `ErrProviderNotGranted` and gets the `provider_not_granted` SkipReason.
   - **Freeze fence:** a revoke (`FOR NO KEY UPDATE`) concurrent with a freeze either commits first, and the freeze refuses `not_granted`, or waits until the run insert commits.
   - **Holds:**
     - issue and chat parks on `provider_not_granted` write one row;
     - a revoked destination hold is rewritten to `provider_not_granted`;
-    - restoring both the URL and the grant still needs an explicit Resume;
+    - after a promoter pass observed the revoke, restoring both the URL and the grant still needs an explicit Resume (the R10 observation window is accepted);
     - Resume while still revoked re-parks with zero opens, and Resume after a re-grant runs;
     - precedence follows R8.
   - **Incident stop (R11):**
@@ -374,10 +411,11 @@ These are recipient-trust conditions, not a promise of per-user isolation at the
   - an operator-bound judge and job settle terminally on `provider_not_granted` and on stale, at both claim decisions;
   - a product-token job for a granted user binds the key and is refused once the user is ungranted (D9);
   - an operator-funded Claude lead with a Codex provider checker passes the same-model guard at both stages;
-  - the Claude checker lane refuses an operator-mode source, unless this PR carries the #4322 M2 rows.
+  - an operator-mode Claude source is refused at Claude-checker creation and at claim (the existing blanket refusals), pinned by a test.
 - **Handler:** the claim wire shape is pinned, with zero vendor release; `check:api-v1-compat` passes.
-- **Web:** picker tests pin the projected `has_key` / `key_enabled` for a granted recipient. The usable control is selectable with no personal-key controls or user Test. Negative cases sit next to it: a keyless, a disabled and a retired operator definition are each visible but blocked, with mode-aware copy.
-- **Classifier:** the M2 sink caller is pinned, and there is a canary for grant-row immutability.
+- **Web:** picker tests pin the projected `has_key` / `key_enabled` for a granted recipient. The usable control is selectable with no personal-key controls or user Test. Negative cases sit next to it: a keyless, a disabled and a retired operator definition are each visible but blocked, with mode-aware copy. A revoked selection renders the top-level "Stop using" with the neutral copy, identical for a deleted id (R7).
+- **Admin grant API (R6):** route groups (read-only GET, cookie plus CSRF writes); idempotent PUT/DELETE; paging bound and cursor; 409 `provider_not_operator_key`, `provider_grant_cap_reached`; 404 `user_not_found`; writes allowed on a retired definition; revoke-recipients is one transaction and returns the removed count; the CHECK refuses all-users on a per-user-key row and on a NULL-mode row; contract fixtures and mock cases.
+- **Classifier:** the R5 M2 entries (a)-(e) with exact predicates and pinned callers; the custody `Open` caller set is exactly the two sinks; the grants-table marker rule fires on an unlisted statement; there is a canary for grant-row immutability.
 
 **Landing obligations:** the same as M1, including the CI-time measurement for the contention tests. Add `test-agent-worker-uid` if `agent/**` is touched, and then **full agent suite: exact-head PR CI**.
 
@@ -415,12 +453,25 @@ Full `test:api`, `test:web`, `test:web-browser`, `gate:repo`, `scan:secrets` and
   - It is sound for three reasons: the writer invariant (R6); delete's `FOR UPDATE` conflicts; and the two exempt writers are harmless. A user-delete cascade also removes that user's runs. Revision prune deletes only unreferenced revisions, and the retained revision lock covers the prune-first order.
   - READ COMMITTED is a recorded invariant, with creation beginning RC explicitly (R9). A `grant_epoch` column was rejected as an extra moving part.
   - The hot-row MultiXact cost is accepted at the expected scale.
-- **D19. Three definition-row locks.** Key attach keeps the per-user-key lock. Select gets a grant-aware `FOR SHARE` lock with an in-lock recheck. Freeze gets an identity `FOR SHARE` lock on the selected ID and scope pair, held through the run insert. Inherited creation holds `FOR SHARE` through the successor insert. One lock cannot both exclude operator definitions (key attach) and admit them (select). The no-cycle analysis (opus N15) goes in the D7 amendment.
+- **D19. Three definition-row locks.** Key attach keeps the per-user-key lock. Select gets a grant-aware `FOR SHARE` lock with an in-lock recheck. Freeze gets an identity `FOR SHARE` lock on the selected ID and scope pair, held through the run insert. Inherited creation holds `FOR SHARE` through the successor insert. One lock cannot both exclude operator definitions (key attach) and admit them (select). The no-cycle analysis (opus N15) goes in the D7 amendment, with these rows (U = per-user secret lock, D = definition row, R = revision row):
+
+  | Path | Lock order |
+  |---|---|
+  | Select | U exclusive -> D FOR SHARE -> users row update -> re-read |
+  | Freeze | [consumer gate] -> U shared -> D FOR SHARE -> re-read -> insert |
+  | Inherit | [consumer gate] -> U shared -> D FOR SHARE -> R FOR KEY SHARE -> plain reads -> insert |
+  | Grant, all-users, revoke-all | D FOR NO KEY UPDATE -> grant rows, or the D update |
+  | Claim final check | run row -> D FOR SHARE NOWAIT -> plain grant and custody reads -> R FOR KEY SHARE NOWAIT -> users row FOR KEY SHARE NOWAIT |
+  | Promoter | U exclusive -> worker -> run row -> R FOR KEY SHARE -> plain reads -> rewrite |
 - **D20. ADR and threat model land with M1.** M1 makes "credential_mode admits only per_user_key" false and ships a sealed instance key.
 - **D21. Indexes (M1 delivery, 2026-11-27).** The custody and evidence tables are new and empty, and their primary keys and unique constraints are the only indexes the statements use, so M1 has no standalone index and no `CONCURRENTLY` file. This deviates from R14's wording, which assumed an index on an existing table.
 - **D22. Probe tuple and evidence fence (M1 delivery).** The tuple is revision, base URL, auth style, protocol, model map, custody id, `key_rev`, enabled and not retired. A rename does not invalidate it. The fence is exact for the evidence write; it is not a fence on the dial, so a change after the pre-dial recheck can still let the in-flight probe use the key and endpoint it captured.
 - **D23. Retired definitions hide Test evidence (M1 delivery).** The evidence read is current status, not history, so retiring a definition hides it.
 - **D24. Limited durability claim (M1 delivery).** The recovery claim covers an API-process failure with PostgreSQL intact. It does not cover a PostgreSQL or host crash, storage loss or concurrent migrators.
+- **D25. RC sites by function, the promoter included (lead and buddy, 2026-11-28).** Both M2 reviews found `finishChatClaimTx` at the default isolation. The opus review held the promoter could stay at the default because the claim re-decides; the Codex review showed a stale promoter snapshot skips the D17 Resume. The cost is one begin call, so the promoter is RC.
+- **D26. Admin grant API pinned in the PRD (M2 review).** Routes, paging, idempotence, errors and the NULL-safe all-users CHECK are specified so the run makes no API design choice.
+- **D27. No checker mode column in #4540 M2 (M2 review).** #4540 M2 lands first and the blanket Claude-checker refusals already cover operator sources; the mode check belongs to #4322 M2, which lifts the refusal.
+- **D28. One gated run with an internal order (lead and buddy recommendation, 2026-11-28; owner decision pending).** The authority change is coupled; a split adds a temporary refusal arm and a review round. The fallback split is recorded under M2.
 - **History.**
   - v1 (re-anchor at `bc0348e1a`): Claude-only mode, the omitted mode CHECK, no endpoint mutation, mode-filtered admin queries, publication scans already shipped, the missing claim-time lock, the threat-model heading, the #4322 wording, the preview anchor.
   - v2 (buddy): D14, D15, D16; the checker-child case handed off.
@@ -435,3 +486,4 @@ Full `test:api`, `test:web`, `test:web-browser`, `gate:repo`, `scan:secrets` and
     - simplicity pass: one rule per section, cited by number elsewhere; restated code facts removed.
   - v5 (buddy): exact freeze fence (`FOR SHARE` after the per-user secret lock, held through the run insert, identity bound to the selected ID and scope pair with the engine checked); visibility separated from usability in the picker, with negative cases. Self-check restorations from v3: per-user secret-mutation lock wording; the M1 fence reader names; the select-lock admit set and ordering; the inherit wording; the resolver's scope-pair match; the revision `FOR KEY SHARE OF r NOWAIT`; the missing-grant fence sentence and "no mixed authority"; RC transaction sources; the promoter's `id` / `user_id` / `claim_generation` fence; "neither landing order opens it untested"; the D7 amendment row list and `FOR UPDATE` cascade contention; D19 lock strengths.
   - v6 (opus final pass, APPROVE with eight non-blocking items): N-a early key-change row restored; N-b prune named as an exempt writer; N-c Codex column pair in the freeze lock; N-d operator identity twins named; N-e `writeProviderCreateRefusal` and `skipReasonForErr` arms with tests; N-f `resume.go` removed from the surface list; N-g explicit RC begin for creation, tested under a repeatable-read default; N-h blocked-interleaving test. Scope and decisions unchanged.
+  - v8 (M2 dual architecture review at `d04cf1ae`: opus REVISE 11, Codex REVISE 1, buddy REVISE 2): RC sites by function incl. chat finisher and promoter (D25); R5 M2 classifier entries (a)-(e) with the full grants-table caller pins; admin grant API, user_id index and NULL-safe CHECK (D26); inherited-creation 409 moved to reachable routes; missing-selection web control; checker mode column dropped (D27); internal build order and fallback (D28); `provider_not_granted` surfaces and SkipReason; promoter observation window; anchors refreshed after M1.
