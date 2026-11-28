@@ -34028,6 +34028,7 @@ export class RunRunner {
     let confirmed = false;
     let appliedAck: StateAck | undefined;
     let epoch: number;
+    let pendingSwitchDefer = releaseSwitchDefer;
     const presentAndWait = async (): Promise<PlanVerdict> => {
     if (!confirmed) {
     let ack: StateAck;
@@ -34113,10 +34114,14 @@ export class RunRunner {
     // Issue #4806: the revised gate is confirmed published and its revise settled; the defer window the executor
     // held across the revision closes here, before the verdict wait. A legacy lane (no revision recovery) settles
     // the revise through a plain APPLIED receipt, which must land first.
-    if (releaseSwitchDefer) {
+    // It runs once: a re-join after the window closed (an applied switch, a retried wait) skips it, so it never
+    // waits on receipts again and a cancel during the verdict wait is not reported as a receipt-wait failure.
+    if (pendingSwitchDefer) {
+      const release = pendingSwitchDefer;
+      pendingSwitchDefer = undefined;
       if (revisionRecovery === undefined && settles !== undefined && request.revision_input_id === undefined) {
-        try { await steering.awaitReceiptSettlement(); } finally { releaseSwitchDefer(); }
-      } else releaseSwitchDefer();
+        try { await steering.awaitReceiptSettlement(); } finally { release(); }
+      } else release();
     }
     // A terminal verdict ends the gate → clear the shared per-run gate state. A revise
     // keeps the shared budget/epoch state running; the re-report above does the bump.
