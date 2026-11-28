@@ -19,6 +19,9 @@ sql:
         # FindingDisposition is fine as-is.
         rename:
           finding: "IncidentalFinding"
+          # Issue #4771: store.AnalyticsPrecomputedDoc is the hand-written (key, bytes) value the
+          # publisher takes, so the generated struct for analytics_precomputed_docs is renamed.
+          analytics_precomputed_doc: "AnalyticsPrecomputedDocRecord"
         overrides:
           - db_type: "uuid"
             go_type: "github.com/google/uuid.UUID"

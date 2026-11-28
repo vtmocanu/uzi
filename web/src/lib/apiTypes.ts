@@ -7213,6 +7213,17 @@ export interface AnalyticsSpendDTO extends AnalyticsEnvelopeDTO {
   breakdown: AnalyticsBreakdownDTO;
 }
 
+/** Snapshot metadata of a stored all-time Spend document (issue #4771). */
+export interface AnalyticsSnapshotMetaDTO {
+  /** When the build that produced the document took its snapshot (RFC 3339). */
+  generated_at: string;
+  /** True once the document is older than twice the configured build interval. */
+  stale: boolean;
+}
+
+/** The admin all-users all-time Spend response: the live Spend body plus a snapshot member. */
+export type AnalyticsSpendSnapshotDTO = AnalyticsSpendDTO & { snapshot: AnalyticsSnapshotMetaDTO };
+
 // ── Reliability analytics (issue #4685) ──────────────────────────────────────
 // Mirrors the Reliability types of api/internal/apitypes/analytics.go: GET
 // /api/analytics/reliability and GET /api/admin/analytics/reliability. It reuses the envelope,

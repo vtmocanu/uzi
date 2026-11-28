@@ -237,7 +237,7 @@ func TestQualityHTTPEvidenceLiveDB(t *testing.T) {
 		if admin {
 			reqUser = uuid.New()
 		}
-		req, msg := parseAnalyticsRequest(u.Query(), admin, analytics.SectionQuality, reqUser)
+		req, msg := parseAnalyticsRequest(u.Query(), admin, analytics.SectionQuality, reqUser, false)
 		if msg != "" {
 			t.Fatalf("parse %s: %s", sc.path, msg)
 		}
