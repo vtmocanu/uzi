@@ -73,7 +73,7 @@ Findings show as a per-connection badge (`least-privilege ✓` / `N warnings` / 
 
 **Your token-expiry banner.** Every signed-in user, admins included, gets one app-wide banner built only from their own connections' latest check. It shows the most urgent of three states, in this order:
 
-- **Expired** (red): the expiry stored by the last successful check has passed, or that check found the token expired or inactive. Repositories using that connection stop syncing and runs cannot push until you update the token in Settings → Forge. This banner cannot be dismissed.
+- **Expired** (red): the latest check succeeded and the expiry it recorded has passed, or it found the token expired or inactive. Repositories using that connection stop syncing and runs cannot push until you update the token in Settings → Forge. This banner cannot be dismissed.
 - **Expiring** (amber): the token expires within the same 14 days the check warns about, with the date of each affected connection. You can dismiss it for the browser session.
 - **Unverified** (neutral): the last check could not verify the connection at all. uzi never reads that as expiry, since an unreachable or unsupported forge looks the same; check the connection in Settings → Forge. You can dismiss it for the browser session.
 
