@@ -61,3 +61,25 @@ func TestBatchControllerBehindWarning(t *testing.T) {
 		t.Fatal("a full batch at maxBatch counted as behind")
 	}
 }
+
+// A statement timeout does not end the behind run: a table that times out more often than once
+// per behindWarnAfter successes (so the timeout streak never reaches warnAfterTimeouts) must
+// still warn that it is deleting below the maximum batch.
+func TestBatchControllerBehindSurvivesTimeouts(t *testing.T) {
+	c := NewBatchController()
+	c.TimedOut(1000)
+	warned := false
+	for i := 0; i < 80 && !warned; i++ {
+		if i%4 == 3 {
+			c.TimedOut(c.Limit())
+			continue
+		}
+		b := c.Limit()
+		if c.Succeeded(b, int64(b)) {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Fatal("no behind warning although every success was a full batch below the maximum")
+	}
+}

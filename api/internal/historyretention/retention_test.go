@@ -236,6 +236,10 @@ func TestPassKnownRollbackLetsOtherTablesRun(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), string(tAnth)) {
 		t.Fatalf("err=%v, want it to name %s", err, tAnth)
 	}
+	var rb *store.HistoryRetentionRollbackError
+	if !errors.As(err, &rb) || rb.Table != tAnth {
+		t.Fatalf("err=%v, want it to wrap the %s rollback error", err, tAnth)
+	}
 	if len(f.calls) != 4 || f.closed != 1 {
 		t.Fatalf("calls=%d closed=%d, want 4 and 1", len(f.calls), f.closed)
 	}

@@ -1349,7 +1349,7 @@ The per-profile tables are in [provider usage history](provider-usage-history.md
 
 - Each sweeper tick spends at most a 2 s client budget. A cross-replica session advisory try-lock lets a second replica skip the tick.
 - Each tick deletes at most 1000 rows per table, oldest first, and the starting table rotates between ticks.
-- Each batch runs with a 300 ms statement timeout and a 200 ms lock timeout. On a statement timeout the table's batch halves (floor 50 rows) and the size that timed out is remembered: the batch then grows back below that size for 20 successful ticks before the larger size is probed again. A warning names the table after 5 consecutive timeouts, and also when it keeps deleting full batches below the maximum (every 20th), which means a backlog may be growing.
+- Each batch runs with a 300 ms statement timeout and a 200 ms lock timeout. On a statement timeout the table's batch halves (floor 50 rows) and the size that timed out is remembered: the batch then grows back below that size for 20 successful ticks before it probes upward again. A warning names the table after 5 consecutive timeouts, and also when it keeps deleting full batches below the maximum (every 20th), which means a backlog may be growing.
 - A table whose 50-row batch still exceeds 300 ms makes no progress, and the warning names it.
 - The first enable drains at most 1000 rows per table per tick. With full batches, that outpaces the stated sample workload of about 1000 rows per minute per table only while `SWEEP_INTERVAL` (default `15s`) is under 60 s. That is a theoretical ceiling: actual drain depends on the cadence, the committed batch sizes and failed ticks.
 

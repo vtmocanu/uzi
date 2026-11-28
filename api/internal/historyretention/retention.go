@@ -7,7 +7,7 @@
 // lock. The batch of a table is a BatchController: a statement timeout halves it (floor 50) and
 // remembers the size that timed out; it then grows back below that size for 20 successful ticks
 // before probing it again, so a table that only fits 500 rows keeps deleting near 500 instead of
-// alternating between 0 and 500. Five consecutive timeouts, and twenty consecutive full batches
+// alternating between 0 and 500. Five consecutive timeouts, and twenty full batches (a run that only a short or maximum batch ends)
 // below the maximum, each log a warning. Every database call is bound to a 2 s client budget (the work context ends 250 ms before
 // the cleanup context, which ends at the budget), but the pass's actual return time also depends
 // on the driver and on scheduling, so it is measured, not guaranteed.

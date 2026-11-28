@@ -9,7 +9,8 @@ const (
 	// holdTicks is how many successful batches a table keeps growing below the size that last
 	// timed out before it probes that size again.
 	holdTicks = 20
-	// behindWarnAfter is the number of consecutive full batches below maxBatch after which a
+	// behindWarnAfter is the number of full batches below maxBatch (a run broken only by a short
+	// batch or one at maxBatch; statement timeouts do not break it) after which a
 	// "may be falling behind" warning is logged (and again at every further multiple).
 	behindWarnAfter = 20
 )
@@ -40,7 +41,9 @@ func (c *BatchController) Limit() int32 { return c.batch }
 // Timeouts is the current run of consecutive statement timeouts.
 func (c *BatchController) Timeouts() int { return c.timeouts }
 
-// Behind is the current run of consecutive full batches below maxBatch.
+// Behind is the current run of full batches below maxBatch. Only a short batch or a batch at
+// maxBatch ends the run; a statement timeout does not, so a table that times out more often than
+// once per behindWarnAfter successes still warns.
 func (c *BatchController) Behind() int { return c.behind }
 
 // TimedOut records a statement timeout of a delete that used batch size b. It reports whether a
@@ -54,7 +57,7 @@ func (c *BatchController) TimedOut(b int32) (warn bool) {
 }
 
 // Succeeded records a delete of n rows that used batch size b. It reports whether a "deleting
-// below the maximum batch" warning is due: every behindWarnAfter-th consecutive full batch
+// below the maximum batch" warning is due: every behindWarnAfter-th full batch of the run
 // (n == b) while b < maxBatch. A short batch, or one at maxBatch, resets that run.
 func (c *BatchController) Succeeded(b int32, n int64) (warnBehind bool) {
 	c.timeouts = 0
