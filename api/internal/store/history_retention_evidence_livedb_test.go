@@ -73,8 +73,9 @@ import (
 // Labels. The compressed, smoke and preflight records carry coverage_reasons (settings that narrow the run
 // below the evidence fixture: fewer tables, candidates or rows, a changed arrival rate or codex
 // variant, autovacuum off, a short or non-btree smoke) and run_reasons (what this run itself
-// observed: short or failed ticks, a wall-clock or error stop, a residual backlog, a probe error).
-// Only a record with both lists empty is qualifying. Warm and cold records are unlabelled
+// observed: short or failed ticks, a wall-clock or error stop, a residual backlog or an unavailable
+// residual count, a probe error, a timed-out preflight DELETE). Only a record whose "qualifying" field
+// is true (both lists empty) is qualifying; a preflight record carries that field too. Warm and cold records are unlabelled
 // measurements; a cold record is bound to its setup instead.
 //
 // Measurements use the production session (store.OpenHistoryRetentionSession, DeleteBatch, a fresh
@@ -1448,6 +1449,7 @@ type heRunFacts struct {
 	PassErrors          int
 	ProbeErrors         int
 	NoopDeleted         int64
+	ResidualUnavailable string // set when the residual count failed or timed out
 }
 
 // heRunReasons lists everything that makes the run itself non-qualifying. A tick counts toward the
@@ -1473,6 +1475,9 @@ func heRunReasons(f heRunFacts) []string {
 	}
 	if _, reason := heNearEmptyGate(f.Residual); reason != "" {
 		r = append(r, reason)
+	}
+	if f.ResidualUnavailable != "" {
+		r = append(r, "residual count unavailable: "+f.ResidualUnavailable)
 	}
 	if f.NoopDeleted > 0 {
 		r = append(r, fmt.Sprintf("near-empty probes deleted %d rows", f.NoopDeleted))
@@ -1595,7 +1600,8 @@ func TestHistoryRetentionCompressedEvidenceLiveDB(t *testing.T) {
 // production 300 ms statement and 200 ms lock timeouts) and records whether it timed out (57014) and
 // what the outcome was; on a second fresh fixture it runs the rolled-back EXPLAIN (ANALYZE, BUFFERS)
 // of the same ordered statement. Nothing loops. An error of the preflight itself is a run reason of
-// the record, never a silent gap, and a timeout is a result, not an error.
+// the record, never a silent gap. A timeout is a recorded result and, for that candidate, a run
+// reason: the record is then not qualifying.
 func (fx *heFx) preflight(table store.HistoryRetentionTable, cand string, offFrac float64) {
 	fx.t.Helper()
 	spec := fx.stdSpec(table)
@@ -1609,6 +1615,7 @@ func (fx *heFx) preflight(table store.HistoryRetentionTable, cand string, offFra
 	case heKindOK:
 	case heKindTimeout:
 		outcome = "timed_out"
+		reasons = append(reasons, "production DELETE timed out (57014): a timeout disqualifies this candidate")
 	case heKindUnknown:
 		outcome = "unknown"
 		reasons = append(reasons, "delete outcome unknown: "+r.Err)
@@ -1629,7 +1636,8 @@ func (fx *heFx) preflight(table store.HistoryRetentionTable, cand string, offFra
 			kv[k] = v
 		}
 	}
-	kv["run_reasons"], kv["coverage_reasons"] = reasons, fx.coverageReasons(false, nil)
+	coverage := fx.coverageReasons(false, nil)
+	kv["run_reasons"], kv["coverage_reasons"], kv["qualifying"] = reasons, coverage, len(coverage) == 0 && len(reasons) == 0
 	fx.log.rec("preflight", kv)
 	fx.t.Logf("preflight %s %s: outcome %s timed_out %v deleted %d delete %.1f ms; run_reasons %v",
 		fx.tableLabel(table), cand, outcome, r.Err == "57014", r.N, r.DelMS, reasons)
@@ -1738,6 +1746,12 @@ tickLoop:
 			}
 		}
 		done = k + 1
+		// A tick that started before the cap but finished its delete after it still counts as a cap
+		// stop, so the label never reads ticks_complete for a run that overran its wall clock.
+		if !time.Now().Before(deadline) {
+			stop = heStopWallCap
+			break
+		}
 	}
 	fx.log.rec("slow_ticks", map[string]any{"mode": mode, "cand": cand, "samples": slowSamples})
 	fx.log.rec("compressed_pass", map[string]any{"mode": mode, "cand": cand, "ticks_done": done, "ticks_planned": ticks,
@@ -1761,10 +1775,14 @@ func heSample(xs []string) []string { return append([]string{}, xs[:min(len(xs),
 // heProbe is the pre-probe residual count and, on a drained table, the near-empty probes.
 type heProbe struct {
 	Residual    int64
-	Valid       bool // residual 0, so the probes ran and mean what they say
+	Valid       bool   // residual 0, so the probes ran and mean what they say
+	Unavailable string // why the residual count could not be taken; the probes were skipped
 	Errors      []string
 	NoopDeleted int64
 }
+
+// heResidualTimeout bounds the residual count of one table.
+const heResidualTimeout = 30 * time.Second
 
 // heNearEmptyGate decides whether the near-empty probes may run: only on a drained table. The reason
 // is the run reason a residual backlog adds.
@@ -1781,9 +1799,16 @@ func (fx *heFx) nearEmptyProbe(mode, cand string, table store.HistoryRetentionTa
 	fx.t.Helper()
 	cut := r.cutoff0.Add(time.Duration(done) * heTick)
 	var p heProbe
-	p.Residual = fx.one(`SELECT count(*) FROM `+string(table)+` WHERE `+heEligibleWhere(table), cut)
+	// The count runs under a bounded context: a lock that blocked an arrival can block it too, and the
+	// per-table record must still be emitted.
+	cctx, cancel := context.WithTimeout(fx.ctx, heResidualTimeout)
+	cerr := fx.pool.QueryRow(cctx, `SELECT count(*) FROM `+string(table)+` WHERE `+heEligibleWhere(table), cut).Scan(&p.Residual)
+	cancel()
 	kv := map[string]any{"table": fx.tableLabel(table), "cand": cand, "mode": mode, "residual_backlog": p.Residual}
-	if runProbes, _ := heNearEmptyGate(p.Residual); !runProbes {
+	if cerr != nil {
+		p.Unavailable = cerr.Error()
+		kv["residual_unavailable"], kv["near_empty_valid"] = p.Unavailable, false
+	} else if runProbes, _ := heNearEmptyGate(p.Residual); !runProbes {
 		kv["near_empty_valid"] = false
 	} else {
 		p.Valid = true
@@ -1877,7 +1902,7 @@ func (fx *heFx) reportCompressed(mode, cand string, table store.HistoryRetention
 		"stop_reason": o.stop, "stop_detail": o.stopDetail,
 		"arrivals_per_tick": r.arrivals, "eligible_initial": r.eligible0,
 		"window_deleted": total, "window_arrivals": int64(done * r.arrivals),
-		"residual_backlog": o.probe.Residual, "near_empty_valid": o.probe.Valid,
+		"residual_backlog": o.probe.Residual, "residual_unavailable": o.probe.Unavailable, "near_empty_valid": o.probe.Valid,
 		"probe_errors": len(o.probe.Errors), "probe_error_sample": heSample(o.probe.Errors), "probe_noop_deleted": o.probe.NoopDeleted,
 		"pass_errors": len(o.passErrs), "pass_error_sample": heSample(o.passErrs),
 		"first_short_batch_tick": r.firstShort, "info_cycles": cycles, "info_cycles_not_exceeding": badCycles,
@@ -1890,7 +1915,7 @@ func (fx *heFx) reportCompressed(mode, cand string, table store.HistoryRetention
 	coverage := fx.coverageReasons(false, nil)
 	run := heRunReasons(heRunFacts{Required: r.required, Confirmed: confirmed, Stop: o.stop, Unknown: unknown, Timeouts: timeouts,
 		Rollbacks: rollbacks, Skipped: skipped, Residual: o.probe.Residual, PassErrors: len(o.passErrs),
-		ProbeErrors: len(o.probe.Errors), NoopDeleted: o.probe.NoopDeleted})
+		ProbeErrors: len(o.probe.Errors), NoopDeleted: o.probe.NoopDeleted, ResidualUnavailable: o.probe.Unavailable})
 	kv["coverage_reasons"], kv["run_reasons"], kv["qualifying"] = coverage, run, len(coverage) == 0 && len(run) == 0
 	// compact per-tick record: deletes per tick and latency, in 50-tick blocks to keep the log small
 	var blockDel []int64
@@ -2120,7 +2145,10 @@ func (fx *heFx) ensureBindingTable() {
 	        table_name text PRIMARY KEY, setup_id uuid NOT NULL UNIQUE, candidate text NOT NULL,
 	        row_count integer NOT NULL, arrivals integer NOT NULL, codex_variant text NOT NULL,
 	        start_at timestamptz NOT NULL, cutoff_c timestamptz NOT NULL, cutoff_a timestamptz NOT NULL,
-	        cutoff_b timestamptz NOT NULL, created_at timestamptz NOT NULL DEFAULT now(), consumed_at timestamptz)`)
+	        cutoff_b timestamptz NOT NULL, rel_oid bigint NOT NULL DEFAULT 0, rel_name text NOT NULL DEFAULT '',
+	        created_at timestamptz NOT NULL DEFAULT now(), consumed_at timestamptz)`)
+	// A table made before the relation identity existed: its bindings carry oid 0 and refuse a measurement.
+	fx.exec(`ALTER TABLE ` + heBindingTable + ` ADD COLUMN IF NOT EXISTS rel_oid bigint NOT NULL DEFAULT 0, ADD COLUMN IF NOT EXISTS rel_name text NOT NULL DEFAULT ''`)
 }
 
 // heColdBinding is what a cold setup publishes: the fixture parameters a measurement must match and
@@ -2133,6 +2161,20 @@ type heColdBinding struct {
 	Codex                     string
 	Start                     time.Time
 	CutoffC, CutoffA, CutoffB time.Time
+	RelOID                    int64  // oid of the table as the production session's search_path resolves it
+	RelName                   string // its schema-qualified name
+}
+
+// resolveRelation returns the oid and schema-qualified name the table name resolves to on p, the
+// search_path the production DELETE resolves it by.
+func (fx *heFx) resolveRelation(p *pgxpool.Pool, table store.HistoryRetentionTable) (oid int64, name string) {
+	fx.t.Helper()
+	err := p.QueryRow(fx.ctx, `SELECT c.oid::bigint, quote_ident(n.nspname) || '.' || quote_ident(c.relname)
+	        FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.oid = to_regclass($1)`, string(table)).Scan(&oid, &name)
+	if err != nil {
+		fx.t.Fatalf("resolving %s on the session search_path: %v", table, err)
+	}
+	return oid, name
 }
 
 // heColdCheck compares the published binding with the parameters the measurement would use now: the
@@ -2154,6 +2196,9 @@ func heColdCheck(got, want heColdBinding) error {
 	}
 	if got.Codex != want.Codex {
 		bad = append(bad, fmt.Sprintf("codex variant %q, now %q", got.Codex, want.Codex))
+	}
+	if got.RelOID != want.RelOID || got.RelName != want.RelName {
+		bad = append(bad, fmt.Sprintf("relation %s (oid %d), now %s (oid %d)", got.RelName, got.RelOID, want.RelName, want.RelOID))
 	}
 	if !got.Start.Equal(want.Start) {
 		bad = append(bad, fmt.Sprintf("fixture start %s, now %s", got.Start.UTC().Format(time.RFC3339Nano), want.Start.UTC().Format(time.RFC3339Nano)))
@@ -2218,9 +2263,9 @@ func (fx *heFx) claimBinding(setupID uuid.UUID, table store.HistoryRetentionTabl
 	b := heColdBinding{SetupID: setupID}
 	var name string
 	var consumed *time.Time
-	err = p.QueryRow(fx.ctx, `SELECT table_name, candidate, row_count, arrivals, codex_variant, start_at, cutoff_c, cutoff_a, cutoff_b, consumed_at
+	err = p.QueryRow(fx.ctx, `SELECT table_name, candidate, row_count, arrivals, codex_variant, start_at, cutoff_c, cutoff_a, cutoff_b, rel_oid, rel_name, consumed_at
 	        FROM `+heBindingTable+` WHERE setup_id = $1 AND table_name = $2`, setupID, string(table)).
-		Scan(&name, &b.Cand, &b.Rows, &b.Arrivals, &b.Codex, &b.Start, &b.CutoffC, &b.CutoffA, &b.CutoffB, &consumed)
+		Scan(&name, &b.Cand, &b.Rows, &b.Arrivals, &b.Codex, &b.Start, &b.CutoffC, &b.CutoffA, &b.CutoffB, &b.RelOID, &b.RelName, &consumed)
 	if errors.Is(err, pgx.ErrNoRows) {
 		fx.t.Fatalf("refusing: no binding for setup id %s on %s; it was never published or a reseed of the table removed it. Re-run the setup", setupID, table)
 	}
@@ -2231,6 +2276,7 @@ func (fx *heFx) claimBinding(setupID uuid.UUID, table store.HistoryRetentionTabl
 	if consumed != nil {
 		fx.t.Fatalf("refusing: setup id %s was already consumed at %s. Re-run the setup", setupID, consumed.UTC().Format(time.RFC3339))
 	}
+	want.RelOID, want.RelName = fx.resolveRelation(p, table) // same DSN and options as fx.pool, so the same search_path
 	if err := heColdCheck(b, want); err != nil {
 		fx.t.Fatalf("refusing: %v. The binding is left unconsumed", err)
 	}
@@ -2291,10 +2337,11 @@ func TestHistoryRetentionColdEvidenceLiveDB(t *testing.T) {
 		cutA, _ := heCaseCutoff(spec, 0.0205)
 		cutB, _ := heCaseCutoff(spec, 0.90)
 		setupID := uuid.New()
-		fx.exec(`INSERT INTO `+heBindingTable+` (setup_id, table_name, candidate, row_count, arrivals, codex_variant, start_at, cutoff_c, cutoff_a, cutoff_b)
-		        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-			setupID, string(table), cand, spec.n, spec.arrivals, fx.codex, spec.start, cutC, cutA, cutB)
-		fx.log.rec("cold_setup", map[string]any{"table": fx.tableLabel(table), "cand": cand, "setup_id": setupID.String(),
+		relOID, relName := fx.resolveRelation(fx.pool, table)
+		fx.exec(`INSERT INTO `+heBindingTable+` (setup_id, table_name, candidate, row_count, arrivals, codex_variant, start_at, cutoff_c, cutoff_a, cutoff_b, rel_oid, rel_name)
+		        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
+			setupID, string(table), cand, spec.n, spec.arrivals, fx.codex, spec.start, cutC, cutA, cutB, relOID, relName)
+		fx.log.rec("cold_setup", map[string]any{"table": fx.tableLabel(table), "cand": cand, "setup_id": setupID.String(), "relation": relName, "rel_oid": relOID,
 			"rows": spec.n, "arrivals": spec.arrivals, "codex": fx.codex, "start": spec.start.Format(time.RFC3339Nano)})
 		t.Logf("cold setup %s cand %s published: UZI_EVIDENCE_COLD_SETUP_ID=%s", table, cand, setupID)
 		return

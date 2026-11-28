@@ -287,19 +287,20 @@ func TestHistoryRetentionEvidenceRunReasons(t *testing.T) {
 		t.Fatalf("a clean run has reasons %v", r)
 	}
 	for name, f := range map[string]heRunFacts{
-		"short":           {Required: 100, Confirmed: 99, Stop: heStopComplete},
-		"wall cap":        {Required: 100, Confirmed: 130, Stop: heStopWallCap},
-		"error stop":      {Required: 100, Confirmed: 100, Stop: heStopArrivalError},
-		"empty stop":      {Required: 100, Confirmed: 100},
-		"one unknown":     {Required: 100, Confirmed: 100, Stop: heStopComplete, Unknown: 1},
-		"timeout":         {Required: 100, Confirmed: 100, Stop: heStopComplete, Timeouts: 1},
-		"other rollback":  {Required: 100, Confirmed: 100, Stop: heStopComplete, Rollbacks: 1},
-		"skipped":         {Required: 100, Confirmed: 100, Stop: heStopComplete, Skipped: 1},
-		"residual":        {Required: 100, Confirmed: 100, Stop: heStopComplete, Residual: 1},
-		"pass error":      {Required: 100, Confirmed: 100, Stop: heStopComplete, PassErrors: 1},
-		"probe error":     {Required: 100, Confirmed: 100, Stop: heStopComplete, ProbeErrors: 1},
-		"probe deleted":   {Required: 100, Confirmed: 100, Stop: heStopComplete, NoopDeleted: 1},
-		"unknown at goal": {Required: 3, Confirmed: 3, Stop: heStopComplete, Unknown: 1},
+		"short":                {Required: 100, Confirmed: 99, Stop: heStopComplete},
+		"wall cap":             {Required: 100, Confirmed: 130, Stop: heStopWallCap},
+		"error stop":           {Required: 100, Confirmed: 100, Stop: heStopArrivalError},
+		"empty stop":           {Required: 100, Confirmed: 100},
+		"one unknown":          {Required: 100, Confirmed: 100, Stop: heStopComplete, Unknown: 1},
+		"timeout":              {Required: 100, Confirmed: 100, Stop: heStopComplete, Timeouts: 1},
+		"other rollback":       {Required: 100, Confirmed: 100, Stop: heStopComplete, Rollbacks: 1},
+		"skipped":              {Required: 100, Confirmed: 100, Stop: heStopComplete, Skipped: 1},
+		"residual":             {Required: 100, Confirmed: 100, Stop: heStopComplete, Residual: 1},
+		"pass error":           {Required: 100, Confirmed: 100, Stop: heStopComplete, PassErrors: 1},
+		"probe error":          {Required: 100, Confirmed: 100, Stop: heStopComplete, ProbeErrors: 1},
+		"residual unavailable": {Required: 100, Confirmed: 100, Stop: heStopComplete, ResidualUnavailable: "context deadline exceeded"},
+		"probe deleted":        {Required: 100, Confirmed: 100, Stop: heStopComplete, NoopDeleted: 1},
+		"unknown at goal":      {Required: 3, Confirmed: 3, Stop: heStopComplete, Unknown: 1},
 	} {
 		if r := heRunReasons(f); len(r) == 0 {
 			t.Fatalf("%s: no run reason", name)
@@ -312,7 +313,7 @@ func TestHistoryRetentionEvidenceRunReasons(t *testing.T) {
 
 func heColdFixture() heColdBinding {
 	return heColdBinding{SetupID: uuid.New(), Table: store.HistoryRetentionCodexUsage, Cand: "btree", Rows: 20000, Arrivals: 250,
-		Codex: "typical", Start: heBase}
+		Codex: "typical", Start: heBase, RelOID: 16400, RelName: "public.codex_usage"}
 }
 
 // The binding is accepted only when table, candidate, rows, arrivals, codex variant and start all
@@ -325,12 +326,14 @@ func TestHistoryRetentionEvidenceColdCheck(t *testing.T) {
 		t.Fatalf("exact match refused: %v", err)
 	}
 	for name, mut := range map[string]func(*heColdBinding){
-		"table":     func(b *heColdBinding) { b.Table = store.HistoryRetentionAnthropicUsage },
-		"candidate": func(b *heColdBinding) { b.Cand = "none" },
-		"rows":      func(b *heColdBinding) { b.Rows++ },
-		"arrivals":  func(b *heColdBinding) { b.Arrivals++ },
-		"codex":     func(b *heColdBinding) { b.Codex = "max" },
-		"start":     func(b *heColdBinding) { b.Start = b.Start.Add(time.Microsecond) },
+		"table":         func(b *heColdBinding) { b.Table = store.HistoryRetentionAnthropicUsage },
+		"candidate":     func(b *heColdBinding) { b.Cand = "none" },
+		"rows":          func(b *heColdBinding) { b.Rows++ },
+		"arrivals":      func(b *heColdBinding) { b.Arrivals++ },
+		"codex":         func(b *heColdBinding) { b.Codex = "max" },
+		"start":         func(b *heColdBinding) { b.Start = b.Start.Add(time.Microsecond) },
+		"relation oid":  func(b *heColdBinding) { b.RelOID++ },
+		"relation name": func(b *heColdBinding) { b.RelName = "other.codex_usage" },
 	} {
 		g := want
 		mut(&g)

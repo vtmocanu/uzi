@@ -729,6 +729,9 @@ func TestHistoryRetentionFailedOpenLiveDB(t *testing.T) {
 		}()
 		t.Cleanup(func() {
 			cancelWork()
+			// Close the wrapper before joining: after a watchdog Fatal a withheld read that the cancel
+			// did not interrupt is released only by the close, and the join would wait on it forever.
+			_ = w.Close()
 			wg.Wait()
 		})
 
@@ -743,10 +746,12 @@ func TestHistoryRetentionFailedOpenLiveDB(t *testing.T) {
 				t.Fatalf("open returned (%v, %v, %v) before the server-side lock was observed", r.s, r.got, r.err)
 			default:
 			}
-			err := f.pool.QueryRow(f.ctx, `SELECT l.pid FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+			obsCtx, cancelObs := context.WithTimeout(f.ctx, 5*time.Second) // the observer is under the watchdog too
+			err := f.pool.QueryRow(obsCtx, `SELECT l.pid FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
 			        WHERE l.locktype = 'advisory' AND l.granted AND l.objid = 0 AND l.classid = $1::int8::oid
 			          AND l.objsubid = 2 AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
 			          AND a.application_name = $2`, int64(store.HistoryRetentionLockClass), p.tag).Scan(&holderPID)
+			cancelObs()
 			switch {
 			case err == nil:
 				sawLock = true
