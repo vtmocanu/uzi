@@ -51,7 +51,7 @@ CREATE TABLE analytics_precomputed_docs (
 -- transaction id and then stamps it. Without this, N deleted rows cost N updates of one row (a
 -- quadratic COMMIT for a large cascade). The marker lives on the state row, not in a session
 -- setting, so a caller cannot preset it: writing it needs UPDATE on analytics_precomputed_state,
--- and that privilege already allows writing the docs table directly. A later firing may skip the
+-- and that privilege already lets a caller rewrite the invalidation counter itself. A later firing may skip the
 -- counter because this transaction already holds the state row lock until it ends, so no publisher
 -- can commit between the firings, and the counter has already moved for this transaction. A
 -- savepoint rollback reverts the marker with the rolled-back firing, so a later delete in the same

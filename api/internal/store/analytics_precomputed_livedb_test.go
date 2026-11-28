@@ -168,7 +168,7 @@ func apAsync(fn func() error) <-chan error {
 
 // waitLockWait polls until backend pid is waiting on a lock that backend blocker holds (the
 // positive barrier that replaces inferring "blocked" from elapsed time), bounded at 10 seconds.
-func (e apEnv) waitLockWait(t *testing.T, pid, blocker int32, what string) {
+func (e apEnv) waitLockWait(t *testing.T, pid, blocker int64, what string) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
@@ -442,9 +442,9 @@ func TestAnalyticsPrecomputeCounterOncePerTransactionLiveDB(t *testing.T) {
 	}
 }
 
-// Mutation it must catch: a trigger whose cost grows with the rows deleted in one transaction (the
-// per-row counter update on one state row). Two thousand repos must invalidate once and commit
-// within a generous bound.
+// Mutation it must catch: a trigger that updates the state row once per deleted row (the per-row
+// counter update whose COMMIT cost grows quadratically). The load-bearing check is that two
+// thousand repos advance the counter exactly once; the time bound is only a generous sanity limit.
 func TestAnalyticsPrecomputeBulkDeleteLiveDB(t *testing.T) {
 	e := apOpenEnv(t)
 	_, conn := raSeedUserConn(e.ctx, t, e.pool, true)
@@ -496,7 +496,8 @@ func TestAnalyticsPrecomputeInvalidationIgnoresTempShadowLiveDB(t *testing.T) {
 			t.Fatalf("%s: %v", sql, err)
 		}
 	}
-	// Dropped with the connection's pooled session reset at the end of the test.
+	// The explicit DROP below removes the temp tables before the connection returns to the pool
+	// (pgxpool does not reset sessions).
 	defer func() {
 		_, _ = conn.Exec(context.Background(), `DROP TABLE IF EXISTS pg_temp.analytics_precomputed_state, pg_temp.analytics_precomputed_docs`)
 	}()
@@ -662,7 +663,7 @@ func TestAnalyticsPrecomputeReadCommittedInterleaveLiveDB(t *testing.T) {
 	}
 
 	// The publisher holds the state row. The deleter commits: its deferred trigger waits on it.
-	pubPID := int32(s.conn.PgConn().PID())
+	pubPID := int64(s.conn.PgConn().PID())
 	dc, err := e.pool.Acquire(e.ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -676,7 +677,7 @@ func TestAnalyticsPrecomputeReadCommittedInterleaveLiveDB(t *testing.T) {
 		_, err := dc.Exec(e.ctx, `DELETE FROM repos WHERE id = $1`, repos[0])
 		return err
 	})
-	e.waitLockWait(t, delPID, pubPID, "the delete commit")
+	e.waitLockWait(t, int64(delPID), pubPID, "the delete commit")
 	select {
 	case derr := <-del:
 		t.Fatalf("the delete commit finished while the publisher held the state row: %v", derr)
@@ -771,7 +772,7 @@ func TestAnalyticsPrecomputeNoDeadlockLiveDB(t *testing.T) {
 	bDelErr := apWait(t, bDel, "B delete r2")
 	aDel := apAsync(func() error { _, err := a.Exec(e.ctx, `DELETE FROM repos WHERE id = $1`, r2); return err })
 	// Barrier: A is waiting on B's r2 row lock before B commits.
-	e.waitLockWait(t, aPID, bPID, "A delete r2")
+	e.waitLockWait(t, int64(aPID), int64(bPID), "A delete r2")
 	// B's delete must have returned before B's commit starts (a transaction is used by one
 	// goroutine at a time). Without the deferral it is stuck here until the deadlock resolves.
 	record := func(name string, err error) {

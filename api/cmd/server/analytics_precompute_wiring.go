@@ -15,7 +15,7 @@ import (
 // before the last one (the usage fold pass must stay last), and the scheduler that pass drives.
 // With interval 0 (the setting is off) it returns passes unchanged and a nil scheduler: nothing is
 // constructed and nothing is registered. ctx is the process context: cancelling it cancels a
-// running build. The caller must call the scheduler's Wait at shutdown, after the sweeper has
+// running build. The caller must call the scheduler's Stop at shutdown, after the sweeper has
 // stopped and before the pool closes.
 func wireAnalyticsPrecompute(ctx context.Context, pool *pgxpool.Pool, interval time.Duration, passes []sweeper.Pass) ([]sweeper.Pass, *analyticsprecompute.Scheduler) {
 	if interval <= 0 {
