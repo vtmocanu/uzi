@@ -126,6 +126,7 @@ Tracked as GitLab issue vtmocanu/uzi#5; PRD at `prds/done/5-access-control-pat-h
 - Serves the primary directive: agents must not be able to modify main.
 - Scope (option A) chosen to run parallel to PRD #4.
 - A blocked repo's owner can request an instance-admin guardrail exception (with a reason) after a waivable Enable refusal; only an admin approves, and approval sets the existing per-repo override rather than enabling — the owner retries Enable so the live guard re-runs. An unverifiable refusal (unreadable branch protection) is never waivable, so no request is offered for it. Extends #66's admin-only override reachability; still only an instance admin may allow a repo through the guardrail. (AI-synced 2026-09-19)
+- A connection owner gets one app-wide web banner from their own connections' latest privilege check: expired (stored expiry passed, or the check found it expired or inactive; not dismissible), else expiring within 14 days (with the date), else unverified (a failed check, never read as expiry); expiring and unverified dismiss per browser session. Scope and admin findings stay on Settings → Forge. It refreshes on load and window focus, and its background read never signs the user out. (AI-synced 2026-11-28, #4817)
 
 ## Feature #6 — CI status integration & CI-fix agent
 

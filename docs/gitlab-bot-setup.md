@@ -71,6 +71,14 @@ uzi does not just document the "bot = Developer, `main` protected" rule — it *
 
 Findings show as a per-connection badge (`least-privilege ✓` / `N warnings` / `N violations` / `unchecked`) expandable to the finding list, plus per-repo badges on the Repos page. Most per-repo findings (a role drift, a missing membership) **warn** and never block sync: membership changes happen on the forge after connect, and blocking sync over a role finding would punish the wrong action.
 
+**Your token-expiry banner.** Every signed-in user, admins included, gets one app-wide banner built only from their own connections' latest check. It shows the most urgent of three states, in this order:
+
+- **Expired** (red): the stored expiry has passed, or the check found the token expired or inactive. Repositories using that connection stop syncing and runs cannot push until you update the token in Settings → Forge. This banner cannot be dismissed.
+- **Expiring** (amber): the token expires within the same 14 days the check warns about, with the date of each affected connection. You can dismiss it for the browser session.
+- **Unverified** (neutral): the last check could not verify the connection at all. uzi never reads that as expiry, since an unreachable or unsupported forge looks the same; check the connection in Settings → Forge. You can dismiss it for the browser session.
+
+A lower state is not shown while a higher one is. The banner refreshes when the page loads and when the window regains focus. Scope or instance-admin findings on a valid token stay on the Settings → Forge badge, and a connection that has never been checked shows nothing.
+
 **uzi refuses to run against a repo the bot could push or merge to `main` on.** An unprotected default branch, or one where the Developer role (or the bot specifically) can push or merge to it, is a **blocking** finding, not a warning: uzi won't let you enable the repo, and refuses to start or claim a run against one that's already enabled but still misconfigured. Sync is unaffected — the board keeps syncing so you can see the badge and fix the branch protection. The check is live and fails closed, so a GitLab that errors or times out while uzi reads branch protection also refuses. An instance admin can override the refusal for one named repo, with a recorded reason, if the risk is knowingly accepted — see [Admin settings](./admin-settings.md#guardrail-override-per-repo).
 
 **Limitation — group-level push grants.** uzi flags a *direct, per-user* allow-to-push grant that names the bot on a protected branch, but it does **not** detect a push grant the bot inherits via a **group** it belongs to (that needs an extra group-membership lookup, deferred). If you use group-based protected-branch push rules, audit them manually: a group the bot belongs to must not appear in the branch's allowed-to-push list.

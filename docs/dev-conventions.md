@@ -701,6 +701,12 @@ scenarios are mutually exclusive by construction. Known values:
   tag pin clears the warning without an apply; with a branch ref, applying a
   snapshot matching the recorded tip clears it. Requires a signed-in admin.
   (#2902.)
+- `forge-token-expired`, `forge-token-expiring`, `forge-token-unverified` —
+  the #4817 owner token banner. Each replaces the GitHub demo connection's
+  (`conn-gh`) privilege report: a token past its expiry, one expiring in
+  three days, or a failed check (`status: "error"`). Any page then shows
+  the matching expired, expiring or unverified banner; without a scenario
+  the demo connections stay healthy and no banner shows.
 - `maintenance` — instance maintenance mode is on with a reason, so every
   page shows the maintenance banner. `/admin/settings?mock=maintenance#maintenance`
   shows the admin card with a not-yet-clear readout: running, held
