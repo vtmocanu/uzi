@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -189,16 +190,23 @@ func heEvidenceDSN(base string) (string, error) {
 	if cfg.Database != heDBName {
 		return "", fmt.Errorf("evidence DSN selects database %q, want %q", cfg.Database, heDBName)
 	}
-	// A multi-host DSN lets each new connection (the marker check, store.Migrate, store.OpenPool)
-	// select a different server, so the marker verified on one would not cover writes on another.
-	if len(cfg.Fallbacks) > 0 {
-		return "", fmt.Errorf("evidence DSN names %d hosts, want exactly one", len(cfg.Fallbacks)+1)
+	// Each harness connection (the marker check, store.Migrate, store.OpenPool) dials anew. A
+	// multi-host DSN, or a hostname resolving to several servers, could verify the marker on one
+	// server and write on another, so require one direct endpoint: a loopback IP or a local Unix
+	// socket. Fallbacks are allowed only as TLS retries of that same endpoint (sslmode=prefer).
+	if ip := net.ParseIP(cfg.Host); !strings.HasPrefix(cfg.Host, "/") && (ip == nil || !ip.IsLoopback()) {
+		return "", fmt.Errorf("evidence DSN host %q must be a loopback IP or a Unix socket", cfg.Host)
+	}
+	for _, fb := range cfg.Fallbacks {
+		if fb.Host != cfg.Host || fb.Port != cfg.Port {
+			return "", fmt.Errorf("evidence DSN names more than one endpoint (%s:%d)", fb.Host, fb.Port)
+		}
 	}
 	return dsn, nil
 }
 
 func TestHistoryRetentionEvidenceDSN(t *testing.T) {
-	const base = "postgres://tester@localhost/sweep?sslmode=disable"
+	const base = "postgres://tester@127.0.0.1/sweep?sslmode=disable"
 	dsn, err := heEvidenceDSN(base)
 	if err != nil {
 		t.Fatal(err)
@@ -214,8 +222,21 @@ func TestHistoryRetentionEvidenceDSN(t *testing.T) {
 	if _, err := heEvidenceDSN(base + "&dbname=sweep"); err == nil || !strings.Contains(err.Error(), "database") {
 		t.Fatalf("conflicting dbname error = %v, want a database identity refusal", err)
 	}
-	if _, err := heEvidenceDSN("postgres://tester@host-a,host-b/sweep?sslmode=disable"); err == nil || !strings.Contains(err.Error(), "hosts") {
-		t.Fatalf("multi-host error = %v, want a single-host refusal", err)
+	// Default sslmode=prefer adds a same-endpoint TLS fallback; a Unix socket is a direct endpoint.
+	for _, ok := range []string{"postgres://tester@127.0.0.1:5433/sweep", "postgres://tester@[::1]/sweep", "postgres://tester@/sweep?host=/tmp"} {
+		if _, err := heEvidenceDSN(ok); err != nil {
+			t.Fatalf("heEvidenceDSN(%q) = %v, want accepted", ok, err)
+		}
+	}
+	for _, bad := range []string{
+		"postgres://tester@127.0.0.1,127.0.0.2/sweep?sslmode=disable",
+		"postgres://tester@127.0.0.1:5432,127.0.0.1:5433/sweep?sslmode=disable",
+		"postgres://tester@localhost/sweep?sslmode=disable",
+		"postgres://tester@db.example.com/sweep",
+	} {
+		if _, err := heEvidenceDSN(bad); err == nil || !strings.Contains(err.Error(), "evidence DSN") {
+			t.Fatalf("heEvidenceDSN(%q) = %v, want an endpoint refusal", bad, err)
+		}
 	}
 }
 
