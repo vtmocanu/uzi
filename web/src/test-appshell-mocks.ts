@@ -26,6 +26,7 @@ const NAMES = [
   "listAgentTemplates",
   "listSecrets",
   "listConnections",
+  "listConnectionsBackground",
   "getUsage",
   "getAdminUsage",
   "adminListRuns",
@@ -63,6 +64,7 @@ export function setupAppShellMocks(api: typeof realApi, useAuth: typeof realUseA
   m.getAgentSource.mockResolvedValue({ agent_source: structuredClone(mockAgentSource) });
   m.listSecrets.mockResolvedValue({ secrets: [{ kind: "anthropic_token" } as never] });
   m.listConnections.mockResolvedValue({ connections: [{} as never] });
+  m.listConnectionsBackground.mockResolvedValue({ connections: [] });
   m.getUsage.mockResolvedValue(emptySelf());
   m.getAdminUsage.mockResolvedValue({ factory: emptySelf(), users: [], earliest_run: null });
   m.getAdminHealth.mockResolvedValue(healthySilentDoc());

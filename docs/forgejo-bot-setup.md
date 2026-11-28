@@ -81,6 +81,8 @@ target project, and the instance is v16.0.0+.
 
 ## Least privilege: what uzi verifies
 
+Your own token-expiry banner (expired, expiring or unverified) works the same on Forgejo; see "Your token-expiry banner" in [GitLab bot setup](./gitlab-bot-setup.md#least-privilege-what-uzi-verifies).
+
 Same posture as [GitLab bot setup](./gitlab-bot-setup.md#least-privilege-what-uzi-verifies),
 mapped onto Forgejo's model:
 

@@ -19,6 +19,7 @@ vi.mock("../lib/api", () => ({
   api: {
     listRepos: vi.fn(),
     listConnections: vi.fn(),
+    listConnectionsBackground: vi.fn().mockResolvedValue({ connections: [] }),
     // The Judge nav badge (PRD #98) polls /me/judge/stats on mount; default to an empty
     // backlog so the badge is absent unless a test overrides it.
     // PRD #113 M6: AppShell now owns a workers-attention poll too. Zero by default so

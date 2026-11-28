@@ -29,6 +29,7 @@ vi.mock("../lib/api", async (importOriginal) => {
       listAgentTemplates: vi.fn(),
       listSecrets: vi.fn(),
       listConnections: vi.fn(),
+      listConnectionsBackground: vi.fn().mockResolvedValue({ connections: [] }),
       getUsage: vi.fn(),
       getAdminUsage: vi.fn(),
       adminListRuns: vi.fn(),

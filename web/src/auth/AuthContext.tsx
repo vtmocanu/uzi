@@ -273,7 +273,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // mid-session) clears the user here; a rendered ProtectedRoute then redirects
   // to /login (replace). We only clear state, never navigate imperatively. The
   // session probe's own 401 does not come through here (api.me opts out); refresh
-  // handles it behind the generation check.
+  // handles it behind the generation check. The forge-token banner's background read
+  // (api.listConnectionsBackground) opts out as well, so its 401 cannot sign out a
+  // possibly different, newer session; every other request still catches a real expiry.
   useEffect(() => {
     setUnauthorizedHandler(() => {
       // Another request's 401: the session is gone. Invalidate any pending probe

@@ -1,6 +1,7 @@
 import type {
   ForgeConnection,
   GuardrailOverrideMeta,
+  PrivilegeReport,
   Repo,
 } from "../../lib/api";
 import { daysAgo, minsAgo } from "./time";
@@ -30,6 +31,52 @@ export const mockConnection: ForgeConnection = {
     ],
   },
 };
+
+// #4817: privilege-report overrides for the forge token banner scenarios. Returns null
+// for an unknown scenario (including the default, ""), so the demo is unchanged.
+export function forgeTokenScenario(scenario: string, nowMs: number): PrivilegeReport | null {
+  const day = 24 * 3600 * 1000;
+  const checked_at = new Date(nowMs).toISOString();
+  switch (scenario) {
+    case "forge-token-expired":
+      return {
+        checked_at,
+        status: "violations",
+        token: {
+          scopes: ["repo"],
+          active: false,
+          expires_at: new Date(nowMs - day).toISOString(),
+          violations: ["token is not active", "token has expired"],
+          warnings: [],
+        },
+        repos: [],
+      };
+    case "forge-token-expiring": {
+      const expires = new Date(nowMs + 3 * day).toISOString();
+      return {
+        checked_at,
+        status: "warnings",
+        token: {
+          scopes: ["repo"],
+          active: true,
+          expires_at: expires,
+          violations: [],
+          warnings: [`token expires within 14 days (on ${expires.slice(0, 10)})`],
+        },
+        repos: [],
+      };
+    }
+    case "forge-token-unverified":
+      return {
+        checked_at,
+        status: "error",
+        token: { scopes: [], active: false, violations: [], warnings: [] },
+        repos: [],
+      };
+    default:
+      return null;
+  }
+}
 
 export const mockForgeConfig = {
   allowed_base_urls: ["https://gitlab.example.com"],
