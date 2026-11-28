@@ -52,7 +52,8 @@ export function ForgeTokenBanner({ userId }: { userId: string }) {
 
   useEffect(() => {
     let live = true;
-    // A new account starts with no data: the previous account's connections never show.
+    // Release the previous account's data. The guarantee that it never renders for another
+    // account is the render-time userId check below; this reset is defence in depth.
     setData(null);
     const load = () => {
       const seq = ++seqRef.current;

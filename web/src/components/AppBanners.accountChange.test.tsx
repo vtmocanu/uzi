@@ -113,7 +113,7 @@ describe("AppBanners across an account change (#4817)", () => {
     expect(screen.getByRole("status", { name: "Forge token expiring" })).toBeTruthy();
   });
 
-  it("an account switch never commits the previous account's already-shown banner", async () => {
+  it("after an account switch the new account's banner replaces the previous one", async () => {
     signInAs("user-a");
     const { rerender } = render(tree());
     await settle();
@@ -123,7 +123,8 @@ describe("AppBanners across an account change (#4817)", () => {
 
     signInAs("user-b");
     rerender(tree());
-    // Synchronously after the switch, before any effect for B has run.
+    // End to end only: rerender runs inside act, so B's effect has already run here. The
+    // same-commit guarantee is pinned in ForgeTokenBanner.test.tsx with a layout-effect probe.
     expect(screen.queryByRole("alert", { name: "Forge token expired" })).toBeNull();
     await settle();
     respond(1, 200, { connections: [connection("b", 3 * DAY)] });
