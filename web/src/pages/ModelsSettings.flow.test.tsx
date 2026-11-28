@@ -343,7 +343,7 @@ describe("unsaved-changes guard", () => {
     const second = unloads(add)[1];
     fireEvent.click(within(bar()).getByRole("button", { name: "Save changes" }));
     await within(bar()).findByText(/Saved 1 change/, {}, { timeout: 5000 });
-    expect(unloads(remove)).toContain(second);
+    await waitFor(() => expect(unloads(remove)).toContain(second));
     expect(unloads(add)).toHaveLength(2);
   }, 30000);
 
