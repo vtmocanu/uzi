@@ -96,13 +96,22 @@ type UsageFolder struct {
 	missingCID     uuid.UUID
 	missingFound   bool
 	missingBackoff time.Time
-	// retryStale / retryMissing hold the ids of a batch that failed because the lane deadline
-	// expired. The next Pass retries them run by run, before taking new work (guarded by passMu).
+	// retryStale / retryMissing hold the ids that a lane deadline cut short: a batch that failed
+	// on the deadline, the tail of an interrupted run-by-run loop, and a single run that was
+	// never attempted (the materializer was busy) or failed with under half a lane budget left
+	// after acquiring it. The next Pass retries them run by run, before taking new work (guarded
+	// by passMu).
 	retryStale   []uuid.UUID
 	retryMissing []uuid.UUID
 
 	skipMu sync.Mutex
 	skip   map[uuid.UUID]time.Time
+
+	// Test seams, nil in production; set before any Notify or Pass (see the export_test setters).
+	// budgetHook replaces the remaining-time read in fullBudget; waitHook is called when
+	// materialize finds the semaphore busy, before it blocks.
+	budgetHook func(ctx context.Context, site budgetSite) time.Duration
+	waitHook   func(ids []uuid.UUID)
 }
 
 // NewUsageFolder builds a folder over db. db may be nil only when opts.Materialize is set
@@ -152,16 +161,44 @@ func terminalRunStatus(s string) bool {
 	return s == "completed" || s == "failed" || s == "cancelled"
 }
 
+// budgetSite names a place that measures the remaining budget; it only exists so a test can
+// tell the reads apart through budgetHook.
+type budgetSite string
+
+const (
+	siteRetry        budgetSite = "retry"
+	siteFold         budgetSite = "fold"
+	siteFoldEach     budgetSite = "foldEach"
+	siteKick         budgetSite = "kick"
+	siteMissingQuery budgetSite = "missingQuery"
+)
+
 // materialize runs one materializer call under the folder-wide semaphore; waiting for it
-// honours ctx.
-func (f *UsageFolder) materialize(ctx context.Context, ids []uuid.UUID) (int64, error) {
+// honours ctx. full reports whether, once the semaphore was acquired, ctx still had at least
+// half a lane budget (fullBudget): the budget is measured AFTER the wait, so a call that spent
+// its lane queued behind a kick is not mistaken for a run that ran out of time on its own.
+// A call that never acquired the semaphore (ctx ended first, or was already done) returns a
+// *materializerBusyError and full=false: the run itself was never attempted.
+func (f *UsageFolder) materialize(ctx context.Context, ids []uuid.UUID, site budgetSite) (n int64, full bool, err error) {
+	if cerr := ctx.Err(); cerr != nil {
+		return 0, false, &materializerBusyError{err: cerr}
+	}
 	select {
 	case f.mat <- struct{}{}:
-	case <-ctx.Done():
-		return 0, &materializerBusyError{err: ctx.Err()}
+	default:
+		if f.waitHook != nil {
+			f.waitHook(ids)
+		}
+		select {
+		case f.mat <- struct{}{}:
+		case <-ctx.Done():
+			return 0, false, &materializerBusyError{err: ctx.Err()}
+		}
 	}
 	defer func() { <-f.mat }()
-	return f.opt.Materialize(ctx, ids)
+	full = f.fullBudget(ctx, site)
+	n, err = f.opt.Materialize(ctx, ids)
+	return n, full, err
 }
 
 // materializerBusyError means ctx ended while the call was still waiting for the folder-wide
@@ -175,9 +212,18 @@ func (e *materializerBusyError) Unwrap() error { return e.err }
 
 // fullBudget reports whether ctx still has at least half a lane budget, i.e. an attempt that
 // runs out of time did so on its own and not because the parent deadline cut the lane short.
-func (f *UsageFolder) fullBudget(ctx context.Context) bool {
+// For a materializer call it is measured after the semaphore was acquired (see materialize).
+// A ctx without a deadline always has the full budget. site only matters to budgetHook.
+func (f *UsageFolder) fullBudget(ctx context.Context, site budgetSite) bool {
 	dl, ok := ctx.Deadline()
-	return !ok || time.Until(dl) >= f.opt.LaneTimeout/2
+	if !ok {
+		return true
+	}
+	remaining := time.Until(dl)
+	if f.budgetHook != nil {
+		remaining = f.budgetHook(ctx, site)
+	}
+	return remaining >= f.opt.LaneTimeout/2
 }
 
 // readTx runs fn in a short read-only transaction with a server-side statement_timeout of one
@@ -248,7 +294,7 @@ func (f *UsageFolder) Notify(runID uuid.UUID, status string) {
 		}()
 		ctx, cancel := context.WithTimeout(f.baseCtx, f.opt.KickTimeout)
 		defer cancel()
-		n, err := f.materialize(ctx, []uuid.UUID{runID})
+		n, _, err := f.materialize(ctx, []uuid.UUID{runID}, siteKick)
 		if err != nil {
 			slog.Warn("usage fold kick failed", "run_id", runID, "error", err)
 		}
@@ -383,7 +429,7 @@ func (f *UsageFolder) missingLane(ctx context.Context) (int64, error) {
 		return n0, nil
 	}
 	var rows []ListMissingRunUsageFoldRunsRow
-	fullQuery := f.fullBudget(ctx)
+	fullQuery := f.fullBudget(ctx, siteMissingQuery)
 	err = f.readTx(ctx, func(q *Queries) error {
 		var qerr error
 		rows, qerr = q.ListMissingRunUsageFoldRuns(ctx, ListMissingRunUsageFoldRunsParams{
@@ -439,9 +485,10 @@ func (f *UsageFolder) missingLane(ctx context.Context) (int64, error) {
 
 // retryPending retries, run by run, the ids of a batch that failed on the lane deadline in an
 // earlier tick. Progress persists in *pending: an id leaves it once it folded, or once it was
-// skipped for the TTL because it ran out of time ALONE with a full lane budget. An id that ran
-// out of time with a short budget (or while waiting for the materializer) stays for the next
-// tick, where it goes first.
+// skipped for the TTL, either because it failed on its own (not a deadline), or because it ran
+// out of time ALONE with at least half a lane budget left, measured after it acquired the
+// materializer. An id that ran out of time with a shorter budget, or that never acquired the
+// materializer (a kick held it), stays for the next tick, where it goes first.
 //
 // It also returns how many runs it attempted: the caller charges them against the lane's
 // per-tick allowance (LaneLimit), so a lane never attempts more than LaneLimit pending retries
@@ -453,17 +500,15 @@ func (f *UsageFolder) retryPending(ctx context.Context, pending *[]uuid.UUID, al
 	attempts := 0
 	for len(*pending) > 0 && attempts < allowance {
 		id := (*pending)[0]
-		full := f.fullBudget(ctx)
 		attempts++
-		n, err := f.materialize(ctx, []uuid.UUID{id})
+		n, full, err := f.materialize(ctx, []uuid.UUID{id}, siteRetry)
 		if err == nil {
 			total += n
 			*pending = (*pending)[1:]
 			continue
 		}
 		if ctx.Err() != nil {
-			var busy *materializerBusyError
-			if full && !errors.As(err, &busy) {
+			if full {
 				f.skipRun(id, err)
 				*pending = (*pending)[1:]
 			}
@@ -479,22 +524,25 @@ func (f *UsageFolder) retryPending(ctx context.Context, pending *[]uuid.UUID, al
 // a run that fails on its own is skipped for the TTL so one poison run cannot stall the lane.
 // When the batch fails because the lane deadline expired, the ids are remembered in *retry and
 // retried run by run first on the next tick, so a run whose fold outlasts the lane budget cannot
-// block its neighbours forever; a run that times out alone is skipped. The error is returned only
-// for a failure the lane itself suffers (deadline), never for a run that was individually skipped.
+// block its neighbours forever. A single run that hits the deadline is skipped only when at
+// least half a lane budget was left after it acquired the materializer (it ran out of time
+// alone); otherwise, or when it never acquired the materializer, it is queued in *retry. An
+// interrupted run-by-run loop queues ids[i:]. The error is returned only for a failure the lane
+// itself suffers (deadline), never for a run that was individually skipped.
 func (f *UsageFolder) fold(ctx context.Context, ids []uuid.UUID, retry *[]uuid.UUID) (int64, error) {
 	if len(ids) == 0 {
 		return 0, nil
 	}
-	full := f.fullBudget(ctx)
-	n, err := f.materialize(ctx, ids)
+	n, full, err := f.materialize(ctx, ids, siteFold)
 	if err == nil {
 		return n, nil
 	}
 	if cerr := ctx.Err(); cerr != nil {
-		var busy *materializerBusyError
 		if len(ids) == 1 {
-			if full && !errors.As(err, &busy) {
+			if full {
 				f.skipRun(ids[0], err)
+			} else {
+				*retry = append([]uuid.UUID(nil), ids...)
 			}
 		} else {
 			*retry = append([]uuid.UUID(nil), ids...)
@@ -508,7 +556,7 @@ func (f *UsageFolder) fold(ctx context.Context, ids []uuid.UUID, retry *[]uuid.U
 	slog.Warn("usage fold batch failed, retrying run by run", "runs", len(ids), "error", err)
 	var total int64
 	for i, id := range ids {
-		n1, err1 := f.materialize(ctx, []uuid.UUID{id})
+		n1, _, err1 := f.materialize(ctx, []uuid.UUID{id}, siteFoldEach)
 		if err1 == nil {
 			total += n1
 			continue

@@ -146,7 +146,9 @@ failure or power loss.
     `TestUsageFolderMissingQueryPlanLiveDB`), with a 5-minute backoff after a full traversal
     finds nothing.
 - A batch that hit a lane deadline is retried run by run on the next pass; a run that fails
-  alone is skipped for 10 minutes. One semaphore serialises every materializer call, because
+  alone is skipped for 10 minutes. A single run cut short by the deadline is skipped only when
+  at least half a lane budget remained after it acquired the semaphore; one that waited behind
+  a kick or ran short of budget is retried on the next tick. One semaphore serialises every materializer call, because
   two concurrent calls on the same new run fail a whole batch with `55P03`. `UsageFolder.Wait` starts after
   the HTTP drain and runs alongside the generated-output and prerequisite drain
   (`drainShutdownWork` in `api/cmd/server/main.go`), bounded to 5 s.

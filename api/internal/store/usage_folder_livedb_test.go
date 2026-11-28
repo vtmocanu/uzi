@@ -924,3 +924,219 @@ func TestUsageFolderMissingQueryPlanLiveDB(t *testing.T) {
 		t.Error("the window size is no longer the literal LIMIT 2000")
 	}
 }
+
+// kickFixture holds the folder's materializer semaphore with a kick of a sentinel run that is
+// not in the database, until release is called. The kick ignores ctx on purpose: it models a
+// materializer call that is busy for longer than a lane budget.
+type kickFixture struct {
+	f       *store.UsageFolder
+	release func()
+	done    chan struct{}
+}
+
+// startKick builds a folder (LaneTimeout 30s, ParentTimeout 60s, LaneLimit 1, frozen clock),
+// lets setup install hooks before any Notify, starts the kick and waits until it holds the
+// semaphore. inner handles every materializer call that is not the kick.
+func (e *foldEnv) startKick(t *testing.T, inner func(ctx context.Context, ids []uuid.UUID) (int64, error), setup func(f *store.UsageFolder, releaseKick func())) *kickFixture {
+	t.Helper()
+	k := uuid.New()
+	entered := make(chan struct{})
+	kickRelease := make(chan struct{})
+	var once sync.Once
+	releaseKick := func() { once.Do(func() { close(kickRelease) }) }
+	kf := &kickFixture{release: releaseKick, done: make(chan struct{})}
+	frozen := time.Now()
+	kf.f = store.NewUsageFolder(e.pool, store.UsageFolderOptions{
+		ParentTimeout: 60 * time.Second,
+		LaneTimeout:   30 * time.Second,
+		LaneLimit:     1,
+		Now:           func() time.Time { return frozen },
+		Materialize: func(ctx context.Context, ids []uuid.UUID) (int64, error) {
+			if len(ids) == 1 && ids[0] == k {
+				close(entered)
+				<-kickRelease
+				return 0, nil
+			}
+			return inner(ctx, ids)
+		},
+		OnFolded: func(id uuid.UUID, _ int64, _ error) {
+			if id == k {
+				close(kf.done)
+			}
+		},
+	})
+	t.Cleanup(func() {
+		releaseKick()
+		wctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := kf.f.Wait(wctx); err != nil {
+			t.Errorf("folder Wait: %v", err)
+		}
+	})
+	if setup != nil {
+		setup(kf.f, releaseKick)
+	}
+	kf.f.Notify(k, "completed")
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the kick never reached the materializer")
+	}
+	return kf
+}
+
+func (kf *kickFixture) waitKickDone(t *testing.T) {
+	t.Helper()
+	select {
+	case <-kf.done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the kick never finished")
+	}
+}
+
+// pinnedMissingRuns creates n missing runs whose created_at is above every eligible run's, in
+// creation order (the last one returned is the newest).
+func (e *foldEnv) pinnedMissingRuns(t *testing.T, n int) []uuid.UUID {
+	t.Helper()
+	var base time.Time
+	if err := e.pool.QueryRow(e.ctx, `SELECT GREATEST(now(), max(created_at)) FROM runs
+		WHERE status IN ('completed','failed','cancelled') AND kind <> 'chat' AND usage_refolded
+		  AND created_at < TIMESTAMPTZ '9999-12-31 00:00:00+00'`).Scan(&base); err != nil {
+		t.Fatalf("find newest eligible run: %v", err)
+	}
+	ids := make([]uuid.UUID, n)
+	for i := range ids {
+		ids[i] = e.missingRun(t)
+	}
+	mustExec(e.ctx, t, e.pool, `UPDATE runs r SET created_at = $1::timestamptz + x.ord * interval '1 second'
+		FROM unnest($2::uuid[]) WITH ORDINALITY AS x(id, ord) WHERE r.id = x.id`, base, ids)
+	return ids
+}
+
+// A single run whose fold found the materializer busy (a kick held it past the lane's end) was
+// never attempted: it is queued for the next tick, not skipped for the TTL, and goes first.
+func TestUsageFolderBusySingleRunRetriedNextTickLiveDB(t *testing.T) {
+	e := newFolderEnv(t)
+	ids := e.pinnedMissingRuns(t, 2) // Y, then X: X is the newest
+	y, x := ids[0], ids[1]
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	defer cancel1()
+	var mu sync.Mutex
+	var order []uuid.UUID
+	kf := e.startKick(t, func(ctx context.Context, ids []uuid.UUID) (int64, error) {
+		mu.Lock()
+		order = append(order, ids...)
+		mu.Unlock()
+		return e.realMaterialize(ctx, ids)
+	}, func(f *store.UsageFolder, _ func()) {
+		store.SetWaitHookForTest(f, func(ids []uuid.UUID) {
+			if len(ids) == 1 && ids[0] == x {
+				cancel1()
+			}
+		})
+	})
+
+	if _, err := kf.f.Pass(ctx1); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Pass 1: got %v, want context cancellation", err)
+	}
+	if !containsID(kf.f.RetryMissingForTest(), x) {
+		t.Fatalf("busy run %s is not queued for retry: %v", x, kf.f.RetryMissingForTest())
+	}
+	if containsID(kf.f.SkippedForTest(), x) {
+		t.Fatalf("busy run %s was skipped for the TTL", x)
+	}
+
+	kf.release()
+	kf.waitKickDone(t)
+	mu.Lock()
+	order = nil
+	mu.Unlock()
+	if _, err := kf.f.Pass(context.Background()); err != nil {
+		t.Fatalf("Pass 2: %v", err)
+	}
+	mu.Lock()
+	got := append([]uuid.UUID(nil), order...)
+	mu.Unlock()
+	if len(got) == 0 || got[0] != x {
+		t.Fatalf("Pass 2 attempted %v, want %s first (y=%s)", got, x, y)
+	}
+	e.wantFresh(t, "retried busy run", x)
+}
+
+// A single run that acquired the materializer late, after waiting behind a kick, has less than
+// half a lane budget left when it fails on the deadline: that is not its own fault, so it is
+// queued for the next tick instead of skipped for the TTL.
+func TestUsageFolderLateMaterializerSlotNotSkippedLiveDB(t *testing.T) {
+	e := newFolderEnv(t)
+	x := e.pinnedMissingRuns(t, 1)[0]
+	const laneTimeout = 30 * time.Second
+
+	type read struct {
+		site     string
+		value    time.Duration
+		observed bool
+	}
+	var (
+		mu           sync.Mutex
+		reads        []read
+		waitObserved atomic.Bool
+		phase        atomic.Int32
+	)
+	phase.Store(1)
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	defer cancel1()
+	kf := e.startKick(t, func(ctx context.Context, ids []uuid.UUID) (int64, error) {
+		if phase.Load() == 1 && len(ids) == 1 && ids[0] == x {
+			cancel1()
+			return 0, ctx.Err()
+		}
+		return e.realMaterialize(ctx, ids)
+	}, func(f *store.UsageFolder, releaseKick func()) {
+		store.SetBudgetHookForTest(f, func(_ context.Context, site string) time.Duration {
+			obs := waitObserved.Load()
+			v := laneTimeout
+			if obs {
+				v = laneTimeout/2 - time.Millisecond
+			}
+			mu.Lock()
+			reads = append(reads, read{site, v, obs})
+			mu.Unlock()
+			return v
+		})
+		store.SetWaitHookForTest(f, func(ids []uuid.UUID) {
+			if len(ids) == 1 && ids[0] == x {
+				waitObserved.Store(true)
+				releaseKick()
+			}
+		})
+	})
+
+	if _, err := kf.f.Pass(ctx1); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Pass 1: got %v, want context cancellation", err)
+	}
+	if containsID(kf.f.SkippedForTest(), x) {
+		t.Errorf("late run %s was skipped for the TTL", x)
+	}
+	mu.Lock()
+	var fold []read
+	for _, r := range reads {
+		if r.site == "fold" {
+			fold = append(fold, r)
+		}
+	}
+	mu.Unlock()
+	if len(fold) != 1 || !fold[0].observed || fold[0].value >= laneTimeout/2 {
+		t.Errorf("fold budget reads in Pass 1 = %+v, want exactly one taken after the wait with less than half a lane", fold)
+	}
+	if !containsID(kf.f.RetryMissingForTest(), x) {
+		t.Errorf("late run %s is not queued for retry: %v", x, kf.f.RetryMissingForTest())
+	}
+
+	kf.waitKickDone(t)
+	phase.Store(2)
+	if _, err := kf.f.Pass(context.Background()); err != nil {
+		t.Fatalf("Pass 2: %v", err)
+	}
+	e.wantFresh(t, "retried late run", x)
+}
