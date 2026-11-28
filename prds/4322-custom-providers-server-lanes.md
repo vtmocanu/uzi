@@ -166,7 +166,7 @@ Risks: during an API-first rollout an owner with only ephemeral workers may meet
 Both child-creation families, source/freeze, custody exclusivity, actual SDK consumer and stage-specific failures; preserve settings and pin resolution, no hidden Codex implementation. Test both engine directions and both plan/code stages, plus final locked races and no synthetic approval.
 
 
-Because #4540 M2 lands first, this milestone carries the operator rows: test an operator-funded Claude checker child at both stages, and an early revoke (at assembly, zero opens) and a late revoke (between assembly and the final recheck, zero deliveries). Both settle as `checker_unavailable`, lead-first. Only if the order flipped (this milestone landing before #4540 M2) would it instead keep refusing an `operator_key` source by adding the selected definition's mode to `GetUserProviderLaneSources`.
+Because #4540 M2 lands first, this milestone flips the blanket-refusal pin test #4540 M2 adds and carries the operator rows: test an operator-funded Claude checker child at both stages, and an early revoke (at assembly, zero opens) and a late revoke (between assembly and the final recheck, zero deliveries). Both settle as `checker_unavailable`, lead-first. Only if the order flipped (this milestone landing before #4540 M2) would it instead keep refusing an `operator_key` source by adding the selected definition's mode to `GetUserProviderLaneSources`.
 ### M2b: Actual resolved-model independence guard
 
 **Blocked by:** M2's source/claim wiring in the same PR; not independently dispatchable.
