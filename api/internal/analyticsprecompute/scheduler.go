@@ -80,7 +80,17 @@ type Scheduler struct {
 	nextAttempt   time.Time
 	failures      int
 	invalidations int
+	checks        int64
 	wg            sync.WaitGroup
+}
+
+// Checks returns how many background checks Pass has started. It is an observability counter:
+// Pass always returns 0, so it is the only way to tell that a pass launched a check (which may
+// then decide that no build is wanted).
+func (s *Scheduler) Checks() int64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.checks
 }
 
 // New returns a Scheduler on pool that keeps each section's stored set younger than interval.
@@ -134,6 +144,7 @@ func (s *Scheduler) Pass(_ context.Context) (int64, error) {
 		return 0, nil
 	}
 	s.running = true
+	s.checks++
 	s.wg.Add(1)
 	go s.run(s.base)
 	return 0, nil
@@ -329,7 +340,7 @@ func (s *Scheduler) skip(st store.AnalyticsPrecomputeState, sec Section) (bool, 
 // logFailure logs a failed section. A process shutdown (base cancelled) is expected, not an error.
 func (s *Scheduler) logFailure(base context.Context, section, phase string, err error, panicked bool) {
 	if base.Err() != nil {
-		slog.Info(analyticsPrecomputeLogName+": build cancelled by shutdown", "section", section, "phase", phase)
+		slog.Info(analyticsPrecomputeLogName+": build cancelled by shutdown", "section", section, "phase", phase, "panic", panicked, "error", err)
 		return
 	}
 	slog.Error(analyticsPrecomputeLogName+": build failed", "section", section, "phase", phase, "panic", panicked, "error", err)

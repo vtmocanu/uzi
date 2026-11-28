@@ -66,10 +66,14 @@ func TestAnalyticsSchedulerSharedStateLiveDB(t *testing.T) {
 		}}}, func() time.Time { return bClock })
 	run := func(s *analyticsprecompute.Scheduler) {
 		t.Helper()
+		before := s.Checks()
 		if n, err := s.Pass(context.Background()); err != nil || n != 0 {
 			t.Fatalf("Pass = (%d, %v), want (0, nil): a build start is not a row", n, err)
 		}
 		s.Wait()
+		if got := s.Checks(); got != before+1 {
+			t.Fatalf("Pass started %d checks, want 1: the no-build assertions need a check that ran", got-before)
+		}
 	}
 	status := func() store.AnalyticsPrecomputeState {
 		t.Helper()
@@ -125,10 +129,14 @@ func TestAnalyticsSchedulerEndToEndLiveDB(t *testing.T) {
 	}}, func() time.Time { return f.now })
 	build := func() {
 		t.Helper()
+		before := sched.Checks()
 		if n, err := sched.Pass(context.Background()); err != nil || n != 0 {
 			t.Fatalf("Pass = (%d, %v), want (0, nil): a build start is not a row", n, err)
 		}
 		sched.Wait()
+		if got := sched.Checks(); got != before+1 {
+			t.Fatalf("Pass started %d checks, want 1: the no-build assertions need a check that ran", got-before)
+		}
 	}
 
 	if rec := f.cookie(admin, path); rec.Code != http.StatusServiceUnavailable {

@@ -515,10 +515,23 @@ func runExpiredBuild(t *testing.T) (*env, *Scheduler, time.Time) {
 			return errors.New("test ended before the build bound")
 		}
 	}
-	done := make(chan struct{})
-	go func() { cycle(t, s, e); close(done) }()
+	// Pass and Wait run off the test goroutine so a hang can be reported; the goroutine only sends
+	// the Pass result back and never calls a method that stops the test.
+	type passResult struct {
+		n   int64
+		err error
+	}
+	done := make(chan passResult, 1)
+	go func() {
+		n, err := s.Pass(context.Background())
+		s.Wait()
+		done <- passResult{n, err}
+	}()
 	select {
-	case <-done:
+	case r := <-done:
+		if r.err != nil || r.n != 0 {
+			t.Fatalf("Pass = (%d, %v), want (0, nil)", r.n, r.err)
+		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("the build was not bounded: Wait did not return")
 	}
@@ -533,6 +546,9 @@ func TestBuildBoundExpiryRecordsOneFailureOnADetachedContext(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "phase=build") {
 		t.Fatalf("failure not logged in the build phase: %s", logs)
+	}
+	if !strings.Contains(logs.String(), "build failed") || !strings.Contains(logs.String(), "level=ERROR") {
+		t.Fatalf("an expired build bound must log an ERROR build failure, not a shutdown: %s", logs)
 	}
 	s.mu.Lock()
 	next := s.nextAttempt
