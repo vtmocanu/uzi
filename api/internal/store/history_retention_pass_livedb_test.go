@@ -18,7 +18,8 @@ import (
 // UZI_TEST_DATABASE_URL points at a throwaway Postgres; run via ./e2e/run-store-it.sh.
 
 // hrSeedMixed gives every table 5 expired rows (48h old), 3 fresh rows (the current bucket) and,
-// for pr_history_events, 2 expired first_merge rows. It returns the current bucket and the
+// for pr_history_events, 2 expired first_merge rows, plus 3 expired pr_history_heads rows with every
+// column populated (which no pass may touch). It returns the current bucket and the
 // expired total a 24h pass deletes.
 func hrSeedMixed(f *hrFx) (fresh time.Time, expired int64) {
 	fresh = time.Now().UTC().Truncate(5 * time.Minute)
@@ -30,8 +31,7 @@ func hrSeedMixed(f *hrFx) (fresh time.Time, expired int64) {
 	}
 	f.seedFirstMerge(2, old)
 	// Expired heads (older than the 24h cutoff): the pass must leave them untouched.
-	f.exec(`INSERT INTO pr_history_heads (repo_id, mr_iid, state, observed_at, last_to_state)
-	        SELECT $1, $2::bigint + g, 'merged', $3, 'merged' FROM generate_series(1, 3) g`, f.repoQ, f.nextIID(3), old)
+	f.seedHeads(3, old)
 	return fresh, expired
 }
 
@@ -104,6 +104,9 @@ func hrPassOffThenOn(t *testing.T, f *hrFx) {
 func hrPassContended(t *testing.T, f *hrFx) {
 	fresh, expired := hrSeedMixed(f)
 	heads := f.heads()
+	if len(heads) != 3 {
+		t.Fatalf("seeded %d heads, want 3", len(heads))
+	}
 	pass := historyretention.New(f.pool, 24*time.Hour)
 
 	holder, got, err := store.OpenHistoryRetentionSession(f.ctx, f.ctx, f.pool, time.Second, time.Second)

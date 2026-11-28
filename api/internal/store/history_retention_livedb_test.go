@@ -179,12 +179,13 @@ func (f *hrFx) lockHolders() int {
 		int64(store.HistoryRetentionLockClass))
 }
 
-// heads snapshots pr_history_heads by value, one string per row in key order, so a test can tell a
-// changed or replaced row from an untouched one (a row count cannot).
+// heads snapshots pr_history_heads by whole row (every column, as jsonb) plus the row version
+// (xmin), one string per row in key order, so a test can tell a changed, nulled, same-value
+// rewritten or replaced row from an untouched one (a row count cannot).
 func (f *hrFx) heads() []string {
 	f.t.Helper()
-	rows, err := f.pool.Query(f.ctx, `SELECT concat_ws('|', repo_id::text, mr_iid::text, state, observed_at::text, coalesce(last_to_state, '<null>'))
-	        FROM pr_history_heads ORDER BY repo_id, mr_iid`)
+	rows, err := f.pool.Query(f.ctx, `SELECT to_jsonb(h)::text || ' xmin=' || h.xmin::text
+	        FROM pr_history_heads h ORDER BY repo_id, mr_iid`)
 	if err != nil {
 		f.t.Fatal(err)
 	}
@@ -201,6 +202,20 @@ func (f *hrFx) heads() []string {
 		f.t.Fatal(err)
 	}
 	return out
+}
+
+// seedHeads inserts n pr_history_heads rows with a non-default value in every nullable or
+// defaulted column the CHECK constraints allow, so a rewrite that nulls or resets any column is
+// visible in heads().
+func (f *hrFx) seedHeads(n int, at time.Time) {
+	f.t.Helper()
+	f.exec(`INSERT INTO pr_history_heads (repo_id, mr_iid, state, observed_at, last_provider_at, first_merged_at,
+	            first_merged_source, last_changed, last_from_state, last_to_state, last_event_provider_at,
+	            last_time_source, last_bootstrap, last_first_merge, created_at, updated_at)
+	        SELECT $1, $2::bigint + g, 'merged', $3::timestamptz, $3 - interval '1 minute', $3 - interval '2 minutes',
+	            'provider', true, 'opened', 'merged', $3 - interval '3 minutes',
+	            'provider', true, true, $3 - interval '1 hour', $3 - interval '30 minutes'
+	        FROM generate_series(1, $4::int) g`, f.repoQ, f.nextIID(n), at, n)
 }
 
 // hrHeadsEqual reports the first difference between two heads snapshots ("" when equal).
@@ -297,9 +312,11 @@ func TestHistoryRetentionDeleteLiveDB(t *testing.T) {
 			t.Errorf("reference - cutoff = %v, want exactly %v", got, retention)
 		}
 		// The reference is the database clock; the test and the database share the host clock.
-		if ref.Before(before.Add(d-time.Millisecond)) || ref.After(after.Add(-d+time.Millisecond)) {
+		// The tolerance (d/4) absorbs any client/server clock offset; a Go-clock reference misses by >= 3d/4.
+		eps := d / 4
+		if ref.Before(before.Add(d-eps)) || ref.After(after.Add(-d+eps)) {
 			t.Errorf("reference %v is not inside [%v, %v] (client readings %v and %v, delay %v each way)",
-				ref, before.Add(d-time.Millisecond), after.Add(-d+time.Millisecond), before, after, d)
+				ref, before.Add(d-eps), after.Add(-d+eps), before, after, d)
 		}
 		for _, bad := range []time.Duration{0, -time.Hour} {
 			if _, _, err := s.Cutoff(f.ctx, bad); err == nil {
@@ -313,8 +330,7 @@ func TestHistoryRetentionDeleteLiveDB(t *testing.T) {
 		old := hrBase
 		f.seed(store.HistoryRetentionPRHistoryEvents, 4, old)
 		f.seedFirstMerge(3, old)
-		f.exec(`INSERT INTO pr_history_heads (repo_id, mr_iid, state, observed_at, last_to_state)
-		        SELECT $1, $2::bigint + g, 'merged', $3, 'merged' FROM generate_series(1, 5) g`, f.repoQ, f.nextIID(5), old)
+		f.seedHeads(5, old)
 		headsBefore := f.heads()
 		if len(headsBefore) != 5 {
 			t.Fatalf("seeded %d heads, want 5", len(headsBefore))
@@ -478,7 +494,7 @@ func TestHistoryRetentionDeleteLiveDB(t *testing.T) {
 		// bounds both the gate and the wait for the result.
 		watchdog := time.NewTimer(20 * time.Second)
 		defer watchdog.Stop()
-		for f.count(`SELECT count(*) FROM pg_stat_activity WHERE pid = $1 AND wait_event_type = 'Lock'`, int64(pid)) != 1 {
+		for f.count(`SELECT count(*) FROM pg_stat_activity WHERE pid = $1 AND wait_event_type = 'Lock' AND wait_event = 'relation'`, int64(pid)) != 1 {
 			select {
 			case r := <-done:
 				t.Fatalf("DeleteBatch returned (%d, %v) before wait_event_type = Lock was observed", r.n, r.err)
@@ -515,7 +531,7 @@ func TestHistoryRetentionDeleteLiveDB(t *testing.T) {
 		exitStart := time.Now()
 		for f.pidAlive(pid) {
 			if time.Since(exitStart) > 3*time.Second {
-				t.Fatalf("backend %d still alive 3s after the work context expired and Close ran (idle_session_timeout is 5s, so only the client side can end it: when the context expires pgx itself sends the cancel request and the terminate, and Close then finds a closed connection and does nothing)", pid)
+				t.Fatalf("backend %d still alive 3s after the work context was cancelled and Close ran (idle_session_timeout is 5s, so only the client side can end it: when the context is cancelled pgx itself sends the cancel request and the terminate, and Close then finds a closed connection and does nothing)", pid)
 			}
 			time.Sleep(10 * time.Millisecond)
 		}
@@ -751,9 +767,12 @@ func TestHistoryRetentionFailedOpenLiveDB(t *testing.T) {
 		}
 		// Cancel only once the reply is provably withheld: the wrapper saw the try-lock execute
 		// (armed) and a client read is blocked on the lost reply.
+		// The lock poll above already implies this (the server holds the lock only after processing
+		// the try-lock, after which the client is necessarily waiting on the withheld reply), so this
+		// loop is a redundant safety condition; removing the poll and this loop together fails the test.
 		gate := time.NewTimer(20 * time.Second)
 		defer gate.Stop()
-		for !(w.armed() && w.blockedRead()) {
+		for !w.armed() || !w.blockedRead() {
 			select {
 			case r := <-done:
 				t.Fatalf("open returned (%v, %v, %v) before the reply hold was armed and a read blocked", r.s, r.got, r.err)
@@ -1111,7 +1130,7 @@ func TestHistoryRetentionLockHoldersScopingLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer other.Close(context.Background())
+	defer func() { _ = other.Close(context.Background()) }()
 	if _, err := other.Exec(otherCtx, `SELECT pg_advisory_lock($1, 0)`, int32(class)); err != nil {
 		t.Fatal(err)
 	}
