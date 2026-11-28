@@ -56,12 +56,12 @@ func analyticsSnapshotStale(now, generatedAt time.Time, interval time.Duration) 
 }
 
 // isNonEmptyJSONObject reports whether b starts with '{', ends with '}' and has something other
-// than whitespace between them, so a member can be appended after a comma.
+// than whitespace between them, so a member can be appended after a comma, and is valid JSON.
 func isNonEmptyJSONObject(b []byte) bool {
 	if len(b) < 3 || b[0] != '{' || b[len(b)-1] != '}' {
 		return false
 	}
-	return len(bytes.TrimSpace(b[1:len(b)-1])) > 0
+	return len(bytes.TrimSpace(b[1:len(b)-1])) > 0 && json.Valid(b)
 }
 
 func (h *Handler) readAllTimeSpendDoc(ctx context.Context, key string) ([]byte, time.Time, error) {
@@ -88,18 +88,7 @@ func (h *Handler) serveAllTimeSpend(w http.ResponseWriter, r *http.Request, req 
 		httpx.Error(w, http.StatusServiceUnavailable, "analytics snapshot pending, retry later")
 		return
 	case err != nil:
-		if errors.Is(store.ClassifyAnalyticsErr(err), store.ErrAnalyticsTimeout) && r.Context().Err() == nil {
-			slog.Warn("analytics: stored document read timed out", "error", err)
-			w.Header().Set("Retry-After", "1")
-			httpx.Error(w, http.StatusServiceUnavailable, "analytics query timed out, retry shortly")
-			return
-		}
-		if r.Context().Err() != nil {
-			slog.Debug("analytics: request cancelled", "error", err)
-			return
-		}
-		slog.Error("analytics: read stored document", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		analyticsFail(w, r, err)
 		return
 	}
 	trimmed := bytes.TrimSpace(doc)

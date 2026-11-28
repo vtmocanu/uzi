@@ -212,8 +212,8 @@ func TestAnalyticsAllTimeServePending(t *testing.T) {
 	docs := &fakeDocs{err: pgx.ErrNoRows}
 	h, begin := newPrecomputedHandler(t, docs, time.Now())
 	rec := serveAdminSpend(h, "window=all")
-	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") != "60" || rec.Header().Get("Cache-Control") != "private, no-store" {
-		t.Fatalf("status %d Retry-After %q Cache-Control %q", rec.Code, rec.Header().Get("Retry-After"), rec.Header().Get("Cache-Control"))
+	if rec.Code != http.StatusServiceUnavailable || rec.Result().Header.Get("Retry-After") != "60" || rec.Result().Header.Get("Cache-Control") != "private, no-store" {
+		t.Fatalf("status %d Retry-After %q Cache-Control %q", rec.Code, rec.Result().Header.Get("Retry-After"), rec.Result().Header.Get("Cache-Control"))
 	}
 	if !strings.Contains(rec.Body.String(), "analytics snapshot pending, retry later") {
 		t.Fatalf("body %s", rec.Body.String())
@@ -226,8 +226,8 @@ func TestAnalyticsAllTimeServePending(t *testing.T) {
 func TestAnalyticsAllTimeServeReadErrors(t *testing.T) {
 	h, _ := newPrecomputedHandler(t, &fakeDocs{err: context.DeadlineExceeded}, time.Now())
 	rec := serveAdminSpend(h, "window=all")
-	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") != "1" || rec.Header().Get("Cache-Control") != "private, no-store" {
-		t.Fatalf("timeout: status %d Retry-After %q", rec.Code, rec.Header().Get("Retry-After"))
+	if rec.Code != http.StatusServiceUnavailable || rec.Result().Header.Get("Retry-After") != "1" || rec.Result().Header.Get("Cache-Control") != "private, no-store" {
+		t.Fatalf("timeout: status %d Retry-After %q", rec.Code, rec.Result().Header.Get("Retry-After"))
 	}
 	h, _ = newPrecomputedHandler(t, &fakeDocs{err: errors.New("boom secret detail")}, time.Now())
 	rec = serveAdminSpend(h, "window=all")
@@ -237,7 +237,7 @@ func TestAnalyticsAllTimeServeReadErrors(t *testing.T) {
 }
 
 func TestAnalyticsAllTimeServeRejectsNonObjectDoc(t *testing.T) {
-	for _, doc := range []string{"", "{}", " { } ", "[1]", "null", `"x"`, `{"a":1`} {
+	for _, doc := range []string{"", "{}", " { } ", "[1]", "null", `"x"`, `{"a":1`, "{x}", `{"a":1,}`} {
 		h, _ := newPrecomputedHandler(t, &fakeDocs{doc: []byte(doc), at: time.Now()}, time.Now())
 		rec := serveAdminSpend(h, "window=all")
 		if rec.Code != http.StatusInternalServerError || strings.Contains(rec.Body.String(), "snapshot") {
@@ -271,8 +271,8 @@ func TestAnalyticsAllTimeServeSplicedBytesEqualEncoder(t *testing.T) {
 			docs := &fakeDocs{doc: stored, at: gen}
 			h, begin := newPrecomputedHandler(t, docs, tc.now)
 			rec := serveAdminSpend(h, "window=all&split=repo&breakdown=kind")
-			if rec.Code != http.StatusOK || rec.Header().Get("Cache-Control") != "private, no-store" || rec.Header().Get("Content-Type") != "application/json" {
-				t.Fatalf("status %d headers %v", rec.Code, rec.Header())
+			if rec.Code != http.StatusOK || rec.Result().Header.Get("Cache-Control") != "private, no-store" || rec.Result().Header.Get("Content-Type") != "application/json" {
+				t.Fatalf("status %d headers %v", rec.Code, rec.Result().Header)
 			}
 			var decoded apitypes.AnalyticsSpendDTO
 			if err := json.Unmarshal(stored, &decoded); err != nil {

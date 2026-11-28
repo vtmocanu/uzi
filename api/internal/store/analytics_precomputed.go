@@ -49,10 +49,10 @@ const (
 // after the build read its counter: nothing was published.
 var ErrAnalyticsPrecomputedInvalidated = errors.New("analytics precompute: build invalidated by a delete since its counter was read")
 
-// ErrAnalyticsPrecomputePublishUnresolved wraps the error of a Publish whose COMMIT was sent but
-// whose result is unknown (the commit returned an error, or the acknowledgement was lost). The set
-// may or may not have been published; the session is closed. Every other Publish error means the
-// transaction failed before commit and nothing was published.
+// ErrAnalyticsPrecomputePublishUnresolved wraps the error of a Publish whose commit returned an
+// error or whose acknowledgement was lost (COMMIT may not have been sent if ctx was already done);
+// the set may or may not have been published and the session is closed. Every other Publish error
+// means the transaction failed before commit and nothing was published.
 var ErrAnalyticsPrecomputePublishUnresolved = errors.New("analytics precompute: publish commit result unknown")
 
 // AnalyticsPrecomputedDoc is one document of a section's set: the variant key and its exact bytes.
@@ -342,4 +342,42 @@ func RecordAnalyticsPrecomputeFailure(ctx context.Context, db DBTX, at time.Time
 		return errors.New("analytics precompute: analytics_precomputed_state row is missing")
 	}
 	return nil
+}
+
+// AnalyticsPrecomputeState is what a scheduler decides a build from: how many of a section's keys
+// are stored, the oldest generated_at among them, and the shared failure status. A zero time means
+// NULL (no stored key, or no recorded failure).
+type AnalyticsPrecomputeState struct {
+	Present           int64
+	OldestGeneratedAt time.Time
+	FailureCount      int32
+	LastFailureAt     time.Time
+}
+
+// ReadAnalyticsPrecomputeStatus reads the state of section's keys in one statement on db.
+func ReadAnalyticsPrecomputeStatus(ctx context.Context, db DBTX, section string, keys []string) (AnalyticsPrecomputeState, error) {
+	row, err := New(db).AnalyticsPrecomputeStatus(ctx, AnalyticsPrecomputeStatusParams{Section: section, Keys: keys})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return AnalyticsPrecomputeState{}, errors.New("analytics precompute: analytics_precomputed_state row is missing")
+	}
+	if err != nil {
+		return AnalyticsPrecomputeState{}, fmt.Errorf("analytics precompute: read status: %w", err)
+	}
+	st := AnalyticsPrecomputeState{Present: row.Present, FailureCount: row.FailureCount}
+	if row.OldestGeneratedAt.Valid {
+		st.OldestGeneratedAt = row.OldestGeneratedAt.Time
+	}
+	if row.LastFailureAt.Valid {
+		st.LastFailureAt = row.LastFailureAt.Time
+	}
+	return st, nil
+}
+
+// Status reads the same state on the session connection, after the lock was taken, so a scheduler
+// can re-check freshness while it is the only builder. The session must be usable (see Idle).
+func (s *AnalyticsPrecomputeSession) Status(ctx context.Context, section string, keys []string) (AnalyticsPrecomputeState, error) {
+	if !s.Idle() {
+		return AnalyticsPrecomputeState{}, errors.New("analytics precompute: session is closed, broken or busy")
+	}
+	return ReadAnalyticsPrecomputeStatus(ctx, s.conn, section, keys)
 }

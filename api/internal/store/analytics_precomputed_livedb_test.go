@@ -912,3 +912,29 @@ func TestAnalyticsPrecomputeStatusLiveDB(t *testing.T) {
 		t.Fatalf("status after publish = %+v (%v), want 1 present and the failures cleared", st, err)
 	}
 }
+
+// Mutation it must catch: ReadAnalyticsPrecomputeStatus or the session's Status ignoring the keys, or
+// the session variant reading through another connection than the locked one.
+func TestAnalyticsPrecomputeStatusHelpersLiveDB(t *testing.T) {
+	e := apOpenEnv(t)
+	at := apNow().Add(-time.Minute)
+	e.publish(t, at, apDocs("A", "a", "b"))
+	failAt := apNow()
+	if err := RecordAnalyticsPrecomputeFailure(e.ctx, e.pool, failAt); err != nil {
+		t.Fatal(err)
+	}
+	want := AnalyticsPrecomputeState{Present: 1, OldestGeneratedAt: at, FailureCount: 1, LastFailureAt: failAt}
+	got, err := ReadAnalyticsPrecomputeStatus(e.ctx, e.pool, apSection, []string{"a", "zzz"})
+	if err != nil || got.Present != want.Present || !got.OldestGeneratedAt.Equal(at) || got.FailureCount != 1 || !got.LastFailureAt.Equal(failAt) {
+		t.Fatalf("pool status = %+v (%v), want %+v", got, err, want)
+	}
+	s, ok, err := OpenAnalyticsPrecomputeSession(e.ctx, e.pool)
+	if err != nil || !ok {
+		t.Fatalf("open = (%v, %v)", ok, err)
+	}
+	defer func() { _, _ = s.Close(e.ctx) }()
+	got, err = s.Status(e.ctx, apSection, []string{"none"})
+	if err != nil || got.Present != 0 || !got.OldestGeneratedAt.IsZero() || got.FailureCount != 1 {
+		t.Fatalf("session status = %+v (%v), want no keys present and the shared failure count", got, err)
+	}
+}

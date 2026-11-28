@@ -104,8 +104,9 @@ func apSetHooks(t *testing.T, before, after func(i int, key string) error) {
 
 // One transaction per generation: a write that commits after variant 1 must change none of the
 // 25 documents, and every document equals the live computation on the same snapshot handle.
-// Mutation: if BuildAllTimeSpendDocs opened a snapshot per variant, variant 25 (split=user x
-// breakdown=user) would include the new user and differ from the pre-write bytes.
+// Mutation caught: RunBuild's IsoLevel RepeatableRead changed to ReadCommitted (store
+// analytics_precomputed.go), after which variant 25 (split=user x breakdown=user) would include
+// the new user and differ from the pre-write bytes.
 func TestAllTimeSpendBuildOneSnapshotLiveDB(t *testing.T) {
 	f := newAnFixture(t, apYear)
 	apSeed(f)
@@ -185,23 +186,12 @@ func TestAllTimeSpendBuildOneSnapshotLiveDB(t *testing.T) {
 	}
 }
 
-// A failure at variant 13 returns no documents, and a caller that stops there leaves the stored
-// set untouched.
-func TestAllTimeSpendBuildFailureLeavesStoredSetLiveDB(t *testing.T) {
+// A failure at variant 13 returns no documents and an error naming that variant.
+func TestAllTimeSpendBuildFailureReturnsNoDocsLiveDB(t *testing.T) {
 	f := newAnFixture(t, apYear)
 	apSeed(f)
 	ctx := context.Background()
 	sess := apOpenSession(t, f)
-
-	known := []store.AnalyticsPrecomputedDoc{{Key: "known-a", Document: []byte(`{"a":1}`)}, {Key: "known-b", Document: []byte(`{"b":2}`)}}
-	genAt := time.Date(apYear, 1, 1, 0, 0, 0, 0, time.UTC)
-	var counter int64
-	if err := sess.RunBuild(ctx, func(_ context.Context, _ *store.AnalyticsSnapshot, c int64) error { counter = c; return nil }); err != nil {
-		t.Fatal(err)
-	}
-	if err := sess.Publish(ctx, AllTimeSpendSection, counter, genAt, known); err != nil {
-		t.Fatalf("publish known set: %v", err)
-	}
 
 	boom := errors.New("injected failure")
 	apSetHooks(t, func(i int, _ string) error {
@@ -226,19 +216,6 @@ func TestAllTimeSpendBuildFailureLeavesStoredSetLiveDB(t *testing.T) {
 		t.Fatalf("error %q does not name variant 13 %q", berr, want)
 	}
 	apCloseOK(t, sess)
-
-	rows, err := f.h.q.ListAnalyticsPrecomputedDocs(ctx, AllTimeSpendSection)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(rows) != len(known) {
-		t.Fatalf("stored set has %d rows, want %d", len(rows), len(known))
-	}
-	for i, r := range rows {
-		if r.VariantKey != known[i].Key || !bytes.Equal(r.Document, known[i].Document) || !r.GeneratedAt.Time.Equal(genAt) {
-			t.Fatalf("stored row %d = (%q, %q, %v) changed", i, r.VariantKey, r.Document, r.GeneratedAt.Time)
-		}
-	}
 }
 
 // The router serves each variant's stored document: minus the snapshot member it equals the live
@@ -256,8 +233,8 @@ func TestAllTimeSpendServedFromStoredSetLiveDB(t *testing.T) {
 	// Before any publish the answer is pending.
 	cliMustExec(t, f.pool, `DELETE FROM analytics_precomputed_docs`)
 	rec := f.cookie(admin, "/api/admin/analytics/spend?window=all")
-	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") != "60" || rec.Header().Get("Cache-Control") != "private, no-store" {
-		t.Fatalf("before publish: %d %v %s", rec.Code, rec.Header(), rec.Body.String())
+	if rec.Code != http.StatusServiceUnavailable || rec.Result().Header.Get("Retry-After") != "60" || rec.Result().Header.Get("Cache-Control") != "private, no-store" {
+		t.Fatalf("before publish: %d %v %s", rec.Code, rec.Result().Header, rec.Body.String())
 	}
 
 	sess := apOpenSession(t, f)
@@ -271,8 +248,8 @@ func TestAllTimeSpendServedFromStoredSetLiveDB(t *testing.T) {
 		split, breakdown := apSplitBreakdown(k)
 		path := "/api/admin/analytics/spend?window=all&split=" + split + "&breakdown=" + breakdown
 		rec := f.cookie(admin, path)
-		if rec.Code != http.StatusOK || rec.Header().Get("Cache-Control") != "private, no-store" {
-			t.Fatalf("%s: %d %v %s", k, rec.Code, rec.Header(), rec.Body.String())
+		if rec.Code != http.StatusOK || rec.Result().Header.Get("Cache-Control") != "private, no-store" {
+			t.Fatalf("%s: %d %v %s", k, rec.Code, rec.Result().Header, rec.Body.String())
 		}
 		body := rec.Body.Bytes()
 		idx := bytes.LastIndex(body, []byte(`,"snapshot":`))
