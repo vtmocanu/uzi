@@ -79,7 +79,9 @@ and hidden tests.
   model identity or issue links. A definitive draft refusal settles local with
   `draft_unavailable`. Never retry as a ready PR. Reconcile an ambiguous create
   response before retrying or cleaning up its branch. Where a ref was already
-  written for a refused draft, use the same custody-checked cleanup.
+  written for a refused draft, prove no PR exists (the refusal was definitive
+  and a list of PRs by that head ref returns none), then delete the ref with
+  `pushbroker.Delete` and `ExpectedOldTip` equal to the neutral SHA.
   [GitHub pull request endpoints](https://docs.github.com/en/rest/pulls/pulls#create-a-pull-request)
 - Use `ListLabels` before applying the existing `uzi-eval` label. If the label
   is absent, skip it and preserve the draft marker. The eval label path must
@@ -110,7 +112,9 @@ and hidden tests.
   skipped and absent checks are ungraded. Reuse the GitHub check-run listing
   pattern in `listCheckRunsForRef`, keeping per-check identity. This records
   evidence observed on the live target, with no claim about the tested merge
-  SHA. The integration does not create a pinned target branch.
+  SHA. The base SHA is recorded at publication and at every poll; any change
+  makes the evidence `no_evidence`. A move that returns to the same SHA between
+  two polls cannot be excluded, a residual the report states. The integration does not create a pinned target branch.
   [GitHub check-run fields](https://docs.github.com/en/rest/checks/runs)
 - Resource bounds: at most six retained open drafts per repo, including pending
   reservations, and at most six drafts awaiting CI per repo. No separate

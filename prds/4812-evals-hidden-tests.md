@@ -116,8 +116,16 @@ publication is independent. Implementation and validation leave
   or loss, revoke bundle/result authority, stop the pod, and delete the scoped
   volumes and join material. If the controller cannot prove teardown, record it
   and hold retry until reconciled. A pod is never reused.
-- Read only JUnit XML at the fixed container path `/out/junit.xml`, a bounded
-  regular file of at most 64 KiB. Parse a bounded subset of JUnit XML with no
+- Read only JUnit XML from a per-attempt random path in a fresh output
+  directory, chosen by the launcher and passed to the owner's test argv at
+  start. Two guarantees follow: a report pre-seeded by the candidate at a
+  conventional path (such as `/out/junit.xml`) is ignored, and the report must
+  agree with the test command's exit status (declared case failing with a
+  non-zero exit, or passing with a zero exit), else the result is ungradable
+  `inconsistent_result`. The report is a bounded regular file of at most
+  64 KiB. Residual, recorded: candidate code imported by the tests runs in the
+  test process, can read the supplied path and can tamper with that run; the
+  holdout reduces, not removes, that risk. Parse a bounded subset of JUnit XML with no
   external references. Identify the declared case by exact `classname.name`;
   reject ambiguity, malformed XML, missing or duplicated case, skipped case,
   `<error>`, or zero cases as setup failure. Base verification is red only if
@@ -162,7 +170,9 @@ The holdout feature ships default off behind the admin-only instance setting
 memory and PID enforcement and scratch bounds, verify network and mount
 isolation, and prove pod, volume and join-material teardown after normal
 completion, cancellation and worker loss. Verify a stale pod cannot retrieve
-the bundle or submit a result. This is a release condition with the owner,
+the bundle or submit a result. Verify a report pre-seeded at a conventional path
+(such as `/out/junit.xml`) is ignored, and that an XML/exit-status mismatch
+returns `inconsistent_result`. This is a release condition with the owner,
 separate from the in-run fake-based acceptance. Use existing hosted test
 entry points and leave workflow files untouched.
 
