@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
+import { useLayoutEffect } from "react";
 
 import { api } from "../lib/api";
 import type { ForgeConnection } from "../lib/api";
@@ -280,6 +281,33 @@ describe("ForgeTokenBanner", () => {
     });
     await settle();
     expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByRole("status", { name: "Forge token expiring" })).toBeTruthy();
+  });
+  it("never commits the previous user's banner when userId changes on the same element", async () => {
+    // A layout effect runs after the DOM is updated but before passive effects, so it sees
+    // exactly what the first commit for the new user put on screen.
+    const seen: { userId: string; alert: boolean }[] = [];
+    function Probe({ userId }: { userId: string }) {
+      useLayoutEffect(() => {
+        seen.push({ userId, alert: document.querySelector('[role="alert"]') !== null });
+      });
+      return null;
+    }
+    const tree = (userId: string) => (
+      <MemoryRouter>
+        <ForgeTokenBanner userId={userId} />
+        <Probe userId={userId} />
+      </MemoryRouter>
+    );
+    mockApi.listConnectionsBackground.mockResolvedValueOnce({ connections: [conn("a", "expired")] });
+    const { rerender } = render(tree("A"));
+    await settle();
+    expect(screen.getByRole("alert", { name: "Forge token expired" })).toBeTruthy();
+    mockApi.listConnectionsBackground.mockResolvedValueOnce({ connections: [conn("b", "expiring")] });
+    rerender(tree("B"));
+    await settle();
+    expect(seen.filter((x) => x.userId === "B").map((x) => x.alert)).not.toContain(true);
+    expect(seen.filter((x) => x.userId === "B").length).toBeGreaterThan(0);
     expect(screen.getByRole("status", { name: "Forge token expiring" })).toBeTruthy();
   });
 });

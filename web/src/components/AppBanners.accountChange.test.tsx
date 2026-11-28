@@ -113,6 +113,25 @@ describe("AppBanners across an account change (#4817)", () => {
     expect(screen.getByRole("status", { name: "Forge token expiring" })).toBeTruthy();
   });
 
+  it("an account switch never commits the previous account's already-shown banner", async () => {
+    signInAs("user-a");
+    const { rerender } = render(tree());
+    await settle();
+    respond(0, 200, { connections: [connection("a", -DAY)] });
+    await settle();
+    expect(screen.getByRole("alert", { name: "Forge token expired" })).toBeTruthy();
+
+    signInAs("user-b");
+    rerender(tree());
+    // Synchronously after the switch, before any effect for B has run.
+    expect(screen.queryByRole("alert", { name: "Forge token expired" })).toBeNull();
+    await settle();
+    respond(1, 200, { connections: [connection("b", 3 * DAY)] });
+    await settle();
+    expect(screen.getByRole("status", { name: "Forge token expiring" })).toBeTruthy();
+    expect(screen.queryByRole("alert", { name: "Forge token expired" })).toBeNull();
+  });
+
   it("a previous account's late 401 does not trip the unauthorized handler", async () => {
     signInAs("user-a");
     const { rerender } = render(tree());

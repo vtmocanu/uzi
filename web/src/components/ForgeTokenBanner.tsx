@@ -44,14 +44,16 @@ function formatDate(iso: string | undefined): string {
 }
 
 export function ForgeTokenBanner({ userId }: { userId: string }) {
-  const [connections, setConnections] = useState<ForgeConnection[] | null>(null);
+  // The data is stamped with the account it was read for, so a render for another account
+  // never shows it, even before this effect has run for the new account.
+  const [data, setData] = useState<{ userId: string; connections: ForgeConnection[] } | null>(null);
   const [, setDismissTick] = useState(0);
   const seqRef = useRef(0);
 
   useEffect(() => {
     let live = true;
     // A new account starts with no data: the previous account's connections never show.
-    setConnections(null);
+    setData(null);
     const load = () => {
       const seq = ++seqRef.current;
       Promise.resolve()
@@ -59,7 +61,7 @@ export function ForgeTokenBanner({ userId }: { userId: string }) {
         .then((r) => {
           if (!live || seq !== seqRef.current) return;
           if (!Array.isArray(r?.connections)) return;
-          setConnections(r.connections);
+          setData({ userId, connections: r.connections });
         })
         .catch(() => {
           // Keep the last good data; a failed background read is not an error to show.
@@ -81,8 +83,8 @@ export function ForgeTokenBanner({ userId }: { userId: string }) {
     [userId],
   );
 
-  if (connections === null) return null;
-  const banner = bannerFor(connections, Date.now());
+  if (data === null || data.userId !== userId) return null;
+  const banner = bannerFor(data.connections, Date.now());
   if (banner === null) return null;
 
   const { cls, affected } = banner;
