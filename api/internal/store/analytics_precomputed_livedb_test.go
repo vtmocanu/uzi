@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -165,21 +166,21 @@ func apAsync(fn func() error) <-chan error {
 	return ch
 }
 
-// waitLockWait polls until backend pid is waiting on a lock (the positive barrier that replaces
-// inferring "blocked" from elapsed time), bounded at 10 seconds.
-func (e apEnv) waitLockWait(t *testing.T, pid int32, what string) {
+// waitLockWait polls until backend pid is waiting on a lock that backend blocker holds (the
+// positive barrier that replaces inferring "blocked" from elapsed time), bounded at 10 seconds.
+func (e apEnv) waitLockWait(t *testing.T, pid, blocker int32, what string) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		var n int
-		if err := e.pool.QueryRow(e.ctx, `SELECT count(*) FROM pg_stat_activity WHERE pid = $1 AND wait_event_type = 'Lock'`, pid).Scan(&n); err != nil {
+		if err := e.pool.QueryRow(e.ctx, `SELECT count(*) FROM pg_stat_activity WHERE pid = $1 AND wait_event_type = 'Lock' AND $2::int = ANY(pg_blocking_pids($1::int))`, pid, blocker).Scan(&n); err != nil {
 			t.Fatalf("poll pg_stat_activity: %v", err)
 		}
 		if n == 1 {
 			return
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("%s (backend %d) never waited on a lock", what, pid)
+			t.Fatalf("%s (backend %d) never waited on a lock held by backend %d", what, pid, blocker)
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
@@ -268,10 +269,11 @@ func TestAnalyticsPrecomputeCounterGuardLiveDB(t *testing.T) {
 }
 
 // Mutation it must catch: remove the trigger function's DELETE of the docs, the counter UPDATE (it
-// must move once per deleted row), or the deferral (docs vanish before COMMIT).
+// must move exactly once per deleting transaction, whatever the number of rows), or the deferral
+// (docs vanish before COMMIT).
 func TestAnalyticsPrecomputeDeleteInvalidatesLiveDB(t *testing.T) {
 	e := apOpenEnv(t)
-	repoCase := func(name string, rows int64, del func(user, conn uuid.UUID, repos []uuid.UUID) error) {
+	repoCase := func(name string, del func(user, conn uuid.UUID, repos []uuid.UUID) error) {
 		t.Run(name, func(t *testing.T) {
 			user, conn, repos := e.seedRepos(t, 2)
 			at := apNow()
@@ -284,30 +286,30 @@ func TestAnalyticsPrecomputeDeleteInvalidatesLiveDB(t *testing.T) {
 			if n := e.docCount(t); n != 0 {
 				t.Fatalf("%d docs after the delete committed, want 0", n)
 			}
-			if got := e.counter(t); got != before+rows {
-				t.Fatalf("counter = %d, want %d (one increment per deleted users or repos row)", got, before+rows)
+			if got := e.counter(t); got != before+1 {
+				t.Fatalf("counter = %d, want %d (exactly one increment per deleting transaction)", got, before+1)
 			}
 		})
 	}
-	repoCase("repo via DeleteRepoForUser", 1, func(user, _ uuid.UUID, repos []uuid.UUID) error {
+	repoCase("repo via DeleteRepoForUser", func(user, _ uuid.UUID, repos []uuid.UUID) error {
 		n, err := e.q.DeleteRepoForUser(e.ctx, DeleteRepoForUserParams{ID: repos[0], UserID: user})
 		if err == nil && n != 1 {
 			err = errors.New("repo not deleted")
 		}
 		return err
 	})
-	repoCase("connection cascading to two repos", 2, func(user, conn uuid.UUID, _ []uuid.UUID) error {
+	repoCase("connection cascading to two repos", func(user, conn uuid.UUID, _ []uuid.UUID) error {
 		n, err := e.q.DeleteForgeConnectionForUser(e.ctx, DeleteForgeConnectionForUserParams{ID: conn, UserID: user})
 		if err == nil && n != 1 {
 			err = errors.New("connection not deleted")
 		}
 		return err
 	})
-	repoCase("user cascading to connection and repos", 3, func(user, _ uuid.UUID, _ []uuid.UUID) error {
+	repoCase("user cascading to connection and repos", func(user, _ uuid.UUID, _ []uuid.UUID) error {
 		_, err := e.pool.Exec(e.ctx, `DELETE FROM users WHERE id = $1`, user)
 		return err
 	})
-	repoCase("two repos in one transaction", 2, func(_, _ uuid.UUID, repos []uuid.UUID) error {
+	repoCase("two repos in one transaction", func(_, _ uuid.UUID, repos []uuid.UUID) error {
 		_, err := e.pool.Exec(e.ctx, `DELETE FROM repos WHERE id = ANY($1)`, repos)
 		return err
 	})
@@ -352,9 +354,10 @@ func TestAnalyticsPrecomputeDeleteInvalidatesLiveDB(t *testing.T) {
 	})
 }
 
-// Mutation it must catch: an invalidation guard keyed on the custom setting
-// uzi.analytics_precomputed_invalidated. A caller that sets it to its own txid must not be able to
-// suppress the invalidation.
+// Mutation it must catch: an invalidation guard keyed on a session setting (the earlier design used
+// uzi.analytics_precomputed_invalidated). A caller that sets it to its own txid must not be able to
+// suppress the invalidation. The once-per-transaction guard now lives on the state row, so this
+// passes trivially; it stays as a regression guard against reintroducing a session-keyed guard.
 func TestAnalyticsPrecomputeInvalidationIgnoresCallerSettingLiveDB(t *testing.T) {
 	e := apOpenEnv(t)
 	_, _, repos := e.seedRepos(t, 1)
@@ -380,6 +383,165 @@ func TestAnalyticsPrecomputeInvalidationIgnoresCallerSettingLiveDB(t *testing.T)
 	}
 	if got := e.counter(t); got != before+1 {
 		t.Fatalf("counter = %d, want %d", got, before+1)
+	}
+}
+
+// Mutation it must catch: the once-per-transaction guard removed (the counter then moves once per
+// firing) or keyed so a rolled-back firing's marker survives its savepoint.
+func TestAnalyticsPrecomputeCounterOncePerTransactionLiveDB(t *testing.T) {
+	e := apOpenEnv(t)
+	_, _, repos := e.seedRepos(t, 4)
+	e.publish(t, apNow(), apDocs("A", "a"))
+	before := e.counter(t)
+
+	tx, err := e.pool.Begin(e.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	run := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := tx.Exec(e.ctx, sql, args...); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	inTx := func() int64 {
+		t.Helper()
+		var n int64
+		if err := tx.QueryRow(e.ctx, `SELECT invalidation FROM analytics_precomputed_state WHERE id`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	// A rolled-back firing leaves no marker behind: the delete after the savepoint still advances.
+	run(`SAVEPOINT sp`)
+	run(`DELETE FROM repos WHERE id = $1`, repos[0])
+	run(`SET CONSTRAINTS ALL IMMEDIATE`)
+	if got := inTx(); got != before+1 {
+		t.Fatalf("inside the savepoint counter = %d, want %d", got, before+1)
+	}
+	run(`ROLLBACK TO SAVEPOINT sp`)
+	run(`SET CONSTRAINTS ALL DEFERRED`)
+	if got := inTx(); got != before {
+		t.Fatalf("after ROLLBACK TO SAVEPOINT counter = %d, want %d", got, before)
+	}
+	// Several deletes in one transaction (some firing immediately, some at commit) move it once.
+	run(`DELETE FROM repos WHERE id = $1`, repos[1])
+	run(`SET CONSTRAINTS ALL IMMEDIATE`)
+	run(`DELETE FROM repos WHERE id = $1`, repos[2])
+	run(`DELETE FROM repos WHERE id = $1`, repos[3])
+	run(`SET CONSTRAINTS ALL DEFERRED`)
+	if err := tx.Commit(e.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.counter(t); got != before+1 {
+		t.Fatalf("counter = %d, want exactly %d for one deleting transaction", got, before+1)
+	}
+	if n := e.docCount(t); n != 0 {
+		t.Fatalf("%d docs left, want 0", n)
+	}
+}
+
+// Mutation it must catch: a trigger whose cost grows with the rows deleted in one transaction (the
+// per-row counter update on one state row). Two thousand repos must invalidate once and commit
+// within a generous bound.
+func TestAnalyticsPrecomputeBulkDeleteLiveDB(t *testing.T) {
+	e := apOpenEnv(t)
+	_, conn := raSeedUserConn(e.ctx, t, e.pool, true)
+	const n = 2000
+	raProjectSeq++
+	base := raProjectSeq
+	raProjectSeq += n
+	raExec(e.ctx, t, e.pool, `
+		INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+		SELECT gen_random_uuid(), $1, $2 + g, 'ap-bulk/' || g || '-' || gen_random_uuid()::text, 'https://forge.e2e/x', 'main', false
+		FROM generate_series(1, $3::int) g`, conn, base, n)
+	e.publish(t, apNow(), apDocs("A", "a"))
+	before := e.counter(t)
+	start := time.Now()
+	tag, err := e.pool.Exec(e.ctx, `DELETE FROM repos WHERE connection_id = $1`, conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tag.RowsAffected() != n {
+		t.Fatalf("deleted %d repos, want %d", tag.RowsAffected(), n)
+	}
+	if d := time.Since(start); d > 30*time.Second {
+		t.Fatalf("deleting %d repos took %v", n, d)
+	}
+	if got := e.counter(t); got != before+1 {
+		t.Fatalf("counter = %d, want %d (one increment for the whole transaction)", got, before+1)
+	}
+	if c := e.docCount(t); c != 0 {
+		t.Fatalf("%d docs left, want 0", c)
+	}
+}
+
+// Mutation it must catch: the function without its pinned search_path. A session that creates TEMP
+// tables named like the state and docs tables must not redirect the trigger's writes to them.
+func TestAnalyticsPrecomputeInvalidationIgnoresTempShadowLiveDB(t *testing.T) {
+	e := apOpenEnv(t)
+	_, _, repos := e.seedRepos(t, 1)
+	e.publish(t, apNow(), apDocs("A", "a", "b"))
+	before := e.counter(t)
+
+	conn, err := e.pool.Acquire(e.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	exec := func(sql string, args ...any) {
+		t.Helper()
+		if _, err := conn.Exec(e.ctx, sql, args...); err != nil {
+			t.Fatalf("%s: %v", sql, err)
+		}
+	}
+	// Dropped with the connection's pooled session reset at the end of the test.
+	defer func() {
+		_, _ = conn.Exec(context.Background(), `DROP TABLE IF EXISTS pg_temp.analytics_precomputed_state, pg_temp.analytics_precomputed_docs`)
+	}()
+	exec(`CREATE TEMP TABLE analytics_precomputed_state (id boolean, invalidation bigint, publications bigint, failure_count int, last_failure_at timestamptz, invalidated_xact xid8)`)
+	exec(`INSERT INTO pg_temp.analytics_precomputed_state VALUES (true, 0, 0, 0, NULL, NULL)`)
+	exec(`CREATE TEMP TABLE analytics_precomputed_docs (section text, variant_key text, generated_at timestamptz, invalidation bigint, document bytea)`)
+	exec(`BEGIN`)
+	exec(`DELETE FROM repos WHERE id = $1`, repos[0])
+	exec(`COMMIT`)
+
+	if n := e.docCount(t); n != 0 {
+		t.Fatalf("%d real docs left after a delete from a session shadowing the tables, want 0", n)
+	}
+	if got := e.counter(t); got != before+1 {
+		t.Fatalf("real counter = %d, want %d", got, before+1)
+	}
+	var tempCounter int64
+	if err := conn.QueryRow(e.ctx, `SELECT invalidation FROM pg_temp.analytics_precomputed_state`).Scan(&tempCounter); err != nil || tempCounter != 0 {
+		t.Fatalf("temp shadow counter = %d (%v), want it untouched", tempCounter, err)
+	}
+}
+
+// Mutation it must catch: a function body that reads a session setting, or a function left on the
+// caller's search_path.
+func TestAnalyticsPrecomputeFunctionCatalogShapeLiveDB(t *testing.T) {
+	e := apOpenEnv(t)
+	var src string
+	var config []string
+	if err := e.pool.QueryRow(e.ctx, `SELECT prosrc, COALESCE(proconfig, '{}') FROM pg_proc WHERE proname = 'analytics_precomputed_invalidate' AND pronamespace = current_schema()::regnamespace`).Scan(&src, &config); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(src, "current_setting(") {
+		t.Fatal("the invalidation function must not read a session setting")
+	}
+	found := false
+	for _, c := range config {
+		if strings.HasPrefix(c, "search_path=") {
+			found = true
+			if !strings.HasSuffix(c, "pg_temp") {
+				t.Fatalf("function search_path = %q, want pg_temp last", c)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("function proconfig = %v, want a pinned search_path", config)
 	}
 }
 
@@ -500,6 +662,7 @@ func TestAnalyticsPrecomputeReadCommittedInterleaveLiveDB(t *testing.T) {
 	}
 
 	// The publisher holds the state row. The deleter commits: its deferred trigger waits on it.
+	pubPID := int32(s.conn.PgConn().PID())
 	dc, err := e.pool.Acquire(e.ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -513,7 +676,7 @@ func TestAnalyticsPrecomputeReadCommittedInterleaveLiveDB(t *testing.T) {
 		_, err := dc.Exec(e.ctx, `DELETE FROM repos WHERE id = $1`, repos[0])
 		return err
 	})
-	e.waitLockWait(t, delPID, "the delete commit")
+	e.waitLockWait(t, delPID, pubPID, "the delete commit")
 	select {
 	case derr := <-del:
 		t.Fatalf("the delete commit finished while the publisher held the state row: %v", derr)
@@ -593,8 +756,11 @@ func TestAnalyticsPrecomputeNoDeadlockLiveDB(t *testing.T) {
 		defer mu.Unlock()
 		errs = append(errs, err)
 	}
-	var aPID int32
+	var aPID, bPID int32
 	if err := a.QueryRow(e.ctx, `SELECT pg_backend_pid()`).Scan(&aPID); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.QueryRow(e.ctx, `SELECT pg_backend_pid()`).Scan(&bPID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := a.Exec(e.ctx, `DELETE FROM repos WHERE id = $1`, r1); err != nil {
@@ -605,7 +771,7 @@ func TestAnalyticsPrecomputeNoDeadlockLiveDB(t *testing.T) {
 	bDelErr := apWait(t, bDel, "B delete r2")
 	aDel := apAsync(func() error { _, err := a.Exec(e.ctx, `DELETE FROM repos WHERE id = $1`, r2); return err })
 	// Barrier: A is waiting on B's r2 row lock before B commits.
-	e.waitLockWait(t, aPID, "A delete r2")
+	e.waitLockWait(t, aPID, bPID, "A delete r2")
 	// B's delete must have returned before B's commit starts (a transaction is used by one
 	// goroutine at a time). Without the deferral it is stuck here until the deadlock resolves.
 	record := func(name string, err error) {
@@ -759,16 +925,21 @@ func TestAnalyticsPrecomputeTryLockAndEarlyExitsLiveDB(t *testing.T) {
 }
 
 // Mutation it must catch: TCP settings folded into the required statement (a refusal would then
-// fail the open), or a failure of them that is treated as fatal.
+// fail the open), or a failure of them that is treated as fatal. The hook must have run, else the
+// test would not be exercising the failing TCP statement at all.
 func TestAnalyticsPrecomputeTCPSettingsBestEffortLiveDB(t *testing.T) {
 	e := apOpenEnv(t)
-	analyticsPrecomputeTCPSettingsFault = func() error { return errors.New("injected tcp failure") }
+	calls := 0
+	analyticsPrecomputeTCPSettingsFault = func() error { calls++; return errors.New("injected tcp failure") }
 	s, ok, err := OpenAnalyticsPrecomputeSession(e.ctx, e.pool)
 	analyticsPrecomputeTCPSettingsFault = nil
 	if err != nil || !ok {
 		t.Fatalf("open with a failing TCP statement = (%v, %v), want acquired", ok, err)
 	}
 	t.Cleanup(func() { _, _ = s.Close(context.Background()) })
+	if calls != 1 {
+		t.Fatalf("the TCP settings fault hook ran %d times, want 1", calls)
+	}
 	var got string
 	if err := s.conn.QueryRow(e.ctx, "SHOW idle_session_timeout").Scan(&got); err != nil || got != "1min" {
 		t.Fatalf("required settings: idle_session_timeout = %q (%v)", got, err)

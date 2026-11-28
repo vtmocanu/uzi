@@ -90,11 +90,12 @@ type AnalyticsPrecomputedDocRecord struct {
 }
 
 type AnalyticsPrecomputedState struct {
-	ID            bool               `json:"id"`
-	Invalidation  int64              `json:"invalidation"`
-	Publications  int64              `json:"publications"`
-	FailureCount  int32              `json:"failure_count"`
-	LastFailureAt pgtype.Timestamptz `json:"last_failure_at"`
+	ID              bool               `json:"id"`
+	Invalidation    int64              `json:"invalidation"`
+	Publications    int64              `json:"publications"`
+	FailureCount    int32              `json:"failure_count"`
+	LastFailureAt   pgtype.Timestamptz `json:"last_failure_at"`
+	InvalidatedXact pgtype.Uint64      `json:"invalidated_xact"`
 }
 
 type AnthropicRateLimit struct {

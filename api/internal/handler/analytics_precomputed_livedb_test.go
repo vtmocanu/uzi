@@ -179,18 +179,43 @@ func TestAllTimeSpendBuildOneSnapshotLiveDB(t *testing.T) {
 		}
 	}
 
-	// The write is visible to a fresh snapshot, so the equality above is not vacuous.
+	// The write is visible to a fresh snapshot, so the equality above is not vacuous: the run's
+	// cost changes the bytes AND the merged PR shows up in the breakdown's merged_prs total.
 	last := len(keys) - 1
 	split, breakdown := apSplitBreakdown(keys[last])
 	err = store.RunAnalyticsSnapshot(context.Background(), f.pool, func(ctx context.Context, s *store.AnalyticsSnapshot) error {
-		if bytes.Equal(apLive(t, ctx, s, split, breakdown, f.now), pre[last]) {
+		post := apLive(t, ctx, s, split, breakdown, f.now)
+		if bytes.Equal(post, pre[last]) {
 			t.Error("a fresh snapshot after the write equals the pre-write bytes: the write changed nothing")
+		}
+		if before, after := apMergedPRs(t, pre[last]), apMergedPRs(t, post); after != before+1 {
+			t.Errorf("merged_prs total: pre-write %d, fresh post-write %d, want the merged PR to add exactly 1", before, after)
 		}
 		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+}
+
+// apMergedPRs sums merged_prs over a Spend body's breakdown rows.
+func apMergedPRs(t *testing.T, body []byte) int64 {
+	t.Helper()
+	var dto struct {
+		Breakdown struct {
+			Rows []struct {
+				MergedPRs int64 `json:"merged_prs"`
+			} `json:"rows"`
+		} `json:"breakdown"`
+	}
+	if err := json.Unmarshal(body, &dto); err != nil {
+		t.Fatalf("decode spend body: %v", err)
+	}
+	var n int64
+	for _, r := range dto.Breakdown.Rows {
+		n += r.MergedPRs
+	}
+	return n
 }
 
 // A failure at variant 13 returns no documents and an error naming that variant.

@@ -818,6 +818,11 @@ It is controlled by `UZI_ANALYTICS_SNAPSHOT_INTERVAL` (a Go duration, default
   future deferred trigger that takes locks of its own. A `REPEATABLE READ` or `SERIALIZABLE`
   user or repo delete can fail with SQLSTATE `40001` if a publish or failure
   record committed meanwhile; it fails closed.
+  The invalidation counter moves once per deleting transaction (a marker on the
+  state row stops later firings from updating it again, so a large cascade does
+  not cost one update per row; every firing still clears the documents). The
+  trigger function pins its `search_path` with `pg_temp` last, so a session
+  cannot shadow the state or document tables with temporary tables.
 
 Code: `api/internal/handler/analytics_precomputed.go` (serving, builder),
 `api/internal/analyticsprecompute/scheduler.go` (scheduler),

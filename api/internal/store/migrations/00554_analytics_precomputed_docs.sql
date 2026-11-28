@@ -7,10 +7,11 @@ SET LOCAL lock_timeout = '5s';
 -- NOTE (goose numbering): drafted as 00554; renumber above the live head at landing via
 -- `task migration:renumber` if another migration lands first.
 --
--- analytics_precomputed_state is a single row (id is always true). invalidation moves on every
--- deleted users or repos row (once per TRUNCATE) and is only compared for equality; a builder reads it first inside its
--- snapshot and a publisher may publish only while it is unchanged. publications, failure_count
--- and last_failure_at are the status the admin surface reads.
+-- analytics_precomputed_state is a single row (id is always true). invalidation moves once per
+-- transaction that deletes users or repos rows (or truncates them) and is only compared for
+-- equality; a builder reads it first inside its snapshot and a publisher may publish only while it
+-- is unchanged. invalidated_xact is the once-per-transaction marker (see the function below).
+-- publications, failure_count and last_failure_at are the status the admin surface reads.
 --
 -- analytics_precomputed_docs holds one ACTIVE SET per section: every row of a section was built
 -- from one snapshot and published by one transaction. document is bytea so the bytes served are
@@ -20,7 +21,8 @@ CREATE TABLE analytics_precomputed_state (
     invalidation    bigint      NOT NULL DEFAULT 0,
     publications    bigint      NOT NULL DEFAULT 0,
     failure_count   int         NOT NULL DEFAULT 0,
-    last_failure_at timestamptz
+    last_failure_at timestamptz,
+    invalidated_xact xid8
 );
 
 INSERT INTO analytics_precomputed_state DEFAULT VALUES;
@@ -44,19 +46,46 @@ CREATE TABLE analytics_precomputed_docs (
 -- on a publisher sees the set that publisher committed meanwhile and removes it. Reordering the
 -- DELETE before the UPDATE, or making the function STABLE, leaves a freshly published set behind.
 --
--- Every firing invalidates: UPDATE the counter, then DELETE the docs. There is deliberately no
--- once-per-transaction shortcut, because any guard keyed on session state (a custom setting) could be
--- set by a caller to suppress invalidation. The counter is only ever compared for equality, so a
--- transaction that deletes N rows moves it by N (a TRUNCATE by one) and that is fine.
+-- ONCE PER TRANSACTION. Every firing deletes the docs, but the counter moves only on the first
+-- firing of a transaction: the UPDATE matches only while invalidated_xact differs from the current
+-- transaction id and then stamps it. Without this, N deleted rows cost N updates of one row (a
+-- quadratic COMMIT for a large cascade). The marker lives on the state row, not in a session
+-- setting, so a caller cannot preset it: writing it needs UPDATE on analytics_precomputed_state,
+-- and that privilege already allows writing the docs table directly. A later firing may skip the
+-- counter because this transaction already holds the state row lock until it ends, so no publisher
+-- can commit between the firings, and the counter has already moved for this transaction. A
+-- savepoint rollback reverts the marker with the rolled-back firing, so a later delete in the same
+-- transaction advances the counter once. The counter is only ever compared for equality.
+--
+-- SEARCH PATH. The function is SECURITY INVOKER, so unqualified names would resolve through the
+-- caller's search_path, where pg_temp is searched first for relations: a session could create a
+-- temp table named like either table and a delete would then update the temp copies and suppress
+-- the invalidation. The ALTER FUNCTION below pins the path with pg_temp last.
 -- +goose StatementBegin
 CREATE FUNCTION analytics_precomputed_invalidate() RETURNS trigger LANGUAGE plpgsql VOLATILE AS $$
 BEGIN
-    UPDATE analytics_precomputed_state SET invalidation = invalidation + 1 WHERE id;
+    UPDATE analytics_precomputed_state
+    SET invalidation = invalidation + 1, invalidated_xact = pg_current_xact_id()
+    WHERE id AND invalidated_xact IS DISTINCT FROM pg_current_xact_id();
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'analytics_precomputed_state row is missing';
+        -- Either this transaction already advanced the counter, or the row is missing.
+        PERFORM 1 FROM analytics_precomputed_state WHERE id;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'analytics_precomputed_state row is missing';
+        END IF;
     END IF;
     DELETE FROM analytics_precomputed_docs;
     RETURN NULL;
+END
+$$;
+-- +goose StatementEnd
+
+-- The tables live in whatever schema the migration runs in, so the path is built from
+-- current_schema() (as 00438 does) instead of hard-coding public.
+-- +goose StatementBegin
+DO $$
+BEGIN
+    EXECUTE format('ALTER FUNCTION analytics_precomputed_invalidate() SET search_path = pg_catalog, %I, pg_temp', current_schema());
 END
 $$;
 -- +goose StatementEnd

@@ -462,7 +462,7 @@ func TestAnalyticsPrecomputeEvidenceLiveDB(t *testing.T) {
 		finished = true
 	}
 sampling:
-	for i := 0; !finished; i++ {
+	for !finished {
 		select {
 		case <-stop:
 			break sampling
@@ -471,7 +471,7 @@ sampling:
 			break sampling
 		default:
 		}
-		sc := scopes[i%2]
+		sc := scopes[len(samples)%2] // by issued samples, so skipped probes cannot starve a scope
 		state := "unknown"
 		if pid := buildPID.Load(); pid != 0 {
 			if qerr := prod.QueryRow(ctx, `SELECT coalesce((SELECT state FROM pg_stat_activity WHERE pid = $1), 'gone')`, pid).Scan(&state); qerr != nil {

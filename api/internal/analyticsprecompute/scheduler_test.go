@@ -187,6 +187,40 @@ func TestPassIsNonBlockingAndSingleFlight(t *testing.T) {
 	}
 }
 
+func TestPassAfterStopLaunchesNothing(t *testing.T) {
+	e, s := newEnv(t)
+	s.Stop()
+	s.Stop() // idempotent
+	if cycle(t, s, e) {
+		t.Fatal("Pass launched a build after Stop")
+	}
+	if s.Checks() != 0 || e.opens != 0 || e.builds != 0 {
+		t.Fatalf("checks %d opens %d builds %d, want none", s.Checks(), e.opens, e.builds)
+	}
+}
+
+func TestStopWaitsForARunningBuild(t *testing.T) {
+	e, s := newEnv(t)
+	release, started := make(chan struct{}), make(chan struct{})
+	e.build = func(ctx context.Context) error { close(started); <-release; return nil }
+	if _, err := s.Pass(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	<-started
+	done := make(chan struct{})
+	go func() { s.Stop(); close(done) }()
+	select {
+	case <-done:
+		t.Fatal("Stop returned while a build was running")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(release)
+	<-done
+	if e.sess.publishes != 1 || e.sess.closes != 1 {
+		t.Fatalf("publishes %d closes %d, want 1 and 1", e.sess.publishes, e.sess.closes)
+	}
+}
+
 func TestShutdownCancelsRunningBuild(t *testing.T) {
 	e, s := newEnv(t)
 	base, cancel := context.WithCancel(context.Background())

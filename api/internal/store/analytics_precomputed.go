@@ -191,7 +191,9 @@ func (s *AnalyticsPrecomputeSession) Close(ctx context.Context) (unlocked bool, 
 		// A transaction is still open (for example after a panic in a RunBuild fn): end it,
 		// bounded by ctx, so the unlock below can run on an idle connection.
 		if _, rerr := conn.Exec(ctx, "ROLLBACK"); rerr != nil {
-			slog.Debug("analytics precompute: close rollback failed", "err", rerr)
+			// Warn, not Debug: the explicit unlock below is skipped when the connection is
+			// not idle, so the lock then depends on the connection closing.
+			slog.Warn("analytics precompute: close rollback failed", "err", rerr)
 		}
 	}
 	idle := s.Idle()

@@ -67,7 +67,7 @@ type deps struct {
 }
 
 // Scheduler decides when to build. Construct it with New, call Start with the process context,
-// register Pass with the sweeper, and call Wait at shutdown after the sweeper has stopped.
+// register Pass with the sweeper, and call Stop at shutdown.
 type Scheduler struct {
 	interval   time.Duration
 	sections   []Section
@@ -81,6 +81,7 @@ type Scheduler struct {
 	failures      int
 	invalidations int
 	checks        int64
+	stopped       bool
 	wg            sync.WaitGroup
 }
 
@@ -131,8 +132,19 @@ func (s *Scheduler) Start(ctx context.Context) {
 	s.mu.Unlock()
 }
 
-// Wait blocks until the build goroutine, if any, has exited.
+// Wait blocks until the build goroutine, if any, has exited. It does not stop later Pass calls
+// from launching a build.
 func (s *Scheduler) Wait() { s.wg.Wait() }
+
+// Stop is for shutdown: it makes every later Pass launch nothing, then blocks until the build
+// goroutine, if any, has exited. Because the flag is set under the same mutex Pass holds when it
+// adds to the wait group, no build can start once Stop has returned. It is idempotent.
+func (s *Scheduler) Stop() {
+	s.mu.Lock()
+	s.stopped = true
+	s.mu.Unlock()
+	s.wg.Wait()
+}
 
 // Pass is the sweeper pass. It does no I/O: when no build is running, the process context is live
 // and the local backoff has passed, it starts one build goroutine. It always returns 0: the sweeper
@@ -140,7 +152,7 @@ func (s *Scheduler) Wait() { s.wg.Wait() }
 func (s *Scheduler) Pass(_ context.Context) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.base.Err() != nil || s.running || s.d.clock().Before(s.nextAttempt) {
+	if s.stopped || s.base.Err() != nil || s.running || s.d.clock().Before(s.nextAttempt) {
 		return 0, nil
 	}
 	s.running = true

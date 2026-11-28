@@ -1126,12 +1126,14 @@ func run() error {
 	sweepPasses, analyticsPrecompute = wireAnalyticsPrecompute(ctx, pool, cfg.AnalyticsSnapshotInterval, sweepPasses)
 	if analyticsPrecompute != nil {
 		// Registered after the deferred pool.Close, so it runs first (LIFO) on every return, the
-		// early startup-error returns (TLS setup, listener bind) included: cancel the process
-		// context so a running build ends, then join it before the pool closes. Both calls are
-		// idempotent; the normal shutdown path below repeats them in its own order.
+		// early startup-error returns (TLS setup, listener bind) included. It cancels the process
+		// context and joins any running build before the pool closes; Stop also makes later
+		// Pass calls launch nothing. A Pass that raced the cancel and started a build before Stop
+		// ran is still joined here, and that build fails fast on the cancelled context.
+		// The calls are idempotent; the normal shutdown path below repeats them in its own order.
 		defer func() {
 			stop()
-			analyticsPrecompute.Wait()
+			analyticsPrecompute.Stop()
 		}()
 	}
 	sweep := sweeper.New(wsvc, cfg.SweepInterval, sweepPasses...)
@@ -1870,7 +1872,7 @@ func run() error {
 	// bgWG joined the sweeper, so no pass starts a new analytics build; ctx is cancelled, which
 	// cancels a running one. Join it before the deferred pool.Close.
 	if analyticsPrecompute != nil {
-		analyticsPrecompute.Wait()
+		analyticsPrecompute.Stop()
 	}
 	// The HTTP server has drained, so no new inline Notify can be fired; wait for
 	// any in-flight ones to finish before the deferred pool.Close so they don't
