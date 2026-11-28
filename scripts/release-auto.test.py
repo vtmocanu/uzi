@@ -228,6 +228,14 @@ class Evidence(unittest.TestCase):
             with self.subTest(jobs=jobs):
                 self.assertFalse(auto.eligible_jobs(jobs))
 
+    def test_current_ci_setup_go_steps_are_retryable(self):
+        workflow = Path(__file__).resolve().parents[1] / '.github/workflows/ci.yml'
+        actions = set(re.findall(r'uses: (actions/setup-go@[0-9a-f]{40})\b', workflow.read_text()))
+        self.assertTrue(actions, 'CI must use a SHA-pinned setup-go action')
+        for action in sorted(actions):
+            with self.subTest(action=action):
+                self.assertTrue(auto.eligible_jobs([job(f'Run {action}')]))
+
     def test_created_at_uses_original_run(self):
         data = dict(id=123, event='workflow_dispatch', head_branch='main', head_sha=H,
                     repository={'full_name': 'vtmocanu/uzi'}, path='.github/workflows/release-auto.yml',
