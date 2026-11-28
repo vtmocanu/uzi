@@ -30,7 +30,8 @@ import { buildSdkEnv, PROVIDER_FALLBACK_CONTEXT_WINDOW } from "../src/sdk-env.js
 // assertion is a MEASURED BAND: its lower bound is at least one reported-token step (2 * perMessage,
 // the increment between consecutive lead calls) below the observed first compaction and its upper bound
 // is the configured or runtime window (or at least one step above the observation), never an exact
-// threshold. Findings: the PRD Decision Log in prds/4320-custom-providers-core-anthropic.md.
+// threshold. These bands and mapped-name assertions also passed in CI on SDK 0.3.330 / CLI 2.1.330.
+// The original measurements are in the Decision Log of prds/4320-custom-providers-core-anthropic.md.
 
 const DRIVE_BUDGET_MS = 90_000;
 const PER_MESSAGE = 5_000; // default reported input tokens per history message

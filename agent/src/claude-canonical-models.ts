@@ -1,9 +1,9 @@
-// PRD #3252 D8 (m4): what the bundled Claude CLI, characterized at SDK 0.3.325 / CLI 2.1.325 (re-checked; fable moved from claude-fable-5-1/high at 0.3.319) (current pin CLAUDE_PHASE_SDK / CLAUDE_PHASE_CLI
-// in test/phase-model-claude.ts) reports as `applied.model` / `applied.effort` from
-// `getSettings` for a requested alias. Only values that test/phase-model-switch.integration.test.ts
-// observed offline are listed: that test asserts these tables equal what the pin reports, so a CLI bump
-// that changes an id or a default reddens it. An alias absent here has NO characterized expectation and
-// the settings barrier holds instead of guessing.
+// PRD #3252 D8 (m4): the bundled Claude CLI reports these values as `applied.model` and
+// `applied.effort` from `getSettings` for a requested alias. The offline phase-switch test
+// confirmed the same ids and omitted-effort defaults on SDK 0.3.330 / CLI 2.1.330.
+// Fable moved from claude-fable-5-1/high at 0.3.319 to claude-fable-5-2/medium at 0.3.325.
+// CI checks these tables against CLAUDE_PHASE_SDK and CLAUDE_PHASE_CLI on each bump.
+// For an alias absent from the table, the settings barrier holds.
 
 /** alias -> the canonical id the pinned CLI applies (and sends on the wire). */
 export const CLAUDE_CANONICAL_MODELS: Readonly<Record<string, string>> = {
