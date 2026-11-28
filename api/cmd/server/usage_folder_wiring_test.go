@@ -152,7 +152,8 @@ func TestMainWiresUsageFolderPassAndWait(t *testing.T) {
 //  5. lifecycle.Wait()
 //
 // An unlaunched closure, a Wait nested in an inner closure or an if body, an early return before
-// it, a ctx not bound by the WithTimeout, or a receive on another channel are all reported.
+// it inside the goroutine or at the top level of run (between drainWG.Wait and lifecycle.Wait), a
+// ctx not bound by the WithTimeout, or a receive on another channel are all reported.
 func shutdownWaitViolations(src, folderVar string) []string {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "main.go", src, 0)
@@ -221,8 +222,8 @@ func shutdownWaitViolations(src, folderVar string) []string {
 	if ctxIdx < 0 {
 		return []string{"run: no `ctx, cancel := context.WithTimeout(..., usageFolderShutdownBudget)` after drainWG.Wait()"}
 	}
-	// waitStmt reports whether s is <folderVar>.Wait(<ctxName>), alone or as an if Init.
-	waitStmt := func(s ast.Stmt) bool {
+	// waitStmt returns "" when s is <folderVar>.Wait(<ctxName>), alone or as an if Init, else why not.
+	waitStmt := func(s ast.Stmt) string {
 		var e ast.Expr
 		switch x := s.(type) {
 		case *ast.ExprStmt:
@@ -230,20 +231,22 @@ func shutdownWaitViolations(src, folderVar string) []string {
 		case *ast.IfStmt:
 			as, ok := x.Init.(*ast.AssignStmt)
 			if !ok || len(as.Rhs) != 1 {
-				return false
+				return "its first non-defer statement is not the folder Wait"
 			}
 			e = as.Rhs[0]
 		default:
-			return false
+			return "its first non-defer statement is not the folder Wait"
 		}
 		call, ok := isMethodCall(e, folderVar, "Wait", 1)
 		if !ok {
-			return false
+			return "its first non-defer statement is not the folder Wait"
 		}
-		a, ok := call.Args[0].(*ast.Ident)
-		return ok && a.Name == ctxName
+		if a, ok := call.Args[0].(*ast.Ident); !ok || a.Name != ctxName {
+			return "the folder Wait ctx is not the WithTimeout ctx " + ctxName
+		}
+		return ""
 	}
-	var chName string
+	var chName, goWhy string
 	goIdx := next(ctxIdx+1, func(s ast.Stmt) bool {
 		gs, ok := s.(*ast.GoStmt)
 		if !ok || len(gs.Call.Args) != 0 {
@@ -268,7 +271,7 @@ func shutdownWaitViolations(src, folderVar string) []string {
 			if _, isDefer := st.(*ast.DeferStmt); isDefer {
 				continue
 			}
-			if !waitStmt(st) {
+			if goWhy = waitStmt(st); goWhy != "" {
 				return false
 			}
 			chName = ch.Name
@@ -277,7 +280,7 @@ func shutdownWaitViolations(src, folderVar string) []string {
 		return false
 	})
 	if goIdx < 0 {
-		return []string{"run: no launched `go func() { defer close(ch); <folder>.Wait(ctx) ... }()` whose first non-defer statement is the folder Wait with the bounded ctx"}
+		return []string{"run: no launched `go func() { defer close(ch); <folder>.Wait(ctx) ... }()` whose first non-defer statement is the folder Wait with the bounded ctx (" + goWhy + ")"}
 	}
 	recvIdx := next(goIdx+1, func(s ast.Stmt) bool {
 		es, ok := s.(*ast.ExprStmt)
@@ -294,8 +297,25 @@ func shutdownWaitViolations(src, folderVar string) []string {
 	if recvIdx < 0 {
 		return []string{"run: no top-level receive `<-" + chName + "` after the launching go statement"}
 	}
-	if next(recvIdx+1, func(s ast.Stmt) bool { return exprCall(s, "lifecycle", "Wait") }) < 0 {
+	lcIdx := next(recvIdx+1, func(s ast.Stmt) bool { return exprCall(s, "lifecycle", "Wait") })
+	if lcIdx < 0 {
 		return []string{"run: top-level lifecycle.Wait() not found after the folder drain receive"}
+	}
+	// Between drainWG.Wait and lifecycle.Wait no return (outside a func literal) may skip the drain.
+	for _, st := range stmts[drainIdx+1 : lcIdx] {
+		returns := false
+		ast.Inspect(st, func(n ast.Node) bool {
+			switch n.(type) {
+			case *ast.FuncLit:
+				return false
+			case *ast.ReturnStmt:
+				returns = true
+			}
+			return !returns
+		})
+		if returns {
+			return []string{"run: a return between drainWG.Wait() and lifecycle.Wait() can skip the usage-fold drain"}
+		}
 	}
 	return nil
 }
@@ -338,13 +358,38 @@ func TestShutdownWaitViolationsFixtures(t *testing.T) {
 		"ctx not from timeout":    build(map[string]string{"launch": "go func() {\ndefer close(done)\nif err := usageFolder.Wait(context.Background()); err != nil {\n}\n}()\n"}),
 		"ctx bound to wrong budg": build(map[string]string{"assign": "c, cancel := context.WithTimeout(context.Background(), time.Hour)\n"}),
 		"receive on other chan":   build(map[string]string{"recv": "<-other\n"}),
+		"defer close other":       build(map[string]string{"launch": "go func() {\ndefer close(other)\nusageFolder.Wait(c)\n}()\n"}),
+		"wait with other ctx":     build(map[string]string{"launch": "go func() {\ndefer close(done)\nif err := usageFolder.Wait(c2); err != nil {\n}\n}()\n"}),
+		"top-level return":        build(map[string]string{"recv": "if x {\nreturn nil\n}\n<-done\n"}),
+		"unconditional return":    build(map[string]string{"recv": "<-done\nreturn nil\n"}),
 		"no receive":              build(map[string]string{"recv": ""}),
 		"no lifecycle wait":       build(map[string]string{"tail": "cancel()\n"}),
 		"wait in other function":  "package main\nfunc other() {\ndrainWG.Wait()\nc, cancel := context.WithTimeout(context.Background(), usageFolderShutdownBudget)\ndone := make(chan struct{})\ngo func() {\ndefer close(done)\nusageFolder.Wait(c)\n}()\n<-done\ncancel()\nlifecycle.Wait()\n}\nfunc run() error { return nil }\n",
 	}
+	// The reason each fixture must be rejected for, so none passes by tripping an earlier check.
+	want := map[string]string{
+		"unlaunched closure":      "no launched",
+		"wait in inner closure":   "not the folder Wait",
+		"wait in if body":         "not the folder Wait",
+		"early return before":     "not the folder Wait",
+		"wait before drainWG":     "no `ctx, cancel := context.WithTimeout",
+		"ctx not from timeout":    "ctx is not the WithTimeout ctx c",
+		"ctx bound to wrong budg": "no `ctx, cancel := context.WithTimeout",
+		"receive on other chan":   "no top-level receive `<-done`",
+		"defer close other":       "no top-level receive `<-other`",
+		"wait with other ctx":     "ctx is not the WithTimeout ctx c",
+		"top-level return":        "a return between",
+		"unconditional return":    "a return between",
+		"no receive":              "no top-level receive",
+		"no lifecycle wait":       "lifecycle.Wait() not found",
+		"wait in other function":  "drainWG.Wait() not found",
+	}
 	for name, src := range bad {
-		if len(shutdownWaitViolations(src, "usageFolder")) == 0 {
+		got := strings.Join(shutdownWaitViolations(src, "usageFolder"), "; ")
+		if got == "" {
 			t.Errorf("fixture %q accepted, want rejected", name)
+		} else if !strings.Contains(got, want[name]) {
+			t.Errorf("fixture %q rejected for the wrong reason: %q, want it to mention %q", name, got, want[name])
 		}
 	}
 }

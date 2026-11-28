@@ -1,6 +1,7 @@
 package store
 
 import (
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -32,7 +33,11 @@ import (
 // Recorded limits (not detected): dynamic SQL built and run through EXECUTE format(...); COPY
 // run_usage FROM; U&"..." identifiers; functions defined at or below migration 00549; UPDATE,
 // INSERT and MERGE are checked for the lock only, not for scope; and TRUNCATE ... CASCADE on a
-// table that run_usage references, which empties run_usage through its foreign key (migration 00062).
+// table that run_usage references, which empties run_usage through its foreign key (migration 00062);
+// DELETE FROM runs, which cascades to run_usage through the same foreign key; a dollar quote used
+// as a string literal, which is lexed as code; ALTER TABLE ... USING, DROP TABLE, DML through views
+// or rules, and triggers at or below migration 00549; the scope of UPDATE, INSERT and MERGE; and a
+// cast in the DELETE scope conjunct (run_id = $1::uuid), which fails closed (rejected).
 
 var (
 	// DML writers of run_usage itself, never run_usage_legs / _messages / _tail_state /
@@ -41,20 +46,24 @@ var (
 	// ("run_usage", public.run_usage, public."run_usage"). Group 1 is the statement keyword.
 	// It runs on the comment-stripped text WITH quoted identifiers intact (norm), and a match only
 	// counts when its keyword is also visible in the mask, i.e. is not inside a string.
-	runUsageDMLRE = regexp.MustCompile(`(?is)\b(INSERT\s+INTO|MERGE\s+INTO|UPDATE|DELETE\s+FROM)\s+(?:ONLY\s+)?(?:"?[A-Za-z_]\w*"?\s*\.\s*)?"?run_usage"?[\s(;,*]`)
+	runUsageDMLRE = regexp.MustCompile(`(?is)\b(INSERT\s+INTO|MERGE\s+INTO|UPDATE|DELETE\s+FROM)\s*(?:ONLY\s+)?(?:"?[A-Za-z_]\w*"?\s*\.\s*)?"?run_usage"?[\s(;,*]`)
 	// TRUNCATE [TABLE] [ONLY] t1 [*] [, ...]: run_usage may be anywhere in the target list, which
 	// stops at ON (GRANT / CREATE TRIGGER ... TRUNCATE ON), CASCADE, RESTRICT, RESTART, CONTINUE,
 	// ";" or the end of the statement.
 	runUsageTruncateRE = regexp.MustCompile(`(?i)\bTRUNCATE\b`)
-	truncateHeadRE     = regexp.MustCompile(`(?is)^\s+(?:TABLE\s+)?`)
-	truncateListEndRE  = regexp.MustCompile(`(?i);|\b(?:ON|CASCADE|RESTRICT|RESTART|CONTINUE)\b`)
-	truncateTargetRE   = regexp.MustCompile(`(?is)(?:^|,)\s*(?:ONLY\s+)?(?:"?[A-Za-z_]\w*"?\s*\.\s*)?"?run_usage"?\s*\*?\s*(?:,|$)`)
+	truncateHeadRE     = regexp.MustCompile(`(?is)^\s*(?:TABLE\b\s*)?`)
+	// CASCADE, RESTART etc. are unreserved keywords, so they only end the list in their option
+	// position: CASCADE/RESTRICT before the end, ";" or ")", RESTART/CONTINUE before IDENTITY.
+	truncateListEndRE = regexp.MustCompile(`(?i);|\bON\b|\b(?:CASCADE|RESTRICT)\b\s*(?:;|\)|$)|\b(?:RESTART|CONTINUE)\s+IDENTITY\b`)
+	truncateTargetRE  = regexp.MustCompile(`(?is)(?:^|,)\s*(?:ONLY\s+)?(?:"?[A-Za-z_]\w*"?\s*\.\s*)?"?run_usage"?\s*\*?\s*(?:,|$)`)
 	// The lock CTE must be defined as lk AND be the one the main statement reads. These run on the
 	// mask, so text in a string or quoted identifier never satisfies them.
 	runUsageLockDefRE = regexp.MustCompile(`(?is)\blk\s+AS\s*\(\s*SELECT\s+fn_run_usage_fold_lock\s*\(`)
 	runUsageFromLk    = regexp.MustCompile(`(?is)\bFROM\s+lk\b`)
 	usageWithRE       = regexp.MustCompile(`(?i)\bWITH\b`)
 	usageMainKwRE     = regexp.MustCompile(`(?i)^(?:INSERT|DELETE|UPDATE|MERGE|SELECT|TRUNCATE)\b`)
+	usageLockArgRE    = regexp.MustCompile(`^(?:\$\d+|@\w+|sqlc\.n?arg\(\w+\))$`)
+	usageLockExistsRE = regexp.MustCompile(`(?is)^\s*EXISTS\s*\(\s*SELECT\b.*\bFROM\s+lk\b.*\)\s*$`)
 	usageAliasRE      = regexp.MustCompile(`(?is)^\s*\*?\s*(?:AS\s+)?([A-Za-z_]\w*)`)
 )
 
@@ -92,6 +101,7 @@ func runUsageWrites(norm, mask string) []usageWrite {
 			out = append(out, usageWrite{start: m[0], end: listEnd, kind: "TRUNCATE"})
 		}
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].start < out[j].start })
 	return out
 }
 
@@ -213,11 +223,12 @@ func splitConjuncts(mask string) (spans [][2]int, hasOR bool) {
 	return append(spans, [2]int{start, len(mask)}), hasOR
 }
 
-// deleteScopedToRun reports whether the DELETE writer w (the leading statement of the lexed main
-// statement) has a WHERE clause with a top-level AND conjunct that is exactly run_id = <arg> or
-// <arg> = run_id (run_id bare or qualified by the target name or its alias), and no top-level OR.
-// arg is the token the statement passes to fn_run_usage_fold_lock.
-func deleteScopedToRun(norm, mask string, w usageWrite, arg string) bool {
+// deleteScopeReason returns "" when the DELETE writer w (the leading statement of the lexed main
+// statement) has a WHERE clause with no top-level OR and, as top-level AND conjuncts, both
+// run_id = <arg> (or <arg> = run_id; run_id bare or qualified by the target name or its alias) and
+// EXISTS (SELECT ... FROM lk ...); otherwise it names what is missing. arg is the token the
+// statement passes to fn_run_usage_fold_lock.
+func deleteScopeReason(norm, mask string, w usageWrite, arg string) string {
 	quals := []string{`run_usage`, `"run_usage"`}
 	if m := usageAliasRE.FindStringSubmatch(mask[w.end:]); m != nil {
 		switch strings.ToUpper(m[1]) {
@@ -238,7 +249,7 @@ func deleteScopedToRun(norm, mask string, w usageWrite, arg string) bool {
 		}
 	}
 	if whereStart < 0 {
-		return false
+		return "DELETE has no top-level WHERE"
 	}
 	whereEnd := len(mask)
 	if i := strings.IndexByte(mask[whereStart:], ';'); i >= 0 {
@@ -252,51 +263,66 @@ func deleteScopedToRun(norm, mask string, w usageWrite, arg string) bool {
 	}
 	spans, hasOR := splitConjuncts(mask[whereStart:whereEnd])
 	if hasOR {
-		return false
+		return "DELETE WHERE has a top-level OR"
 	}
+	var scoped, locked bool
 	for _, sp := range spans {
-		if scope.MatchString(norm[whereStart+sp[0] : whereStart+sp[1]]) {
-			return true
-		}
+		scoped = scoped || scope.MatchString(norm[whereStart+sp[0]:whereStart+sp[1]])
+		locked = locked || usageLockExistsRE.MatchString(mask[whereStart+sp[0]:whereStart+sp[1]])
 	}
-	return false
+	switch {
+	case !scoped:
+		return "DELETE WHERE lacks a run_id = <lock argument> conjunct"
+	case !locked:
+		return "DELETE WHERE lacks an EXISTS (SELECT ... FROM lk) conjunct"
+	}
+	return ""
 }
 
-// unguardedLexed reports whether the lexed statement writes run_usage without the lock CTE: the
-// WITH clause must define lk as fn_run_usage_fold_lock, no CTE may itself write run_usage, and the
-// MAIN statement (not some other CTE) must be the writer and read FROM lk. A main DELETE must also
-// be scoped to the locked run (deleteScopedToRun). UPDATE, INSERT and MERGE are not scope-checked:
-// a recorded limit of this guard.
-func unguardedLexed(norm, mask string) bool {
+// unguardedReason returns "" when the lexed statement is not a run_usage writer or is guarded, else
+// why it is unguarded. Guarded means: the WITH clause defines lk as fn_run_usage_fold_lock of a
+// parameter, no CTE itself writes run_usage, and the MAIN statement (not some other CTE or a
+// later statement) is the single writer, starts the statement and reads FROM lk. A main DELETE
+// must also be scoped to the locked run (deleteScopeReason). UPDATE, INSERT and MERGE are not
+// scope-checked: a recorded limit of this guard.
+func unguardedReason(norm, mask string) string {
 	if len(runUsageWrites(norm, mask)) == 0 {
-		return false
+		return ""
 	}
 	cs, ms, ok := splitWithClause(mask)
 	if !ok {
-		return true
+		return "no WITH clause"
 	}
 	loc := runUsageLockDefRE.FindStringIndex(mask[cs:ms])
 	if loc == nil {
-		return true
+		return "no lk CTE calling fn_run_usage_fold_lock"
 	}
 	argStart := cs + loc[1]
 	argEnd, ok := balancedArg(mask, argStart)
 	if !ok {
-		return true
+		return "unbalanced fn_run_usage_fold_lock call"
 	}
 	arg := strings.TrimSpace(norm[argStart:argEnd])
 	if len(runUsageWrites(norm[cs:ms], mask[cs:ms])) > 0 {
-		return true
+		return "a CTE writes run_usage"
 	}
 	mainWrites := runUsageWrites(norm[ms:], mask[ms:])
-	if len(mainWrites) == 0 || !runUsageFromLk.MatchString(mask[ms:]) {
-		return true
+	if len(mainWrites) != 1 || mainWrites[0].start != 0 {
+		return "the main statement is not the single run_usage writer"
 	}
-	if w := mainWrites[0]; w.start == 0 && w.kind == "DELETE" {
-		return !deleteScopedToRun(norm[ms:], mask[ms:], w, arg)
+	if !runUsageFromLk.MatchString(mask[ms:]) {
+		return "the main statement never reads FROM lk"
 	}
-	return false
+	if !usageLockArgRE.MatchString(arg) {
+		return "lock argument is not a parameter"
+	}
+	if mainWrites[0].kind == "DELETE" {
+		return deleteScopeReason(norm[ms:], mask[ms:], mainWrites[0], arg)
+	}
+	return ""
 }
+
+func unguardedLexed(norm, mask string) bool { return unguardedReason(norm, mask) != "" }
 
 // unguardedRunUsageWrite lexes stmt and classifies it; an error is a lexer error (unterminated
 // block comment).
@@ -308,14 +334,29 @@ func unguardedRunUsageWrite(stmt string) (bool, error) {
 	return unguardedLexed(norm+" ", mask+" "), nil
 }
 
-// writesRunUsage reports whether s (SQL, or an arbitrary Go string literal) writes run_usage. A
-// string the lexer rejects is scanned as is: more text counts, never less.
+// writesRunUsage reports whether s (SQL, or an arbitrary Go string literal) writes run_usage:
+// either the raw text or the lexed scan matches, so a literal such as "'; DELETE FROM run_usage; --'"
+// is caught even though the lexer reads its tail as a string, and a string the lexer rejects is
+// scanned as is. More text counts, never less.
 func writesRunUsage(s string) bool {
-	norm, mask, err := lexSQL(s)
-	if err != nil {
-		norm, mask = s, s
+	if len(runUsageWrites(s+" ", s+" ")) > 0 {
+		return true
 	}
-	return len(runUsageWrites(norm+" ", mask+" ")) > 0
+	norm, mask, err := lexSQL(s)
+	return err == nil && len(runUsageWrites(norm+" ", mask+" ")) > 0
+}
+
+func TestWritesRunUsageGoLiterals(t *testing.T) {
+	for _, s := range []string{"'; DELETE FROM run_usage; --'", "x' DELETE FROM run_usage '", "DELETE FROM /* c */ run_usage WHERE x", "DELETE FROM run_usage /*"} {
+		if !writesRunUsage(s) {
+			t.Errorf("writesRunUsage(%q) = false, want true", s)
+		}
+	}
+	for _, s := range []string{"SELECT 1", "DELETE FROM run_usage_legs", "glob/*"} {
+		if writesRunUsage(s) {
+			t.Errorf("writesRunUsage(%q) = true, want false", s)
+		}
+	}
 }
 
 func TestRunUsageWriterClassifier(t *testing.T) {
@@ -345,6 +386,8 @@ func TestRunUsageWriterClassifier(t *testing.T) {
 		"GRANT TRUNCATE ON run_usage TO x",
 		"CREATE TRIGGER t AFTER TRUNCATE ON run_usage FOR EACH STATEMENT EXECUTE FUNCTION f()",
 		"SELECT foo$bar$ FROM t",
+		"SELECT 'DELETE FROM run_usage x'",
+		"TRUNCATE run_usage_legs RESTART IDENTITY CASCADE",
 	}
 	for _, s := range good {
 		bad, err := unguardedRunUsageWrite(s)
@@ -392,11 +435,9 @@ func TestRunUsageWriterClassifier(t *testing.T) {
 		"WITH lk AS (SELECT fn_run_usage_fold_lock($1) AS ok) DELETE FROM public.\"run_usage\" WHERE EXISTS (SELECT 1 FROM lk WHERE lk.ok)",
 		"WITH lk AS (SELECT fn_run_usage_fold_lock($1) AS ok) DELETE FROM run_usage WHERE run_id = $2 AND EXISTS (SELECT 1 FROM lk WHERE lk.ok)",
 		"WITH lk AS (SELECT fn_run_usage_fold_lock($1) AS ok) DELETE FROM run_usage WHERE run_id = $1 OR true AND EXISTS (SELECT 1 FROM lk WHERE lk.ok)",
-		"WITH lk AS (SELECT fn_run_usage_fold_lock($1) AS ok) DELETE FROM run_usage WHERE run_id = $1 OR true",
 		"WITH lk AS (SELECT fn_run_usage_fold_lock($1) AS ok) DELETE FROM run_usage WHERE (run_id = $1) AND EXISTS (SELECT 1 FROM lk WHERE lk.ok)",
 		"WITH lk AS (SELECT fn_run_usage_fold_lock($1) AS ok) DELETE FROM run_usage WHERE x BETWEEN run_id = $1 AND 2 AND EXISTS (SELECT 1 FROM lk WHERE lk.ok)",
 		"WITH lk AS (SELECT fn_run_usage_fold_lock($1) AS ok) DELETE FROM run_usage WHERE CASE WHEN a THEN run_id = $1 AND b END AND EXISTS (SELECT 1 FROM lk WHERE lk.ok)",
-		"WITH lk AS (SELECT fn_run_usage_fold_lock($1) AS ok) DELETE FROM run_usage WHERE EXISTS (SELECT 1 FROM lk WHERE lk.ok) RETURNING run_id = $1",
 	}
 	for _, s := range bad {
 		got, err := unguardedRunUsageWrite(s)
@@ -405,6 +446,59 @@ func TestRunUsageWriterClassifier(t *testing.T) {
 		} else if !got {
 			t.Errorf("classified as clean, want unguarded writer: %q", s)
 		}
+	}
+	// Each of these must be unguarded for the named reason, so a fixture cannot pass by tripping an
+	// earlier check than the one it exists to cover.
+	const lk1 = "WITH lk AS (SELECT fn_run_usage_fold_lock($1) AS ok) "
+	const lkOK = " EXISTS (SELECT 1 FROM lk)"
+	reasons := []struct{ sql, why string }{
+		// The writer is not the main statement.
+		{"DO $$ BEGIN IF EXISTS (WITH lk AS (SELECT fn_run_usage_fold_lock(1) AS ok) SELECT 1 FROM lk) THEN DELETE FROM run_usage WHERE true; END IF; END $$", "not the single run_usage writer"},
+		{"WITH lk AS (SELECT fn_run_usage_fold_lock(@id) AS ok) SELECT 1 FROM lk; DELETE FROM run_usage", "not the single run_usage writer"},
+		// Lexer-level hiding.
+		{"SELECT E'a'\n'\\' /* ';\nDELETE FROM run_usage;\nSELECT ' */ '", "no WITH clause"},
+		{"SELECT 1 -- x\rDELETE FROM run_usage WHERE run_id = $1", "no WITH clause"},
+		// Adjacent quotes: no whitespace before a quoted target.
+		{"DELETE FROM\"run_usage\" WHERE run_id = $1", "no WITH clause"},
+		{"TRUNCATE\"run_usage\"", "no WITH clause"},
+		// TRUNCATE stop words are unreserved keywords outside their option position.
+		{"TRUNCATE restart.run_usage", "no WITH clause"},
+		{"TRUNCATE continue, run_usage", "no WITH clause"},
+		{"TRUNCATE cascade.run_usage CASCADE", "no WITH clause"},
+		{"TRUNCATE \"on\", run_usage", "no WITH clause"},
+		// The lock argument must be a parameter.
+		{"WITH lk AS (SELECT fn_run_usage_fold_lock(run_id) AS ok FROM run_usage_fold_state) DELETE FROM run_usage WHERE run_id = run_id AND EXISTS (SELECT 1 FROM lk WHERE lk.ok)", "not a parameter"},
+		// DELETE scope: the lock conjunct, the run conjunct, the OR check and the clause end.
+		{lk1 + "DELETE FROM run_usage WHERE run_id = $1 AND (true OR" + lkOK + ")", "lacks an EXISTS"},
+		{lk1 + "DELETE FROM run_usage WHERE run_id = $1 RETURNING (SELECT 1 FROM lk)", "lacks an EXISTS"},
+		{lk1 + "DELETE FROM run_usage WHERE run_id = $1 AND x OR true AND" + lkOK, "top-level OR"},
+		{lk1 + "DELETE FROM run_usage WHERE run_id = $1 AND" + lkOK + " OR true", "top-level OR"},
+		{lk1 + "DELETE FROM run_usage WHERE x BETWEEN y AND run_id = $1 AND" + lkOK, "lacks a run_id"},
+		{lk1 + "DELETE FROM run_usage WHERE CASE WHEN a THEN b AND run_id = $1 AND c END AND" + lkOK, "lacks a run_id"},
+		{lk1 + "DELETE FROM run_usage WHERE" + lkOK + " RETURNING a AND run_id = $1", "lacks a run_id"},
+		{lk1 + "DELETE FROM run_usage WHERE run_id = $1::uuid AND" + lkOK, "lacks a run_id"},
+	}
+	for _, c := range reasons {
+		norm, mask, err := lexSQL(c.sql)
+		if err != nil {
+			t.Errorf("lexer error on %q: %v", c.sql, err)
+			continue
+		}
+		if got := unguardedReason(norm+" ", mask+" "); !strings.Contains(got, c.why) {
+			t.Errorf("%q: unguarded reason %q, want it to mention %q", c.sql, got, c.why)
+		}
+	}
+}
+
+func TestSqlcStatementsRejectTrailingStatement(t *testing.T) {
+	if _, err := sqlcStatements("-- name: X :exec\nWITH lk AS (SELECT fn_run_usage_fold_lock(@id) AS ok) SELECT 1 FROM lk; DELETE FROM run_usage"); err == nil {
+		t.Error("a statement after a top-level \";\" was accepted")
+	}
+	if _, err := sqlcStatements("-- name: Y :exec\nSELECT 1; -- done\n/* more */\n"); err != nil {
+		t.Errorf("trailing comments after \";\" rejected: %v", err)
+	}
+	if _, err := sqlcStatements("-- name: Z :exec\nSELECT 'a; b';"); err != nil {
+		t.Errorf("\";\" inside a string rejected: %v", err)
 	}
 }
 
@@ -426,6 +520,11 @@ func sqlcStatements(text string) ([]sqlStmt, error) {
 		var name string
 		if f := strings.Fields(strings.SplitN(strings.TrimSpace(part), "\n", 2)[0]); len(f) > 0 {
 			name = f[0]
+		}
+		// A sqlc query is one statement: anything but whitespace and comments after a top-level ";"
+		// would be a second statement that the single-statement classifier never splits off.
+		if i := strings.IndexByte(mask, ';'); i >= 0 && strings.TrimSpace(norm[i+1:]) != "" {
+			return nil, fmt.Errorf("query %q holds a statement after a top-level \";\"", name)
 		}
 		out = append(out, sqlStmt{name: name, norm: norm + " ", mask: mask + " "})
 	}
@@ -462,6 +561,9 @@ func TestMigrationViolations(t *testing.T) {
 		"DELETE FROM /* a; b */ run_usage;",
 		"-- it's fine\nDELETE FROM run_usage WHERE run_id = $1;",
 		"SELECT 1; TRUNCATE x, run_usage;",
+		"DO $$ BEGIN IF EXISTS (WITH lk AS (SELECT fn_run_usage_fold_lock(1) AS ok) SELECT 1 FROM lk) THEN DELETE FROM run_usage WHERE true; END IF; END $$;",
+		"SELECT E'a'\n'\\' /* ';\nDELETE FROM run_usage;\nSELECT ' */ ';",
+		"SELECT 1 -- x\rDELETE FROM run_usage WHERE run_id = $1;",
 	}
 	for _, text := range mustReport {
 		bad, err := migrationViolations(text)
@@ -825,6 +927,7 @@ func TestRefoldRunUsageLocksRunBeforeDelete(t *testing.T) {
 		"lock as operand":            {head + begin + "ok := cond && qtx.LockRunForUsageRefold(ctx, id) != nil\n_ = ok\n" + del, "whole expression"},
 		"lock as call argument":      {head + begin + "maybe(qtx.LockRunForUsageRefold(ctx, id))\n" + del, "whole expression"},
 		"goto skips lock":            {head + begin + "if c {\ngoto del\n}\n" + lock + "del:\n" + del, "goto or label"},
+		"label without goto":         {head + begin + lock + "done:\n" + del, "goto or label"},
 		"go lock":                    {head + begin + "go qtx.LockRunForUsageRefold(ctx, id)\n" + del, "whole expression"},
 		"BeginTx in if body":         {head + "if c {\ntx, _ := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})\n}\n" + lock + del, "whole expression"},
 		"ReadCommitted in other arg": {head + "tx, _ := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable, AccessMode: m(pgx.ReadCommitted)})\n" + lock + del, "ReadCommitted"},

@@ -17,10 +17,11 @@ import (
 //     body's own mask, so comments inside a plpgsql body are stripped and its code stays visible.
 //
 // Rules, outside any quote:
-//   - "--" runs to the newline; "/* */" nests; an unterminated block comment is an error.
-//   - '...' doubles ” for a quote and treats backslash literally; E'...' / e'...' (opening only when
+//   - "--" runs to the newline (\n or \r); "/* */" nests; an unterminated block comment is an error.
+//   - '...' uses a doubled single quote for a quote and treats backslash literally; E'...' / e'...' (opening only when
 //     the byte before the E is not an identifier byte) also lets a backslash escape the next byte.
-//   - "..." doubles "" for a quote.
+//     A string continues across whitespace containing a newline, 'a'<newline>'b', in the same mode.
+//   - "..." uses a doubled double quote for a quote.
 //   - A dollar quote ($$ or $tag$, tag = letter/_/high-byte then word bytes) opens only when the
 //     previous byte is not an identifier byte, so $1 stays a parameter and foo$bar$ an identifier.
 //     The closing tag is found by plain text search, then the body is lexed on its own.
@@ -88,7 +89,7 @@ func sqlQuotedEnd(src string, i int, q byte, backslash bool) int {
 func lexSQLInto(src string, n, m []byte) error {
 	blank := func(a, b int) {
 		for k := a; k < b; k++ {
-			if src[k] != '\n' {
+			if src[k] != '\n' && src[k] != '\r' {
 				n[k], m[k] = ' ', ' '
 			}
 		}
@@ -97,7 +98,7 @@ func lexSQLInto(src string, n, m []byte) error {
 		c := src[i]
 		switch {
 		case c == '-' && i+1 < len(src) && src[i+1] == '-':
-			end := strings.IndexByte(src[i:], '\n')
+			end := strings.IndexAny(src[i:], "\r\n")
 			if end < 0 {
 				end = len(src)
 			} else {
@@ -134,6 +135,26 @@ func lexSQLInto(src string, n, m []byte) error {
 				m[k] = 'x'
 			}
 			i = end + 1
+			// A string continues across whitespace holding a newline, as 'a'<newline>'b', in the
+			// same escape mode as the segment before it.
+			for c == '\'' {
+				j, nl := i, false
+				for j < len(src) && strings.IndexByte(" \t\r\n\f", src[j]) >= 0 {
+					nl = nl || src[j] == '\n' || src[j] == '\r'
+					j++
+				}
+				if !nl || j >= len(src) || src[j] != '\'' {
+					break
+				}
+				next := sqlQuotedEnd(src, j, '\'', esc)
+				if next < 0 {
+					return nil
+				}
+				for k := j + 1; k < next; k++ {
+					m[k] = 'x'
+				}
+				i = next + 1
+			}
 		case c == '$' && (i == 0 || !isSQLIdentByte(src[i-1])):
 			tag := sqlDollarTag(src[i:])
 			if tag == "" {
@@ -160,24 +181,27 @@ func lexSQLInto(src string, n, m []byte) error {
 func TestLexSQL(t *testing.T) {
 	type tc struct{ in, norm, mask string }
 	cases := map[string]tc{
-		"line comment":      {"a -- b 'c\nd", "a        \nd", "a        \nd"},
-		"block comment":     {"a /* b */ c", "a         c", "a         c"},
-		"nested comment":    {"a /* b /* c */ d */ e", "a                   e", "a                   e"},
-		"string":            {"a 'b/*' c", "a 'b/*' c", "a 'xxx' c"},
-		"doubled quote":     {"'a''/*b'", "'a''/*b'", "'xxxxxx'"},
-		"backslash literal": {`'a\' /* c */`, `'a\'        `, `'xx'        `},
-		"escape string":     {`E'a\'/*' x`, `E'a\'/*' x`, `E'xxxxx' x`},
-		"lower escape":      {`e'\\' /**/`, `e'\\'     `, `e'xx'     `},
-		"E in identifier":   {`fooE'a\' /**/`, `fooE'a\'     `, `fooE'xx'     `},
-		"quoted ident":      {`"a/*""b" c`, `"a/*""b" c`, `"xxxxxx" c`},
-		"param":             {"$1 /* x */", "$1        ", "$1        "},
-		"identifier dollar": {"foo$bar$ 'a'", "foo$bar$ 'a'", "foo$bar$ 'x'"},
-		"dollar body":       {"$$ 'a' -- c\nz $$", "$$ 'a'     \nz $$", "$$ 'x'     \nz $$"},
-		"tagged dollar":     {"$t$ a /* c */ $t$ b", "$t$ a         $t$ b", "$t$ a         $t$ b"},
-		"inner other tag":   {"$t$ a $$ /* c */ $t$ b", "$t$ a $$ /* c */ $t$ b", "$t$ a $$ /* c */ $t$ b"},
-		"unterminated str":  {"a 'b /* c", "a 'b /* c", "a 'b /* c"},
-		"unterminated $":    {"a $$ b /* c", "a $$ b /* c", "a $$ b /* c"},
-		"body unterminated": {"$$ 'a /* c */ $$ d /* e */", "$$ 'a /* c */ $$ d        ", "$$ 'a /* c */ $$ d        "},
+		"line comment":        {"a -- b 'c\nd", "a        \nd", "a        \nd"},
+		"block comment":       {"a /* b */ c", "a         c", "a         c"},
+		"nested comment":      {"a /* b /* c */ d */ e", "a                   e", "a                   e"},
+		"string":              {"a 'b/*' c", "a 'b/*' c", "a 'xxx' c"},
+		"doubled quote":       {"'a''/*b'", "'a''/*b'", "'xxxxxx'"},
+		"backslash literal":   {`'a\' /* c */`, `'a\'        `, `'xx'        `},
+		"escape string":       {`E'a\'/*' x`, `E'a\'/*' x`, `E'xxxxx' x`},
+		"lower escape":        {`e'\\' /**/`, `e'\\'     `, `e'xx'     `},
+		"E in identifier":     {`fooE'a\' /**/`, `fooE'a\'     `, `fooE'xx'     `},
+		"quoted ident":        {`"a/*""b" c`, `"a/*""b" c`, `"xxxxxx" c`},
+		"param":               {"$1 /* x */", "$1        ", "$1        "},
+		"identifier dollar":   {"foo$bar$ 'a'", "foo$bar$ 'a'", "foo$bar$ 'x'"},
+		"dollar body":         {"$$ 'a' -- c\nz $$", "$$ 'a'     \nz $$", "$$ 'x'     \nz $$"},
+		"tagged dollar":       {"$t$ a /* c */ $t$ b", "$t$ a         $t$ b", "$t$ a         $t$ b"},
+		"inner other tag":     {"$t$ a $$ /* c */ $t$ b", "$t$ a $$ /* c */ $t$ b", "$t$ a $$ /* c */ $t$ b"},
+		"string continuation": {"E'a'\n'\\' /* ';\nx;\n' */ '", "E'a'\n'\\' /* ';\nx;\n' */ '", "E'x'\n'xxxxxx';\nx;\n'xxxx'"},
+		"no continuation":     {"'a' 'b' /* c */", "'a' 'b'        ", "'x' 'x'        "},
+		"CR ends comment":     {"a -- b\rc", "a     \rc", "a     \rc"},
+		"unterminated str":    {"a 'b /* c", "a 'b /* c", "a 'b /* c"},
+		"unterminated $":      {"a $$ b /* c", "a $$ b /* c", "a $$ b /* c"},
+		"body unterminated":   {"$$ 'a /* c */ $$ d /* e */", "$$ 'a /* c */ $$ d        ", "$$ 'a /* c */ $$ d        "},
 	}
 	for name, c := range cases {
 		norm, mask, err := lexSQL(c.in)
