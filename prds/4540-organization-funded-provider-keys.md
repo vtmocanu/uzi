@@ -4,7 +4,7 @@
 **Umbrella**: #4319
 **Priority / area**: High / security
 **Status**: v8 (M2 dual architecture review at `d04cf1ae` folded). M2 anchors re-verified at `cba1fb0d7` (2026-11-28); M1 (`fc9553a8`) and #4574 M2 (`529ebaa7`) changed this area since v7. Split by owner decision 2026-11-27 into M1 (custody and admin Test) and M2 (recipients). **M1 delivered (owner acceptance #4770 M1 pending); M2 not started.**
-**Entry prerequisites**: met, except the two M2 owner decisions in D28. #4324 (PR #4656) and its Codex extension #4633 (PR #4705), #4505 (PR #4551), and #4322 M1a (judge, PR #4678) and M1b (jobs, PR #4742) are all merged. There is no implementation dependency on #4323, #4496 or #50. Each milestone needs the user's dispatch go.
+**Entry prerequisites**: met. M2's merge additionally waits for #4770's M1 section (D28). #4324 (PR #4656) and its Codex extension #4633 (PR #4705), #4505 (PR #4551), and #4322 M1a (judge, PR #4678) and M1b (jobs, PR #4742) are all merged. There is no implementation dependency on #4323, #4496 or #50. Each milestone needs the user's dispatch go.
 **Disposition**: one milestone per gated run, with no on-deck enrollment. Each PR is `non_closing` (`Refs #4540`). The issue closes when M2's owner acceptance passes in #4770.
 
 ## Problem and outcome
@@ -419,7 +419,7 @@ These are recipient-trust conditions, not a promise of per-user isolation at the
 - **Admin grant API (R6):** route groups (read-only GET, cookie plus CSRF writes); idempotent PUT/DELETE (existing-grant PUT 204 at the cap; absent-grant DELETE 204, also after user deletion; unknown-user PUT 404); paging bound and cursor; 409 `provider_not_operator_key`, `provider_grant_cap_reached`; 404 `user_not_found`; writes allowed on a retired definition; revoke-recipients is one transaction and returns the removed count; the CHECK refuses all-users on a per-user-key row and on a NULL-mode row; contract fixtures and mock cases.
 - **Classifier:** the R5 M2 entries (a)-(e) with exact predicates and pinned callers; the custody `Open` caller set is exactly the two sinks; the grants-table marker rule fires on an unlisted statement; there is a canary for grant-row immutability.
 
-**Landing obligations:** the same as M1, including the CI-time measurement for the contention tests. Add `test-agent-worker-uid` if `agent/**` is touched, and then **full agent suite: exact-head PR CI**.
+**Landing obligations:** the same as M1, including the CI-time measurement for the contention tests. Merge only after #4770's M1 section passes (D28). Add `test-agent-worker-uid` if `agent/**` is touched, and then **full agent suite: exact-head PR CI**.
 
 **Owner acceptance:** #4770, M2 section. Use a real gateway with grants for two users, a revoke during a queued run followed by an explicit Resume, a rotation, the incident stop and a product-token job. Run it with no sweep and no deadline. It does not replace the offline proofs. `non_closing`; #4540 closes when it passes.
 
@@ -473,9 +473,9 @@ Full `test:api`, `test:web`, `test:web-browser`, `gate:repo`, `scan:secrets` and
 - **D25. RC sites by function, the promoter included (lead and buddy, 2026-11-28).** Both M2 reviews found `finishChatClaimTx` at the default isolation. The opus review held the promoter could stay at the default because the claim re-decides; the Codex review showed a stale promoter snapshot skips the D17 Resume. The cost is one begin call, so the promoter is RC.
 - **D26. Admin grant API pinned in the PRD (M2 review).** Routes, paging, idempotence, errors and the NULL-safe all-users CHECK are specified so the run makes no API design choice.
 - **D27. No checker mode column in #4540 M2 (M2 review).** #4540 M2 lands first and the blanket Claude-checker refusals already cover operator sources; #4322 M2 lifts the Claude-checker refusal and carries the operator-funded checker rows (its M2 acceptance and D23); a mode refusal applies there only if the order flips.
-- **D28. Owner decisions pending before M2 dispatch (2026-11-28).**
-  - Q1: whether M2's dispatch or merge waits for the #4770 M1 owner acceptance. Lead and buddy recommend: dispatch, and hold the merge until #4770's M1 section passes, since M2 opens the spending path.
-  - Q2: one gated run with the internal order, or the M2a/M2b split. Lead and buddy recommend one run: the authority change is coupled, and a split adds a temporary refusal arm and a review round. The fallback split is recorded under M2.
+- **D28. M2 dispatch and merge gating (lead and buddy, delegated by the owner, 2026-11-28).**
+  - Q1: M2 dispatches now; its merge waits until #4770's M1 section passes, since M2 opens the spending path.
+  - Q2: one gated run with the internal order. The authority change is coupled, and a split adds a temporary refusal arm and a review round. The fallback split recorded under M2 applies only if the plan exceeds the owner's budget.
 - **History.**
   - v1 (re-anchor at `bc0348e1a`): Claude-only mode, the omitted mode CHECK, no endpoint mutation, mode-filtered admin queries, publication scans already shipped, the missing claim-time lock, the threat-model heading, the #4322 wording, the preview anchor.
   - v2 (buddy): D14, D15, D16; the checker-child case handed off.
