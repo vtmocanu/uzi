@@ -437,3 +437,14 @@ func TestHistoryRetentionEvidenceRequiredTicksCeilsHeadroom(t *testing.T) {
 		t.Fatalf("PR backlog = %d, %v; want 941", got, err)
 	}
 }
+
+// The shared segment alone is reported: the temp segment's read/written must not overwrite it.
+func TestHistoryRetentionEvidenceParseBuffersSharedOnly(t *testing.T) {
+	hit, read, dirt, wr := heParseBuffers("  Buffers: shared hit=20053 read=55448 dirtied=73 written=7, temp read=480 written=3544")
+	if hit != 20053 || read != 55448 || dirt != 73 || wr != 7 {
+		t.Fatalf("got hit=%d read=%d dirtied=%d written=%d, want 20053 55448 73 7", hit, read, dirt, wr)
+	}
+	if h, r, _, _ := heParseBuffers("Buffers: temp read=480 written=3544"); h != 0 || r != 0 {
+		t.Fatalf("temp-only line gave hit=%d read=%d, want 0 0", h, r)
+	}
+}

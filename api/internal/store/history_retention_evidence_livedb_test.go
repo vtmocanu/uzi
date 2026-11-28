@@ -1022,24 +1022,33 @@ func heParseBuffers(line string) (hit, read, dirt, wr int64) {
 	if i < 0 {
 		return
 	}
-	for _, f := range strings.Fields(line[i+len("Buffers:"):]) {
-		kv := strings.SplitN(f, "=", 2)
-		if len(kv) != 2 {
+	// Only the shared segment counts: a line such as
+	// "Buffers: shared hit=1 read=2 written=7, temp read=480 written=3544" carries temp and
+	// local segments after commas whose keys would otherwise overwrite the shared values.
+	for _, seg := range strings.Split(line[i+len("Buffers:"):], ",") {
+		fields := strings.Fields(seg)
+		if len(fields) == 0 || fields[0] != "shared" {
 			continue
 		}
-		n, err := strconv.ParseInt(kv[1], 10, 64)
-		if err != nil {
-			continue
-		}
-		switch kv[0] {
-		case "hit":
-			hit = n
-		case "read":
-			read = n
-		case "dirtied":
-			dirt = n
-		case "written":
-			wr = n
+		for _, f := range fields[1:] {
+			kv := strings.SplitN(f, "=", 2)
+			if len(kv) != 2 {
+				continue
+			}
+			n, err := strconv.ParseInt(kv[1], 10, 64)
+			if err != nil {
+				continue
+			}
+			switch kv[0] {
+			case "hit":
+				hit = n
+			case "read":
+				read = n
+			case "dirtied":
+				dirt = n
+			case "written":
+				wr = n
+			}
 		}
 	}
 	return
