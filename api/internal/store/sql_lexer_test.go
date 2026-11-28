@@ -20,18 +20,24 @@ import (
 //   - "--" runs to the newline (\n or \r); "/* */" nests; an unterminated block comment is an error.
 //   - '...' uses a doubled single quote for a quote and treats backslash literally; E'...' / e'...' (opening only when
 //     the byte before the E is not an identifier byte) also lets a backslash escape the next byte.
-//     A string continues across whitespace containing a newline, 'a'<newline>'b', in the same mode.
+//     A string continues across whitespace containing a newline, 'a'<newline>'b', in the same mode;
+//     "--" comments count as that whitespace (a "/* */" comment does not, as in PostgreSQL).
+//   - A vertical tab is whitespace in PostgreSQL 16+ but not in Go's regexp \s, so it is mapped to a
+//     space outside quotes.
 //   - "..." uses a doubled double quote for a quote.
 //   - A dollar quote ($$ or $tag$, tag = letter/_/high-byte then word bytes) opens only when the
 //     previous byte is not an identifier byte, so $1 stays a parameter and foo$bar$ an identifier.
-//     The closing tag is found by plain text search, then the body is lexed on its own.
+//     The closing tag is found by plain text search, then the body is lexed on its own. The opening
+//     and closing tags are blanked to spaces in both outputs.
 //   - An unterminated string, quoted identifier or dollar quote keeps the rest of the text (or of
 //     that dollar body) verbatim, without an error.
 //
 // Not handled (recorded limits of the guard built on this lexer): dynamic SQL assembled and run
 // through EXECUTE format(...); COPY run_usage FROM; U&"..." / U&'...' escapes; function bodies
 // defined at or below migration 00549, which the migration scan skips; and TRUNCATE ... CASCADE,
-// which empties run_usage through its foreign key (migration 00062) without naming it.
+// which empties run_usage through its foreign key (migration 00062) without naming it; and a
+// function or DO body given as a single-quoted string (AS 'DELETE FROM run_usage'), which is lexed
+// as a string.
 func lexSQL(s string) (norm, mask string, err error) {
 	n, m := []byte(s), []byte(s)
 	if err := lexSQLInto(s, n, m); err != nil {
@@ -139,9 +145,22 @@ func lexSQLInto(src string, n, m []byte) error {
 			// same escape mode as the segment before it.
 			for c == '\'' {
 				j, nl := i, false
-				for j < len(src) && strings.IndexByte(" \t\r\n\f", src[j]) >= 0 {
-					nl = nl || src[j] == '\n' || src[j] == '\r'
-					j++
+				for j < len(src) {
+					if strings.IndexByte(" \t\r\n\f\v", src[j]) >= 0 {
+						nl = nl || src[j] == '\n' || src[j] == '\r'
+						j++
+					} else if src[j] == '-' && j+1 < len(src) && src[j+1] == '-' {
+						// A "--" comment is whitespace here; the newline that ends it is the
+						// required newline.
+						e := strings.IndexAny(src[j:], "\r\n")
+						if e < 0 {
+							e = len(src) - j
+						}
+						blank(j, j+e)
+						j += e
+					} else {
+						break
+					}
 				}
 				if !nl || j >= len(src) || src[j] != '\'' {
 					break
@@ -170,7 +189,15 @@ func lexSQLInto(src string, n, m []byte) error {
 			if err := lexSQLInto(src[bodyStart:bodyEnd], n[bodyStart:bodyEnd], m[bodyStart:bodyEnd]); err != nil {
 				return err
 			}
+			// The tags are delimiters, not text: blank them so a body that starts or ends at a
+			// tag ($$DELETE FROM run_usage$$) is not glued to the tag bytes.
+			blank(i, bodyStart)
+			blank(bodyEnd, bodyEnd+len(tag))
 			i = bodyEnd + len(tag)
+		case c == '\v':
+			// Vertical tab is whitespace in PostgreSQL 16+ but not in Go's regexp \s.
+			n[i], m[i] = ' ', ' '
+			i++
 		default:
 			i++
 		}
@@ -180,28 +207,33 @@ func lexSQLInto(src string, n, m []byte) error {
 
 func TestLexSQL(t *testing.T) {
 	type tc struct{ in, norm, mask string }
+	sp := func(n int) string { return strings.Repeat(" ", n) }
 	cases := map[string]tc{
-		"line comment":        {"a -- b 'c\nd", "a        \nd", "a        \nd"},
-		"block comment":       {"a /* b */ c", "a         c", "a         c"},
-		"nested comment":      {"a /* b /* c */ d */ e", "a                   e", "a                   e"},
-		"string":              {"a 'b/*' c", "a 'b/*' c", "a 'xxx' c"},
-		"doubled quote":       {"'a''/*b'", "'a''/*b'", "'xxxxxx'"},
-		"backslash literal":   {`'a\' /* c */`, `'a\'        `, `'xx'        `},
-		"escape string":       {`E'a\'/*' x`, `E'a\'/*' x`, `E'xxxxx' x`},
-		"lower escape":        {`e'\\' /**/`, `e'\\'     `, `e'xx'     `},
-		"E in identifier":     {`fooE'a\' /**/`, `fooE'a\'     `, `fooE'xx'     `},
-		"quoted ident":        {`"a/*""b" c`, `"a/*""b" c`, `"xxxxxx" c`},
-		"param":               {"$1 /* x */", "$1        ", "$1        "},
-		"identifier dollar":   {"foo$bar$ 'a'", "foo$bar$ 'a'", "foo$bar$ 'x'"},
-		"dollar body":         {"$$ 'a' -- c\nz $$", "$$ 'a'     \nz $$", "$$ 'x'     \nz $$"},
-		"tagged dollar":       {"$t$ a /* c */ $t$ b", "$t$ a         $t$ b", "$t$ a         $t$ b"},
-		"inner other tag":     {"$t$ a $$ /* c */ $t$ b", "$t$ a $$ /* c */ $t$ b", "$t$ a $$ /* c */ $t$ b"},
-		"string continuation": {"E'a'\n'\\' /* ';\nx;\n' */ '", "E'a'\n'\\' /* ';\nx;\n' */ '", "E'x'\n'xxxxxx';\nx;\n'xxxx'"},
-		"no continuation":     {"'a' 'b' /* c */", "'a' 'b'        ", "'x' 'x'        "},
-		"CR ends comment":     {"a -- b\rc", "a     \rc", "a     \rc"},
-		"unterminated str":    {"a 'b /* c", "a 'b /* c", "a 'b /* c"},
-		"unterminated $":      {"a $$ b /* c", "a $$ b /* c", "a $$ b /* c"},
-		"body unterminated":   {"$$ 'a /* c */ $$ d /* e */", "$$ 'a /* c */ $$ d        ", "$$ 'a /* c */ $$ d        "},
+		"line comment":            {"a -- b 'c\nd", "a        \nd", "a        \nd"},
+		"block comment":           {"a /* b */ c", "a         c", "a         c"},
+		"nested comment":          {"a /* b /* c */ d */ e", "a                   e", "a                   e"},
+		"string":                  {"a 'b/*' c", "a 'b/*' c", "a 'xxx' c"},
+		"doubled quote":           {"'a''/*b'", "'a''/*b'", "'xxxxxx'"},
+		"backslash literal":       {`'a\' /* c */`, `'a\'        `, `'xx'        `},
+		"escape string":           {`E'a\'/*' x`, `E'a\'/*' x`, `E'xxxxx' x`},
+		"lower escape":            {`e'\\' /**/`, `e'\\'     `, `e'xx'     `},
+		"E in identifier":         {`fooE'a\' /**/`, `fooE'a\'     `, `fooE'xx'     `},
+		"quoted ident":            {`"a/*""b" c`, `"a/*""b" c`, `"xxxxxx" c`},
+		"param":                   {"$1 /* x */", "$1        ", "$1        "},
+		"identifier dollar":       {"foo$bar$ 'a'", "foo$bar$ 'a'", "foo$bar$ 'x'"},
+		"dollar body":             {"$$ 'a' -- c\nz $$", sp(3) + "'a'" + sp(5) + "\nz" + sp(3), sp(3) + "'x'" + sp(5) + "\nz" + sp(3)},
+		"tagged dollar":           {"$t$ a /* c */ $t$ b", sp(4) + "a" + sp(13) + "b", sp(4) + "a" + sp(13) + "b"},
+		"inner other tag":         {"$t$ a $$ /* c */ $t$ b", sp(3) + " a $$ /* c */ " + sp(3) + " b", sp(3) + " a $$ /* c */ " + sp(3) + " b"},
+		"dollar tags blanked":     {"$$DELETE FROM x$$;", sp(2) + "DELETE FROM x" + sp(2) + ";", sp(2) + "DELETE FROM x" + sp(2) + ";"},
+		"vertical tab":            {"a\vb 'c\vd'", "a b 'c\vd'", "a b 'xxx'"},
+		"comment in continuation": {"E'a' -- c\n'\\' ' z", "E'a'" + sp(5) + "\n'\\' ' z", "E'x'" + sp(5) + "\n'xxx' z"},
+		"comment-only line":       {"E'a'\n-- c\n'\\' ' z", "E'a'\n" + sp(4) + "\n'\\' ' z", "E'x'\n" + sp(4) + "\n'xxx' z"},
+		"string continuation":     {"E'a'\n'\\' /* ';\nx;\n' */ '", "E'a'\n'\\' /* ';\nx;\n' */ '", "E'x'\n'xxxxxx';\nx;\n'xxxx'"},
+		"no continuation":         {"'a' 'b' /* c */", "'a' 'b'        ", "'x' 'x'        "},
+		"CR ends comment":         {"a -- b\rc", "a     \rc", "a     \rc"},
+		"unterminated str":        {"a 'b /* c", "a 'b /* c", "a 'b /* c"},
+		"unterminated $":          {"a $$ b /* c", "a $$ b /* c", "a $$ b /* c"},
+		"body unterminated":       {"$$ 'a /* c */ $$ d /* e */", sp(2) + " 'a /* c */ " + sp(2) + " d" + sp(8), sp(2) + " 'a /* c */ " + sp(2) + " d" + sp(8)},
 	}
 	for name, c := range cases {
 		norm, mask, err := lexSQL(c.in)

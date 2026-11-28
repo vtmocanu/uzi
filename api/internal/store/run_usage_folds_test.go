@@ -31,22 +31,29 @@ import (
 // scoped to the locked run (a top-level AND conjunct run_id = <the lock argument>, no top-level OR).
 //
 // Recorded limits (not detected): dynamic SQL built and run through EXECUTE format(...); COPY
-// run_usage FROM; U&"..." identifiers; functions defined at or below migration 00549; UPDATE,
-// INSERT and MERGE are checked for the lock only, not for scope; and TRUNCATE ... CASCADE on a
-// table that run_usage references, which empties run_usage through its foreign key (migration 00062);
+// run_usage FROM; U&"..." identifiers; functions defined at or below migration 00549; the scope of
+// UPDATE, INSERT and MERGE (checked for the lock only); TRUNCATE ... CASCADE on a table that
+// run_usage references, which empties run_usage through its foreign key (migration 00062);
 // DELETE FROM runs, which cascades to run_usage through the same foreign key; a dollar quote used
 // as a string literal, which is lexed as code; ALTER TABLE ... USING, DROP TABLE, DML through views
-// or rules, and triggers at or below migration 00549; the scope of UPDATE, INSERT and MERGE; and a
-// cast in the DELETE scope conjunct (run_id = $1::uuid), which fails closed (rejected).
+// or rules, and triggers at or below migration 00549; a function or DO body given as a
+// single-quoted string (AS 'DELETE FROM run_usage'); a catalog-qualified db.schema.run_usage (only
+// one qualifier is matched); TRUNCATE public.on, run_usage (the ON stop fires after a dot); a
+// plpgsql #variable_conflict use_variable directive with a variable named run_id; the refold check
+// does not verify that the lock and the delete run on the transaction-bound queries (qtx, not q);
+// and the shutdown-wiring check is a presence check that does not reject an extra Wait added before
+// the drain. A cast in the DELETE scope conjunct (run_id = $1::uuid) fails closed (rejected).
 
 var (
 	// DML writers of run_usage itself, never run_usage_legs / _messages / _tail_state /
-	// _model_totals / _fold_state: the table name must be followed by whitespace, "(", ";", "," or
-	// "*" (after an optional closing quote). The target may be quoted and/or schema-qualified
-	// ("run_usage", public.run_usage, public."run_usage"). Group 1 is the statement keyword.
+	// _model_totals / _fold_state: the table name (after an optional closing quote) must be
+	// followed by a non-identifier byte (not "." or "$") or the end of the text. The target may be
+	// quoted and/or schema-qualified ("run_usage", public.run_usage, public."run_usage") and may
+	// follow ONLY, with or without a parenthesis. Group 1 is the statement keyword, group 2 the
+	// byte after the name (empty at the end of the text).
 	// It runs on the comment-stripped text WITH quoted identifiers intact (norm), and a match only
 	// counts when its keyword is also visible in the mask, i.e. is not inside a string.
-	runUsageDMLRE = regexp.MustCompile(`(?is)\b(INSERT\s+INTO|MERGE\s+INTO|UPDATE|DELETE\s+FROM)\s*(?:ONLY\s+)?(?:"?[A-Za-z_]\w*"?\s*\.\s*)?"?run_usage"?[\s(;,*]`)
+	runUsageDMLRE = regexp.MustCompile(`(?is)\b(INSERT\s+INTO|MERGE\s+INTO|UPDATE|DELETE\s+FROM)\s*(?:ONLY\b\s*\(?\s*)?(?:"?[A-Za-z_]\w*"?\s*\.\s*)?"?run_usage"?([^A-Za-z0-9_$.\x{80}-\x{10FFFF}]|$)`)
 	// TRUNCATE [TABLE] [ONLY] t1 [*] [, ...]: run_usage may be anywhere in the target list, which
 	// stops at ON (GRANT / CREATE TRIGGER ... TRUNCATE ON), CASCADE, RESTRICT, RESTART, CONTINUE,
 	// ";" or the end of the statement.
@@ -55,7 +62,7 @@ var (
 	// CASCADE, RESTART etc. are unreserved keywords, so they only end the list in their option
 	// position: CASCADE/RESTRICT before the end, ";" or ")", RESTART/CONTINUE before IDENTITY.
 	truncateListEndRE = regexp.MustCompile(`(?i);|\bON\b|\b(?:CASCADE|RESTRICT)\b\s*(?:;|\)|$)|\b(?:RESTART|CONTINUE)\s+IDENTITY\b`)
-	truncateTargetRE  = regexp.MustCompile(`(?is)(?:^|,)\s*(?:ONLY\s+)?(?:"?[A-Za-z_]\w*"?\s*\.\s*)?"?run_usage"?\s*\*?\s*(?:,|$)`)
+	truncateTargetRE  = regexp.MustCompile(`(?is)(?:^|,)\s*(?:ONLY\b\s*\(?\s*)?(?:"?[A-Za-z_]\w*"?\s*\.\s*)?"?run_usage"?\s*\*?\s*(?:,|\)|$)`)
 	// The lock CTE must be defined as lk AND be the one the main statement reads. These run on the
 	// mask, so text in a string or quoted identifier never satisfies them.
 	runUsageLockDefRE = regexp.MustCompile(`(?is)\blk\s+AS\s*\(\s*SELECT\s+fn_run_usage_fold_lock\s*\(`)
@@ -82,7 +89,7 @@ func runUsageWrites(norm, mask string) []usageWrite {
 		if norm[m[2]:m[3]] != mask[m[2]:m[3]] {
 			continue
 		}
-		out = append(out, usageWrite{start: m[0], end: m[1] - 1, kind: strings.ToUpper(strings.Fields(norm[m[2]:m[3]])[0])})
+		out = append(out, usageWrite{start: m[0], end: m[4], kind: strings.ToUpper(strings.Fields(norm[m[2]:m[3]])[0])})
 	}
 	for _, m := range runUsageTruncateRE.FindAllStringIndex(norm, -1) {
 		if norm[m[0]:m[1]] != mask[m[0]:m[1]] {
@@ -230,11 +237,13 @@ func splitConjuncts(mask string) (spans [][2]int, hasOR bool) {
 // statement passes to fn_run_usage_fold_lock.
 func deleteScopeReason(norm, mask string, w usageWrite, arg string) string {
 	quals := []string{`run_usage`, `"run_usage"`}
+	// An alias hides the table name (PostgreSQL), so with one only <alias>.run_id qualifies; a
+	// run_usage.run_id would resolve to some USING item.
 	if m := usageAliasRE.FindStringSubmatch(mask[w.end:]); m != nil {
 		switch strings.ToUpper(m[1]) {
 		case "WHERE", "USING", "RETURNING":
 		default:
-			quals = append(quals, regexp.QuoteMeta(m[1]))
+			quals = []string{regexp.QuoteMeta(m[1])}
 		}
 	}
 	q := `(?:(?:` + strings.Join(quals, "|") + `)\s*\.\s*)?run_id`
@@ -339,7 +348,8 @@ func unguardedRunUsageWrite(stmt string) (bool, error) {
 // is caught even though the lexer reads its tail as a string, and a string the lexer rejects is
 // scanned as is. More text counts, never less.
 func writesRunUsage(s string) bool {
-	if len(runUsageWrites(s+" ", s+" ")) > 0 {
+	raw := strings.ReplaceAll(s, "\v", " ") + " " // \v is whitespace in PostgreSQL, not in RE2 \s
+	if len(runUsageWrites(raw, raw)) > 0 {
 		return true
 	}
 	norm, mask, err := lexSQL(s)
@@ -347,7 +357,7 @@ func writesRunUsage(s string) bool {
 }
 
 func TestWritesRunUsageGoLiterals(t *testing.T) {
-	for _, s := range []string{"'; DELETE FROM run_usage; --'", "x' DELETE FROM run_usage '", "DELETE FROM /* c */ run_usage WHERE x", "DELETE FROM run_usage /*"} {
+	for _, s := range []string{"'; DELETE FROM run_usage; --'", "x' DELETE FROM run_usage '", "DELETE FROM /* c */ run_usage WHERE x", "DELETE FROM run_usage /*", "DELETE\vFROM\vrun_usage\vWHERE x", "TRUNCATE run_usage\v;", "WITH d AS (DELETE FROM run_usage) SELECT 1", "DELETE FROM ONLY (run_usage)"} {
 		if !writesRunUsage(s) {
 			t.Errorf("writesRunUsage(%q) = false, want true", s)
 		}
@@ -406,6 +416,22 @@ func TestRunUsageWriterClassifier(t *testing.T) {
 		"WITH lk AS (SELECT fn_run_usage_fold_lock($1) AS ok) DELETE FROM run_usage WHERE run_id = $1", // CTE never read
 		"DELETE FROM run_usage WHERE run_id = $1 -- fn_run_usage_fold_lock( FROM lk",                   // lock only in a comment
 		"TRUNCATE run_usage;",
+		// The target ends at ")" or the end of the text, not only at whitespace.
+		"WITH d AS (DELETE FROM run_usage) SELECT 1",
+		"WITH d AS (DELETE FROM \"run_usage\") SELECT 1",
+		"DELETE FROM run_usage",
+		"DELETE FROM \"run_usage\"",
+		// ONLY with a parenthesis or an adjacent quote.
+		"DELETE FROM ONLY (run_usage) WHERE run_id = $1",
+		"UPDATE ONLY (run_usage) SET a = 1",
+		"TRUNCATE ONLY (run_usage)",
+		"DELETE FROM ONLY\"run_usage\" WHERE run_id = $1",
+		// A write at the very end of a dollar body.
+		"CREATE FUNCTION f() RETURNS void LANGUAGE sql AS $$DELETE FROM run_usage$$;",
+		"CREATE FUNCTION f() RETURNS void LANGUAGE sql AS $$TRUNCATE run_usage$$;",
+		// Vertical tab is whitespace in PostgreSQL 16+.
+		"DELETE\vFROM\vrun_usage\vWHERE\vrun_id = 99",
+		"TRUNCATE run_usage\v;",
 		// lk is referenced only by a different, unused CTE: the main statement never reads it.
 		"WITH lk AS (SELECT fn_run_usage_fold_lock($1) AS ok), other AS (SELECT 1 FROM lk) DELETE FROM run_usage WHERE run_id = $1",
 		// Quoted and schema-qualified targets are still run_usage writers.
@@ -477,6 +503,8 @@ func TestRunUsageWriterClassifier(t *testing.T) {
 		{lk1 + "DELETE FROM run_usage WHERE CASE WHEN a THEN b AND run_id = $1 AND c END AND" + lkOK, "lacks a run_id"},
 		{lk1 + "DELETE FROM run_usage WHERE" + lkOK + " RETURNING a AND run_id = $1", "lacks a run_id"},
 		{lk1 + "DELETE FROM run_usage WHERE run_id = $1::uuid AND" + lkOK, "lacks a run_id"},
+		// An alias hides the table name: run_usage.run_id resolves to the USING item.
+		{lk1 + "DELETE FROM run_usage AS ru USING other AS run_usage WHERE run_usage.run_id = $1 AND" + lkOK, "lacks a run_id"},
 	}
 	for _, c := range reasons {
 		norm, mask, err := lexSQL(c.sql)
@@ -564,6 +592,15 @@ func TestMigrationViolations(t *testing.T) {
 		"DO $$ BEGIN IF EXISTS (WITH lk AS (SELECT fn_run_usage_fold_lock(1) AS ok) SELECT 1 FROM lk) THEN DELETE FROM run_usage WHERE true; END IF; END $$;",
 		"SELECT E'a'\n'\\' /* ';\nDELETE FROM run_usage;\nSELECT ' */ ';",
 		"SELECT 1 -- x\rDELETE FROM run_usage WHERE run_id = $1;",
+		// A "--" comment between continued string segments, in E mode.
+		"SELECT E'a' -- c\n'\\' ' ; DELETE FROM run_usage WHERE run_id = 2; SELECT 'b';",
+		"SELECT E'a'\n-- c\n'\\' ' ; DELETE FROM run_usage WHERE run_id = 2; SELECT 'b';",
+		"SELECT E'a' -- c\n'\\' /* ';\nDELETE FROM run_usage;\nSELECT ' */ ';",
+		"WITH d AS (DELETE FROM run_usage) SELECT 1;",
+		"CREATE FUNCTION f() RETURNS void LANGUAGE sql AS $$DELETE FROM run_usage$$;",
+		"CREATE FUNCTION f() RETURNS void LANGUAGE sql AS $$TRUNCATE run_usage$$;",
+		"DELETE\vFROM\vrun_usage\vWHERE\vrun_id = 99;",
+		"TRUNCATE run_usage\v;",
 	}
 	for _, text := range mustReport {
 		bad, err := migrationViolations(text)
