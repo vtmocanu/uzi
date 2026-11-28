@@ -27,8 +27,12 @@ import (
 // leaves behind with UZI_EVIDENCE_KEEP=1. A measurement harness, not a gate: compiled only with
 // -tags analyticsevidence and run only with UZI_ANALYTICS_PRECOMPUTE_EVIDENCE=1. It does not seed.
 // It fails first unless the database carries the throwaway marker row and the retained seed. It
-// writes the stored documents (Publish) and one admin user (removed at the end; that delete
-// empties the stored set through the users-delete invalidation trigger, as intended). Run:
+// applies migrations (store.Migrate), writes the stored documents (Publish) and one admin user
+// (removed at the end; that delete empties the stored set through the users-delete invalidation
+// trigger, as intended). With UZI_PRECOMPUTE_EVIDENCE_FOLD=1 the production folder also writes
+// run_usage_fold_state and run_usage_model_folds permanently: measure the unfolded case first,
+// or reseed, because nothing restores those rows. The during-build window is confirmed active
+// at each sample's start only (one pg_stat_activity probe before the request). Run:
 //
 //	cd api && UZI_ANALYTICS_PRECOMPUTE_EVIDENCE=1 UZI_TEST_DATABASE_URL='postgres://...' \
 //	  go test -tags analyticsevidence -count=1 -v -p 1 -timeout 58m \
@@ -492,6 +496,9 @@ sampling:
 			}
 		}
 		logf("DURING-BUILD scope=%s samples=%d confirmed_active=%d statuses[%s] ok: %s; confirmed-only ok: %s", sc.name, n, confirmed, pcCounts(counts), pcStats(all), pcStats(conf))
+		if n == 0 || confirmed == 0 {
+			t.Errorf("DURING-BUILD scope=%s: %d samples, %d confirmed active; the during-build window was not observed", sc.name, n, confirmed)
+		}
 	}
 	for i, s := range samples {
 		logf("DURING-BUILD sample=%d scope=%s class=%s ms=%.1f build_state=%s confirmed=%v", i+1, s.scope, pcClass(s.r), pcMs(s.r.dur), s.state, s.confirmed)
