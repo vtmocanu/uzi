@@ -170,7 +170,11 @@ func TestUsageFolderWaitStopsNewKicksAndIsBoundedByCtx(t *testing.T) {
 		},
 	})
 	f.Notify(uuid.New(), "completed")
-	<-entered
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("materialize never started after Notify")
+	}
 	wctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	start := time.Now()
