@@ -195,6 +195,10 @@ export interface AdminSharedProvider {
   credential_mode: "per_user_key" | "operator_key";
   selected_user_count: number;
   attached_key_count: number;
+  /** Recipients of an organization-funded definition (PRD #4540 M2): every user when true, plus
+   *  `named_grant_count` individually granted users. Always present; false and 0 for per_user_key. */
+  operator_all_users: boolean;
+  named_grant_count: number;
   /** Present only for an organization-funded definition (credential_mode "operator_key", PRD #4540):
    *  the state of its one organization key. Never the key itself. */
   operator_key?: {
@@ -207,6 +211,21 @@ export interface AdminSharedProvider {
 
 export interface AdminSharedProviderList {
   providers: AdminSharedProvider[];
+}
+
+/** One page of GET /api/admin/providers/{id}/grants (PRD #4540 M2): a keyset page on user_id.
+ *  Items carry only the user id; the admin UI joins them to GET /api/admin/users. */
+export interface AdminProviderGrants {
+  operator_all_users: boolean;
+  named_grant_count: number;
+  grants: { user_id: string }[];
+  /** null on the last page; otherwise pass it back as `cursor`. */
+  next_cursor: string | null;
+}
+
+/** POST /api/admin/providers/{id}/revoke-recipients response (all-users is turned off as well). */
+export interface AdminRevokeRecipients {
+  named_grants_removed: number;
 }
 
 /** POST /api/admin/providers body: keyless (each user attaches their own key). The client

@@ -19,12 +19,12 @@
 // Server strings (names, URLs, model names) render as React text nodes only; nothing here
 // uses dangerouslySetInnerHTML.
 
-import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from "react";
-import { api, type AdminSharedProvider, type ProviderAuthStyle, type ProviderDTO, type ProviderModelMap, type ProviderProbe } from "../lib/api";
+import { useCallback, useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { api, type AdminSharedProvider, type ProviderAuthStyle, type ProviderDTO, type ProviderModelMap, type ProviderProbe, type User } from "../lib/api";
 import { ApiError, errorMessage } from "../lib/apiError";
 import { sanitizeLabel } from "../lib/sanitizeLabel";
 import { useAsyncData } from "../lib/useAsyncData";
-import { Alert, Badge, Button, Card, EmptyState, Field, Input, ListSkeleton, Select } from "../components/ui";
+import { Alert, Badge, Button, Card, EmptyState, Field, Input, ListSkeleton, Select, Toggle } from "../components/ui";
 import { AdminShell } from "../components/AdminShell";
 import { KeyIcon, LockIcon } from "../components/icons";
 import {
@@ -56,7 +56,14 @@ const REASONS: Record<string, (engine: Engine) => string> = {
   provider_not_operator_key: () =>
     "This definition is not organization-funded: each user attaches their own key to it, so there is no organization key to manage.",
   provider_probe_rate_limited: () => "Tests are rate limited. Wait a moment, then test again.",
+  provider_grant_cap_reached: () =>
+    "This definition already has 10,000 named recipients, the limit. Remove one first, or give access to all users instead.",
+  user_not_found: () => "That user no longer exists, so access was not granted. The user list has been refreshed; pick another.",
 };
+
+// Default-deny (PRD #4540 M2): an organization-funded definition has no recipients until the
+// admin grants access, and every granted user's runs receive the one organization key.
+const DENY_COPY = "No user can see or use this definition until you grant access; granted users' runs receive the organization key.";
 
 // The server's stale-Test 409 carries no reason code, only its message.
 const STALE_TEST_COPY = "The provider or key changed while testing; test again.";
@@ -143,6 +150,20 @@ export function AdminSharedProviders() {
   const [editing, setEditing] = useState<string | null>(null);
   const [confirm, setConfirm] = useState<Confirm>(null);
   const [notice, setNotice] = useState("");
+  // The admin user list, read once when an organization-funded card is on screen: grant rows carry
+  // only a user id, and the picker offers these users. undefined = not read yet, null = read failed.
+  const hasOperator = providers.some((p) => p.credential_mode === "operator_key");
+  const [users, setUsers] = useState<User[] | null | undefined>(undefined);
+  const loadUsers = useCallback(async () => {
+    try {
+      setUsers((await api.listUsers()).users);
+    } catch {
+      setUsers(null);
+    }
+  }, []);
+  useEffect(() => {
+    if (hasOperator && users === undefined) void loadUsers();
+  }, [hasOperator, users, loadUsers]);
 
   const reset = () => {
     setNotice("");
@@ -168,8 +189,7 @@ export function AdminSharedProviders() {
         <>
           Shared providers are Claude or Codex gateways any user can pick as their source for that engine. You fix the
           engine, endpoint and auth style and map the models. With a per-user key, each user attaches their own key, which
-          you never see. With an organization key, you set one key for the definition; that mode is staged and not yet
-          available to users.
+          you never see. With an organization key, you set one key for the definition and choose which users can use it.
         </>
       }
     >
@@ -188,7 +208,7 @@ export function AdminSharedProviders() {
       {creating ? (
         <CreateForm allowed={data?.allowed ?? []} onCancel={() => setCreating(false)} onCreated={(p) => done(
           p.credential_mode === "operator_key"
-            ? `Shared provider ${sanitizeLabel(p.name)} created. Staged: set its organization key next; it is not yet available to users.`
+            ? `Shared provider ${sanitizeLabel(p.name)} created. Set its organization key and grant access next: no user can see or use it until you do.`
             : `Shared provider ${sanitizeLabel(p.name)} created. Users can now attach their own key to it.`,
         )} />
       ) : (
@@ -228,6 +248,8 @@ export function AdminSharedProviders() {
                   onDone={done}
                   onApply={apply}
                   onStale={reload}
+                  users={users}
+                  onUsersStale={loadUsers}
                 />
               )}
             </li>
@@ -265,8 +287,12 @@ function ProviderCard({
   onDone,
   onApply,
   onStale,
+  users,
+  onUsersStale,
 }: {
   provider: AdminSharedProvider;
+  users: User[] | null | undefined;
+  onUsersStale: () => Promise<void>;
   confirm: "retire" | "delete" | null;
   onEdit: () => void;
   onAsk: (kind: "retire" | "delete") => void;
@@ -348,7 +374,12 @@ function ProviderCard({
         )}
       </ul>
 
-      {p.credential_mode === "operator_key" && <OperatorKeyPanel provider={p} name={name} onDone={onDone} onApply={onApply} onStale={onStale} />}
+      {p.credential_mode === "operator_key" && (
+        <>
+          <OperatorKeyPanel provider={p} name={name} onDone={onDone} onApply={onApply} onStale={onStale} />
+          <RecipientsPanel provider={p} name={name} users={users} onUsersStale={onUsersStale} onDone={onDone} onStale={onStale} />
+        </>
+      )}
 
       <FixedFacts baseUrl={p.base_url} auth={p.auth_style} />
 
@@ -378,6 +409,11 @@ function ProviderCard({
             Retire {name}? No new run can start on it and nobody can newly select it. {plural(selected, "user keeps", "users keep")} it
             selected but cannot use it until they choose another source; runs already started keep their binding. This cannot be undone.
           </p>
+          {operatorMode && (
+            <p className="text-muted" data-testid={`retire-effect-${p.id}`}>
+              Retire stops fresh use only: runs already started keep the organization key. To stop everyone, disable or delete the key.
+            </p>
+          )}
         </ConfirmBox>
       )}
 
@@ -498,10 +534,6 @@ function OperatorKeyPanel({
         </p>
       </div>
 
-      <p className="text-xs text-warn" data-testid={`staged-notice-${p.id}`}>
-        Staged: not yet available to users or runs.
-      </p>
-
       <div data-testid={`probe-results-${p.id}`} aria-live="polite" className="space-y-0.5 text-xs">
         {shownProbe ? (
           <>
@@ -540,7 +572,7 @@ function OperatorKeyPanel({
           </div>
           <p className="text-xs text-faint">
             {key.present
-              ? "Replacing the key clears the last Test result. Once recipients are granted access in a later release, copies they already hold keep working until the old key is rotated at the gateway."
+              ? "Replacing the key clears the last Test result. Copies recipients already obtained keep working until the old key is rotated at the gateway."
               : "Stored encrypted and never shown again."}
           </p>
         </div>
@@ -562,8 +594,8 @@ function OperatorKeyPanel({
               </Button>
               <p className="max-w-xs text-xs text-faint" data-testid={`disable-effect-${p.id}`}>
                 {key.enabled
-                  ? "Marks the key unusable for runs once recipients have access; frozen copies held by recipients are not revoked."
-                  : "Marks the key usable again for runs once recipients have access."}
+                  ? "Stops everyone at the next claim: no recipient's run receives the key. Copies recipients already obtained are not revoked; rotate the key at the gateway for that."
+                  : "Makes the key usable again: recipients' runs receive it from their next claim."}
               </p>
             </div>
           )}
@@ -610,7 +642,9 @@ function OperatorKeyPanel({
               >
                 Delete key
               </Button>
-              <p className="max-w-xs text-xs text-faint">Removes the key from uzi; the definition stays.</p>
+              <p className="max-w-xs text-xs text-faint" data-testid={`delete-key-effect-${p.id}`}>
+                Stops everyone at the next claim and removes the key from uzi; the definition and its recipients stay.
+              </p>
             </div>
           )}
         </div>
@@ -635,13 +669,285 @@ function OperatorKeyPanel({
           }
         >
           <p>
-            Delete the organization key of {name}? The definition stays; set a key again to use it later.
-            Copies recipients may already hold, once access is granted in a later release, are not taken back; only rotating the key at the gateway revokes them.
+            Delete the organization key of {name}? Everyone stops at the next claim. The definition and its recipients stay;
+            set a key again to use it later. Copies recipients already obtained are not taken back; only rotating the key at the gateway revokes them.
           </p>
         </ConfirmBox>
       )}
       {!confirmingDelete && error && <Alert message={error} />}
     </div>
+  );
+}
+
+// RecipientsPanel is who may use an organization-funded definition (PRD #4540 M2): the all-users
+// switch, the named grants (paged; each row joined to the admin user list for its name) and the
+// incident stop. Default-deny: with neither, nobody sees the definition. Every write is idempotent
+// on the server; after one the page reloads, and a changed count refetches the first grant page.
+// On a retired definition only removal stays: no new grant and no switching all users on, while
+// removing a grant, turning all users off and revoking everyone stay available (R11).
+const GRANTS_PAGE = 50;
+
+function userLabel(u: User | undefined, id: string): { name: string; detail: string } {
+  if (!u) return { name: "Unknown user", detail: id };
+  const display = u.display_name?.trim();
+  return display
+    ? { name: sanitizeLabel(display), detail: sanitizeLabel(u.email) }
+    : { name: sanitizeLabel(u.email), detail: u.is_active ? "" : "inactive" };
+}
+
+function RecipientsPanel({
+  provider: p,
+  name,
+  users,
+  onUsersStale,
+  onDone,
+  onStale,
+}: {
+  provider: AdminSharedProvider;
+  name: string;
+  users: User[] | null | undefined;
+  onUsersStale: () => Promise<void>;
+  onDone: (message: string) => Promise<void>;
+  onStale: () => Promise<void>;
+}) {
+  const [grants, setGrants] = useState<string[]>([]);
+  const [next, setNext] = useState<string | null>(null);
+  const [loadingGrants, setLoadingGrants] = useState(true);
+  const [grantsError, setGrantsError] = useState("");
+  const [pick, setPick] = useState("");
+  const [working, setWorking] = useState(false);
+  const [error, setError] = useState("");
+  const [confirmingRevoke, setConfirmingRevoke] = useState(false);
+  const confirmRef = useRef<HTMLDivElement>(null);
+  const pickerId = useId();
+  const allUsersHelpId = useId();
+  const allUsers = p.operator_all_users;
+  const named = p.named_grant_count;
+  const key = p.operator_key;
+  const keyUsable = key?.present === true && key.enabled;
+  const byId = new Map((users ?? []).map((u) => [u.id, u]));
+
+  const loadPage = useCallback(async (cursor?: string) => {
+    setLoadingGrants(true);
+    setGrantsError("");
+    try {
+      const page = await api.adminListProviderGrants(p.id, { cursor, limit: GRANTS_PAGE });
+      const ids = page.grants.map((g) => g.user_id);
+      setGrants((prev) => (cursor ? [...prev, ...ids] : ids));
+      setNext(page.next_cursor);
+    } catch (err) {
+      setGrantsError(sharedError(err, "Failed to load the recipients", p.engine));
+    } finally {
+      setLoadingGrants(false);
+    }
+  }, [p.id, p.engine]);
+
+  // The first page again whenever the definition's recipient counts change (a write here, or a
+  // reload that saw another admin's).
+  useEffect(() => { void loadPage(); }, [loadPage, named, allUsers]);
+
+  useEffect(() => {
+    if (confirmingRevoke) confirmRef.current?.querySelector<HTMLButtonElement>("button[data-confirm-cancel]")?.focus();
+  }, [confirmingRevoke]);
+
+  const run = async (fn: () => Promise<void>, fallback: string) => {
+    setError("");
+    setWorking(true);
+    try {
+      await fn();
+    } catch (err) {
+      setError(sharedError(err, fallback, p.engine));
+      const reason = err instanceof ApiError ? (err.body as { reason?: string } | null)?.reason : undefined;
+      if (reason === "user_not_found") {
+        setPick("");
+        await onUsersStale();
+      } else if (err instanceof ApiError && (err.status === 409 || err.status === 404)) {
+        await onStale();
+      }
+    } finally {
+      setWorking(false);
+    }
+  };
+
+  const granted = new Set(grants);
+  const candidates = (users ?? []).filter((u) => !granted.has(u.id));
+  const summary = allUsers
+    ? named > 0
+      ? `All users have access. ${plural(named, "named grant is", "named grants are")} kept and still apply if all users is turned off.`
+      : "All users have access."
+    : named > 0
+      ? `${plural(named, "named user has", "named users have")} access.`
+      : "No recipients yet.";
+
+  return (
+    <section
+      className="space-y-3 rounded-lg border border-edge px-3 py-2 text-sm"
+      aria-label={`Recipients of ${name}`}
+      data-testid={`recipients-${p.id}`}
+    >
+      <div className="space-y-1">
+        <h3 className="font-medium text-fg">Recipients</h3>
+        <p className="text-muted" data-testid={`access-notice-${p.id}`}>{DENY_COPY}</p>
+        <p className="text-fg" data-testid={`recipient-summary-${p.id}`}>{summary}</p>
+        {(allUsers || named > 0) && !keyUsable && !p.retired && (
+          <p className="text-xs text-warn" data-testid={`recipients-blocked-${p.id}`}>
+            Recipients can see this definition but cannot run on it until its key is set and enabled.
+          </p>
+        )}
+        {p.retired && (
+          <p className="text-xs text-faint">Retired: no new grants. You can still remove recipients.</p>
+        )}
+      </div>
+
+      <div className="flex items-start gap-3">
+        <Toggle
+          checked={allUsers}
+          disabled={working || (p.retired && !allUsers)}
+          label={`All users can use ${name}`}
+          aria-describedby={allUsersHelpId}
+          onChange={(enabled) => void run(async () => {
+            await api.adminSetProviderAllUsers(p.id, enabled);
+            await onDone(enabled ? `Every user can now use ${name}.` : `All users turned off for ${name}; named grants still apply.`);
+          }, "Failed to change all-users access")}
+        />
+        <div className="min-w-0 space-y-0.5">
+          <p className="text-fg">All users</p>
+          <p id={allUsersHelpId} className="text-xs text-faint" data-testid={`all-users-effect-${p.id}`}>
+            {allUsers
+              ? "Every user, including users added later, can select this definition. Turning it off leaves only the named users below, from their next claim."
+              : "Off: only the named users below have access. On gives every user, including users added later, the organization key in their runs."}
+          </p>
+        </div>
+      </div>
+
+      <div className="space-y-2">
+        <p className="text-muted" data-testid={`named-count-${p.id}`}>
+          Named users: {named.toLocaleString()}
+        </p>
+        {grantsError && <Alert message={grantsError} />}
+        {users === null && (
+          <p className="text-xs text-warn">The user list could not be read, so names are not shown and no user can be picked.</p>
+        )}
+        {grants.length > 0 && (
+          <ul className="divide-y divide-edge rounded-md border border-edge" aria-label={`Users granted ${name}`}>
+            {grants.map((id) => {
+              const label = userLabel(byId.get(id), id);
+              return (
+                <li key={id} className="flex flex-wrap items-center justify-between gap-2 px-2 py-1.5">
+                  <span className="min-w-0 [overflow-wrap:anywhere]">
+                    <span className="text-fg">{label.name}</span>
+                    {label.detail && <span className="ml-2 text-xs text-faint">{label.detail}</span>}
+                  </span>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    disabled={working}
+                    aria-label={`Remove ${label.name} from ${name}`}
+                    onClick={() => void run(async () => {
+                      await api.adminDeleteProviderGrant(p.id, id);
+                      await onDone(`${label.name} no longer has access to ${name}. Their runs stop receiving the key at the next claim.`);
+                    }, "Failed to remove the recipient")}
+                  >
+                    Remove
+                  </Button>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+        {loadingGrants && grants.length === 0 && named > 0 && <p className="text-xs text-faint">Loading recipients…</p>}
+        {next && (
+          <Button variant="secondary" size="sm" disabled={loadingGrants} onClick={() => void loadPage(next)}>
+            {loadingGrants ? "Loading…" : "Show more recipients"}
+          </Button>
+        )}
+
+        {!p.retired && users && (
+          <div className="space-y-1">
+            <label htmlFor={pickerId} className="block text-muted">Grant access to a user</label>
+            <div className="flex flex-wrap gap-2">
+              <Select id={pickerId} className="min-w-0 flex-1" value={pick} onChange={(e) => setPick(e.target.value)}>
+                <option value="">{candidates.length ? "Choose a user" : "Every listed user is already named"}</option>
+                {candidates.map((u) => {
+                  const l = userLabel(u, u.id);
+                  return <option key={u.id} value={u.id}>{l.detail ? `${l.name} (${l.detail})` : l.name}</option>;
+                })}
+              </Select>
+              <Button
+                size="sm"
+                disabled={working || pick === ""}
+                aria-label={`Grant ${name} to the chosen user`}
+                onClick={() => {
+                  const id = pick;
+                  const label = userLabel(byId.get(id), id).name;
+                  void run(async () => {
+                    await api.adminPutProviderGrant(p.id, id);
+                    setPick("");
+                    await onDone(`${label} can now use ${name}; their runs receive the organization key.`);
+                  }, "Failed to grant access");
+                }}
+              >
+                Grant access
+              </Button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div className="space-y-1 border-t border-edge pt-3" data-testid={`incident-stop-${p.id}`}>
+        <h4 className="font-medium text-fg">Stop access</h4>
+        <div className="flex flex-wrap items-start gap-x-6 gap-y-2">
+          <div className="space-y-1">
+            <Button
+              variant="danger"
+              size="sm"
+              disabled={working}
+              onClick={() => { setError(""); setConfirmingRevoke(true); }}
+              aria-label={`Revoke all recipients of ${name}`}
+            >
+              Revoke all recipients
+            </Button>
+            <p className="max-w-sm text-xs text-faint" data-testid={`revoke-effect-${p.id}`}>
+              Turns all users off and removes every named grant. Takes effect at the next claim; copies already
+              obtained are revoked only by rotating the key at the gateway.
+            </p>
+          </div>
+          <p className="max-w-sm text-xs text-faint" data-testid={`stop-scope-${p.id}`}>
+            Disabling or deleting the key stops everyone at the next claim. Retire stops fresh use only: runs
+            already started keep the key.
+          </p>
+        </div>
+      </div>
+
+      {confirmingRevoke && (
+        <ConfirmBox
+          refEl={confirmRef}
+          label={`Confirm revoking all recipients of ${name}`}
+          error={error}
+          actions={
+            <>
+              <Button variant="dangerSolid" size="sm" disabled={working} onClick={() => void run(async () => {
+                const r = await api.adminRevokeProviderRecipients(p.id);
+                setConfirmingRevoke(false);
+                await onDone(
+                  `Revoked every recipient of ${name}: all users turned off and ${plural(r.named_grants_removed, "named grant", "named grants")} removed. ` +
+                  "Runs stop receiving the key at their next claim; rotate the key at the gateway to revoke copies already obtained.",
+                );
+              }, "Failed to revoke the recipients")}>
+                {working ? "Revoking…" : "Revoke all recipients"}
+              </Button>
+              <Button variant="ghost" size="sm" disabled={working} onClick={() => setConfirmingRevoke(false)} data-confirm-cancel>Cancel</Button>
+            </>
+          }
+        >
+          <p>
+            Revoke every recipient of {name}? All users is turned off and {plural(named, "named grant is", "named grants are")} removed.
+            Nobody can start a run on it from the next claim. Copies already obtained are revoked only by rotating the key at the gateway.
+          </p>
+        </ConfirmBox>
+      )}
+      {!confirmingRevoke && error && <Alert message={error} />}
+    </section>
   );
 }
 
@@ -719,7 +1025,7 @@ function CreateForm({
         <h2 className="text-sm font-semibold text-fg">New shared provider</h2>
         <p className="text-sm text-muted">
           {operatorMode
-            ? "You set one organization key after creating it. Staged: not yet available to users or runs; once access can be granted in a later release, granted users' runs will receive it."
+            ? `You set one organization key after creating it. ${DENY_COPY}`
             : "No key here: each user attaches their own."}{" "}
           The engine, endpoint and auth style cannot be changed after you create it; a different gateway needs a new
           definition, which users select again on purpose.
@@ -781,8 +1087,8 @@ function CreateForm({
             className="space-y-2 rounded-lg border border-warn/50 bg-warn/5 px-3 py-2 text-sm text-fg"
           >
             <p className="font-medium text-warn">Before you create an organization-funded definition</p>
-            <p data-testid="staged-notice-new">
-              Staged: not yet available to users or runs. These terms apply once recipients are granted access, in a later release.
+            <p data-testid="access-notice-new">
+              {DENY_COPY} These terms apply to every user you grant access to.
             </p>
             <ul className="list-disc space-y-1.5 pl-5">
               {OPERATOR_DISCLOSURES.map((d) => (

@@ -53,3 +53,23 @@ it("sends the organization-key create fields and calls the four key routes with 
   await api.adminTestOperatorKey("p1");
   expect(call(4)).toMatchObject({ url: "/api/admin/providers/p1/test", method: "POST" });
 });
+it("calls the recipient grant routes with the right verbs, paths and bodies (PRD #4540 M2)", async () => {
+  const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => new Response(JSON.stringify({}), { status: 200 }));
+  vi.stubGlobal("fetch", fetchMock);
+  const call = (i: number) => {
+    const [url, init] = fetchMock.mock.calls[i] as unknown as [string, RequestInit];
+    return { url, method: init.method ?? "GET", body: init.body ? JSON.parse(init.body as string) : undefined };
+  };
+  await api.adminListProviderGrants("p 1");
+  expect(call(0)).toMatchObject({ url: "/api/admin/providers/p%201/grants", method: "GET" });
+  await api.adminListProviderGrants("p1", { cursor: "u/1", limit: 50 });
+  expect(call(1).url).toBe("/api/admin/providers/p1/grants?cursor=u%2F1&limit=50");
+  await api.adminPutProviderGrant("p1", "u 1");
+  expect(call(2)).toMatchObject({ url: "/api/admin/providers/p1/grants/u%201", method: "PUT", body: undefined });
+  await api.adminDeleteProviderGrant("p1", "u1");
+  expect(call(3)).toMatchObject({ url: "/api/admin/providers/p1/grants/u1", method: "DELETE" });
+  await api.adminSetProviderAllUsers("p1", true);
+  expect(call(4)).toMatchObject({ url: "/api/admin/providers/p1/all-users", method: "PUT", body: { enabled: true } });
+  await api.adminRevokeProviderRecipients("p1");
+  expect(call(5)).toMatchObject({ url: "/api/admin/providers/p1/revoke-recipients", method: "POST" });
+});

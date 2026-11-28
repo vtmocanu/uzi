@@ -191,6 +191,8 @@ import type {
   AdminSharedProvider,
   AdminSharedProviderList,
   AdminSharedProviderCreateInput,
+  AdminProviderGrants,
+  AdminRevokeRecipients,
   CreateProviderInput,
   ProviderAuthStyle,
   ProviderDTO,
@@ -2290,6 +2292,25 @@ const realApi = {
     request<{ provider: AdminSharedProvider }>("DELETE", `/admin/providers/${encodeURIComponent(id)}/key`),
   adminTestOperatorKey: (id: string) =>
     request<{ probe: ProviderProbe }>("POST", `/admin/providers/${encodeURIComponent(id)}/test`),
+  // Recipient grants of an operator_key definition (PRD #4540 M2). The page read sits in the admin
+  // read group; the writes are cookie-only admin routes. PUT/DELETE of a grant and the all-users PUT
+  // are idempotent 204s; PUT of an unknown user is a 404 user_not_found, a new grant at the cap a
+  // 409 provider_grant_cap_reached; a per_user_key definition is a 409 provider_not_operator_key.
+  adminListProviderGrants: (id: string, opts: { cursor?: string; limit?: number } = {}) => {
+    const q = new URLSearchParams();
+    if (opts.cursor) q.set("cursor", opts.cursor);
+    if (opts.limit !== undefined) q.set("limit", String(opts.limit));
+    const qs = q.toString();
+    return request<AdminProviderGrants>("GET", `/admin/providers/${encodeURIComponent(id)}/grants${qs ? `?${qs}` : ""}`);
+  },
+  adminPutProviderGrant: (id: string, userId: string) =>
+    request<null>("PUT", `/admin/providers/${encodeURIComponent(id)}/grants/${encodeURIComponent(userId)}`),
+  adminDeleteProviderGrant: (id: string, userId: string) =>
+    request<null>("DELETE", `/admin/providers/${encodeURIComponent(id)}/grants/${encodeURIComponent(userId)}`),
+  adminSetProviderAllUsers: (id: string, enabled: boolean) =>
+    request<null>("PUT", `/admin/providers/${encodeURIComponent(id)}/all-users`, { enabled }),
+  adminRevokeProviderRecipients: (id: string) =>
+    request<AdminRevokeRecipients>("POST", `/admin/providers/${encodeURIComponent(id)}/revoke-recipients`),
   adminPatchSharedProvider: (id: string, body: { name?: string; model_map?: ProviderModelMap }) =>
     request<{ provider: AdminSharedProvider }>("PATCH", `/admin/providers/${encodeURIComponent(id)}`, body),
   adminRetireSharedProvider: (id: string) =>

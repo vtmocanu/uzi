@@ -12,6 +12,13 @@
 // cannot see them, which is the server's rule (they are not the caller's providers, and the
 // owner routes answer 404). Only the admin routes below read it. The key is never kept, only
 // whether one is set, enabled, and its last Test result.
+//
+// Recipients (PRD #4540 M2) are a second map keyed by definition id: the all-users switch and the
+// named grants. The admin routes mirror the server: default-deny (no recipients), idempotent grant
+// PUT and DELETE (a PUT of an existing grant is accepted even at the cap), a 404 user_not_found for
+// a user not on the roster, a 409 provider_grant_cap_reached for a new grant at the cap, a 409
+// provider_not_operator_key for a per-user definition, and writes still allowed after retire. The
+// recipient-side cases (what a granted user sees) are not mirrored here yet.
 
 import type {
   AdminSharedProvider,
@@ -28,9 +35,13 @@ import {
   mockSharedProviderOtherUsers,
   type MockOperatorProvider,
 } from "../data";
-import { delay, mockScenario, requireAdmin, requireSession } from "./shared";
+import { delay, mockScenario, requireAdmin, requireSession, users } from "./shared";
 
 const SHARED_CAP = 50;
+// The server's maxProviderGrants (api/internal/handler/providers_admin_grants.go).
+const GRANT_CAP = 10000;
+const GRANTS_PAGE_DEFAULT = 100;
+const GRANTS_PAGE_MAX = 500;
 const isShared = (p: ProviderDTO) => p.credential_mode === "per_user_key";
 const otherUsers: Record<string, { selected: number; keys: number }> = Object.fromEntries(
   Object.entries(mockSharedProviderOtherUsers).map(([id, c]) => [id, { ...c }]),
@@ -41,6 +52,19 @@ let providers: ProviderDTO[] = featureOn ? mockProviders.map((p) => ({ ...p })) 
 let operators: MockOperatorProvider[] = featureOn
   ? mockOperatorProviders.map((o) => ({ ...o, def: { ...o.def }, key: { ...o.key } }))
   : [];
+// Recipients per operator definition. The seeded definition starts with one named grant so the
+// demo shows a populated list; a new definition starts with none (default-deny).
+const recipients = new Map<string, { allUsers: boolean; grants: Set<string> }>(
+  operators.map((o) => [o.def.id, { allUsers: false, grants: new Set(o.def.id === "prov-operator-org" ? ["u-mira"] : []) }]),
+);
+function recipientsOf(id: string): { allUsers: boolean; grants: Set<string> } {
+  let r = recipients.get(id);
+  if (!r) {
+    r = { allUsers: false, grants: new Set() };
+    recipients.set(id, r);
+  }
+  return r;
+}
 let nextId = 1;
 // The user's selected Claude source (UserSettings.claude_provider_id); null = Anthropic.
 let claudeProviderId: string | null = null;
@@ -114,6 +138,8 @@ function adminView(p: ProviderDTO): AdminSharedProvider {
     // The demo user counts once whichever engine slot holds it (a definition has one engine).
     selected_user_count: others.selected + (claudeProviderId === p.id || codexProviderId === p.id ? 1 : 0),
     attached_key_count: others.keys + (p.has_key ? 1 : 0),
+    operator_all_users: false,
+    named_grant_count: 0,
   };
 }
 
@@ -145,6 +171,8 @@ function operatorView(o: MockOperatorProvider): AdminSharedProvider {
     credential_mode: "operator_key",
     selected_user_count: o.selectedUsers,
     attached_key_count: 0,
+    operator_all_users: recipientsOf(def.id).allUsers,
+    named_grant_count: recipientsOf(def.id).grants.size,
     operator_key: {
       present: key.present,
       enabled: key.present && key.enabled,
@@ -452,6 +480,7 @@ export const providersApi = {
           "the provider is selected as a source by at least one user; they must choose another source before it can be deleted");
       }
       operators = operators.filter((o) => o.def.id !== id);
+      recipients.delete(id);
       return delay({ deleted: true, deleted_key_count: 0 });
     }
     const view = adminView(shared(id));
@@ -504,5 +533,62 @@ export const providersApi = {
     const probe: ProviderProbe = { auth_result: "ok", tool_result: "passed", probed_at: new Date().toISOString() };
     updateOperator(id, (cur) => ({ ...cur, key: { ...cur.key, probe } }));
     return delay({ probe });
+  },
+
+  // ── Recipient grants (PRD #4540 M2) ─────────────────────────────────────────
+  // A keyset page on user_id: grants sorted by id, the cursor is the last id of the previous page.
+  adminListProviderGrants: async (id: string, opts: { cursor?: string; limit?: number } = {}) => {
+    requireAdmin();
+    operatorFor(id);
+    const limit = opts.limit ?? GRANTS_PAGE_DEFAULT;
+    if (!Number.isInteger(limit) || limit < 1 || limit > GRANTS_PAGE_MAX) {
+      failPlain(400, `limit must be between 1 and ${GRANTS_PAGE_MAX}`);
+    }
+    const r = recipientsOf(id);
+    const sorted = [...r.grants].sort();
+    const after = opts.cursor ? sorted.filter((u) => u > opts.cursor!) : sorted;
+    const page = after.slice(0, limit);
+    return delay({
+      operator_all_users: r.allUsers,
+      named_grant_count: r.grants.size,
+      grants: page.map((user_id) => ({ user_id })),
+      next_cursor: after.length > limit ? page[page.length - 1] : null,
+    });
+  },
+  adminPutProviderGrant: async (id: string, userId: string) => {
+    requireAdmin();
+    operatorFor(id);
+    if (!users.some((u) => u.id === userId)) fail(404, "user_not_found", "user not found");
+    const r = recipientsOf(id);
+    if (!r.grants.has(userId)) {
+      if (r.grants.size >= GRANT_CAP) {
+        fail(409, "provider_grant_cap_reached",
+          `the definition already has ${GRANT_CAP} named recipients; remove one first or use all users`);
+      }
+      r.grants.add(userId);
+    }
+    return delay(null);
+  },
+  adminDeleteProviderGrant: async (id: string, userId: string) => {
+    requireAdmin();
+    operatorFor(id);
+    recipientsOf(id).grants.delete(userId);
+    return delay(null);
+  },
+  adminSetProviderAllUsers: async (id: string, enabled: boolean) => {
+    requireAdmin();
+    operatorFor(id);
+    recipientsOf(id).allUsers = enabled;
+    return delay(null);
+  },
+  // All-users off and every named grant removed, in one step.
+  adminRevokeProviderRecipients: async (id: string) => {
+    requireAdmin();
+    operatorFor(id);
+    const r = recipientsOf(id);
+    const removed = r.grants.size;
+    r.allUsers = false;
+    r.grants.clear();
+    return delay({ named_grants_removed: removed });
   },
 };

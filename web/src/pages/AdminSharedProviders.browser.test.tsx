@@ -4,14 +4,14 @@ import { page, userEvent } from "vitest/browser";
 import { cleanup, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { AdminSharedProviders } from "./AdminSharedProviders";
-import { api, type AdminSharedProvider } from "../lib/api";
+import { api, type AdminSharedProvider, type User } from "../lib/api";
 
 // PRD #4324 M4: Admin → Shared providers at phone width. A long fixed endpoint, the counts and
 // the delete confirmation must wrap inside the card, never push the page sideways, and the
 // Cancel takes focus (never the destructive button) with a visible focus ring.
 vi.mock("../lib/api", async original => {
   const actual = await original<typeof import("../lib/api")>();
-  return { ...actual, api: { adminListSharedProviders: vi.fn(), listProviders: vi.fn(), adminDeleteSharedProvider: vi.fn(), adminPatchSharedProvider: vi.fn() } };
+  return { ...actual, api: { adminListSharedProviders: vi.fn(), listProviders: vi.fn(), adminDeleteSharedProvider: vi.fn(), adminPatchSharedProvider: vi.fn(), listUsers: vi.fn(), adminListProviderGrants: vi.fn() } };
 });
 afterEach(cleanup);
 
@@ -23,7 +23,7 @@ it("keeps the card, fixed facts and delete confirmation inside a 390px viewport"
     id: "s1", name: "platform-gateway-with-a-rather-long-name", engine: "claude", retired: false, current_revision: 2,
     protocol: "anthropic_messages", base_url: url, auth_style: "x_api_key",
     model_map: { haiku: { model: "platform-small", context_window: 65536 } },
-    credential_mode: "per_user_key", selected_user_count: 2, attached_key_count: 5,
+    credential_mode: "per_user_key", selected_user_count: 2, attached_key_count: 5, operator_all_users: false, named_grant_count: 0,
   };
   mock.adminListSharedProviders.mockResolvedValue({ providers: [row] });
   mock.listProviders.mockResolvedValue({ enabled: true, allowed_base_urls: [url], providers: [] });
@@ -83,7 +83,7 @@ it("keeps the Codex edit form's focus order: name, then each Codex slot's model 
   const row: AdminSharedProvider = {
     id: "c1", name: "codex-gateway", engine: "codex", retired: false, current_revision: 1,
     protocol: "openai_responses", base_url: "https://gateway.example.com/v1", auth_style: "bearer",
-    model_map: { default: { model: "gw-code" } }, credential_mode: "per_user_key", selected_user_count: 0, attached_key_count: 0,
+    model_map: { default: { model: "gw-code" } }, credential_mode: "per_user_key", selected_user_count: 0, attached_key_count: 0, operator_all_users: false, named_grant_count: 0,
   };
   mock.adminListSharedProviders.mockResolvedValue({ providers: [row] });
   mock.listProviders.mockResolvedValue({ enabled: true, allowed_base_urls: [row.base_url], providers: [] });
@@ -114,9 +114,10 @@ it("keeps the Codex edit form's focus order: name, then each Codex slot's model 
   expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(390);
 });
 
-// Issue #4540: an operator_key card (staged notice, key controls) and the organization-key
-// create form (six disclosures, acknowledgment gate) at phone width.
-it("keeps an organization-key card, its staged notice and key controls inside 390px", async () => {
+// Issue #4540: an operator_key card (key controls, recipients with a long granted name, the
+// incident stop) and the organization-key create form (six disclosures, acknowledgment gate) at
+// phone width.
+it("keeps an organization-key card, its key controls and recipients inside 390px", async () => {
   await page.viewport(390, 844);
   const mock = vi.mocked(api);
   const url = "https://gateway.example.com/a/very/long/path/that/must/wrap/inside/the/card/anthropic/v1";
@@ -124,14 +125,20 @@ it("keeps an organization-key card, its staged notice and key controls inside 39
     id: "o1", name: "organization-gateway-with-a-rather-long-name", engine: "claude", retired: false, current_revision: 1,
     protocol: "anthropic_messages", base_url: url, auth_style: "bearer",
     model_map: { haiku: { model: "org-small" } },
-    credential_mode: "operator_key", selected_user_count: 0, attached_key_count: 0,
+    credential_mode: "operator_key", selected_user_count: 0, attached_key_count: 0, operator_all_users: false, named_grant_count: 1,
     operator_key: { present: true, enabled: true, set_at: "2026-11-20T10:00:00Z" },
   };
   mock.adminListSharedProviders.mockResolvedValue({ providers: [row] });
   mock.listProviders.mockResolvedValue({ enabled: true, allowed_base_urls: [url], providers: [] });
+  mock.listUsers.mockResolvedValue({ users: [{ id: "u1", email: "a-very-long-address-that-must-wrap@example.com", display_name: "A rather long display name for one user", is_admin: false, is_active: true } as User] });
+  mock.adminListProviderGrants.mockResolvedValue({ operator_all_users: false, named_grant_count: 1, grants: [{ user_id: "u1" }], next_cursor: null });
   render(<MemoryRouter><div className="px-4"><AdminSharedProviders /></div></MemoryRouter>);
   const panel = await screen.findByTestId("operator-key-o1");
-  expect(within(panel).getByTestId("staged-notice-o1").textContent).toMatch(/Staged: not yet available to users or runs/);
+  const recipients = screen.getByTestId("recipients-o1");
+  expect(within(recipients).getByTestId("access-notice-o1").textContent).toMatch(/No user can see or use this definition until you grant access/);
+  await within(recipients).findByRole("button", { name: `Remove A rather long display name for one user from ${row.name}` });
+  expect(within(recipients).getByRole("button", { name: `Revoke all recipients of ${row.name}` })).toBeTruthy();
+  expect(recipients.scrollWidth).toBeLessThanOrEqual(recipients.clientWidth + 1);
   for (const name of [
     `Replace organization key for ${row.name}`,
     `Disable organization key for ${row.name}`,

@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { AdminSharedProviders } from "./AdminSharedProviders";
-import { api, type AdminSharedProvider } from "../lib/api";
+import { api, type AdminProviderGrants, type AdminSharedProvider, type User } from "../lib/api";
 import { ApiError } from "../lib/apiError";
 
 vi.mock("../lib/api", async (importOriginal) => {
@@ -24,6 +24,12 @@ vi.mock("../lib/api", async (importOriginal) => {
       adminSetOperatorKeyEnabled: vi.fn(),
       adminDeleteOperatorKey: vi.fn(),
       adminTestOperatorKey: vi.fn(),
+      adminListProviderGrants: vi.fn(),
+      adminPutProviderGrant: vi.fn(),
+      adminDeleteProviderGrant: vi.fn(),
+      adminSetProviderAllUsers: vi.fn(),
+      adminRevokeProviderRecipients: vi.fn(),
+      listUsers: vi.fn(),
       listProviders: vi.fn(),
     },
   };
@@ -47,6 +53,8 @@ function shared(over: Partial<AdminSharedProvider> = {}): AdminSharedProvider {
     credential_mode: "per_user_key",
     selected_user_count: 0,
     attached_key_count: 3,
+    operator_all_users: false,
+    named_grant_count: 0,
     ...over,
   };
 }
@@ -66,8 +74,20 @@ async function renderPage(rows: AdminSharedProvider[] = [shared()]) {
   else await screen.findByText("No shared providers yet");
 }
 
+const USERS = [
+  { id: "u-ana", email: "ana@example.com", display_name: "Ana Pop", is_admin: false, is_active: true },
+  { id: "u-bo", email: "bo@example.com", display_name: null, is_admin: false, is_active: true },
+  { id: "u-cy", email: "cy@example.com", display_name: "Cy Ion", is_admin: true, is_active: true },
+] as User[];
+
+function grantsPage(ids: string[], over: Partial<AdminProviderGrants> = {}): AdminProviderGrants {
+  return { operator_all_users: false, named_grant_count: ids.length, grants: ids.map((user_id) => ({ user_id })), next_cursor: null, ...over };
+}
+
 beforeEach(() => {
   mockApi.listProviders.mockResolvedValue({ enabled: true, allowed_base_urls: [URL_A, URL_B], providers: [] });
+  mockApi.listUsers.mockResolvedValue({ users: USERS });
+  mockApi.adminListProviderGrants.mockResolvedValue(grantsPage([]));
 });
 afterEach(() => {
   cleanup();
@@ -534,7 +554,7 @@ describe("AdminSharedProviders — organization key card", () => {
     mockApi.adminSetOperatorKeyEnabled.mockResolvedValue({ provider: operator() });
     await renderPage([operator()]);
     expect(screen.getByTestId("disable-effect-o1").textContent).toMatch(
-      /unusable for runs.*frozen copies held by recipients are not revoked/i,
+      /stops everyone at the next claim.*copies recipients already obtained are not revoked/i,
     );
     fireEvent.click(screen.getByRole("button", { name: "Disable organization key for org-gateway" }));
     await waitFor(() => expect(mockApi.adminSetOperatorKeyEnabled).toHaveBeenCalledWith("o1", false));
@@ -553,7 +573,7 @@ describe("AdminSharedProviders — organization key card", () => {
     fireEvent.click(screen.getByRole("button", { name: "Delete organization key for org-gateway" }));
     expect(mockApi.adminDeleteOperatorKey).not.toHaveBeenCalled();
     const group = screen.getByRole("group", { name: "Confirm deleting the organization key of org-gateway" });
-    expect(group.textContent).toMatch(/copies recipients may already hold.*are not taken back/i);
+    expect(group.textContent).toMatch(/everyone stops at the next claim.*copies recipients already obtained are not taken back/i);
     expect(document.activeElement).toBe(within(group).getByRole("button", { name: "Cancel" }));
     fireEvent.click(within(group).getByRole("button", { name: "Delete key" }));
     await waitFor(() => expect(mockApi.adminDeleteOperatorKey).toHaveBeenCalledWith("o1"));
@@ -656,7 +676,7 @@ describe("AdminSharedProviders — organization key card", () => {
     await waitFor(() => expect(screen.getByTestId("probe-results-o1").textContent).toMatch(/Authentication rejected/));
   });
 
-  it("says an organization-key definition is staged, not usable by users, on create", async () => {
+  it("says on create that nobody can use an organization-key definition until access is granted", async () => {
     mockApi.adminCreateSharedProvider.mockResolvedValue({ provider: operator() });
     mockApi.adminListSharedProviders.mockResolvedValue({ providers: [operator()] });
     const form = await openOperatorForm();
@@ -666,8 +686,9 @@ describe("AdminSharedProviders — organization key card", () => {
     fireEvent.click(form.getByRole("checkbox", { name: /acknowledge/i }));
     fireEvent.click(form.getByRole("button", { name: "Create shared provider" }));
     const notice = await screen.findByText(/Shared provider org-gateway created/);
-    expect(notice.textContent).toMatch(/Staged: set its organization key next; it is not yet available to users/);
+    expect(notice.textContent).toMatch(/Set its organization key and grant access next: no user can see or use it until you do/);
     expect(notice.textContent).not.toMatch(/attach their own key/);
+    expect(notice.textContent).not.toMatch(/staged|later release|not yet available/i);
   });
 
   it("does not mention an organization key in the delete copy when none is set", async () => {
@@ -680,12 +701,34 @@ describe("AdminSharedProviders — organization key card", () => {
     expect(await screen.findByText("org-gateway deleted.")).toBeTruthy();
   });
 
-  it("marks organization keys as staged on the card and in the create form", async () => {
+  // PRD #4540 M2 retired the M1 "staged / later release" copy for default-deny. Each check pairs the
+  // new wording (positive) with a did-the-old-copy-come-back guard on the same element.
+  const DENY = /^No user can see or use this definition until you grant access; granted users' runs receive the organization key\./;
+  const OLD = /staged|later release|not yet available|once recipients/i;
+  it("states default-deny on the card and in the create form, with no staged copy left", async () => {
     await renderPage([operator()]);
-    expect(screen.getByTestId("staged-notice-o1").textContent).toMatch(/Staged: not yet available to users or runs/);
+    const card = screen.getByTestId("access-notice-o1");
+    expect(card.textContent).toMatch(DENY);
+    expect(card.textContent).not.toMatch(OLD);
+    const keyPanel = screen.getByTestId("operator-key-o1");
+    expect(keyPanel.textContent).toMatch(/Copies recipients already obtained keep working until the old key is rotated at the gateway/);
+    expect(keyPanel.textContent).not.toMatch(OLD);
     cleanup();
     const form = await openOperatorForm();
-    expect(form.getByTestId("staged-notice-new").textContent).toMatch(/Staged: not yet available to users or runs/);
+    const formNotice = form.getByTestId("access-notice-new");
+    expect(formNotice.textContent).toMatch(DENY);
+    expect(formNotice.textContent).toMatch(/These terms apply to every user you grant access to\./);
+    expect(formNotice.textContent).not.toMatch(OLD);
+    const intro = form.getByText(/You set one organization key after creating it\./);
+    expect(intro.textContent).toMatch(/until you grant access; granted users' runs receive the organization key/);
+    expect(intro.textContent).not.toMatch(OLD);
+    // The redirect disclosure is unchanged, and the disclosure group as a whole carries no staged copy.
+    expect(form.getByTestId("disclosure-redirect").textContent).toBe(
+      "A redirecting gateway can forward request bodies to the redirect host, and can send the key to a same-host sibling path, or to another host with the x_api_key auth style. Bearer is recommended.",
+    );
+    const group = form.getByRole("group", { name: "Organization key disclosures" });
+    expect(group.textContent).toContain("No user can see or use this definition until you grant access");
+    expect(group.textContent).not.toMatch(OLD);
     expect(form.getByTestId("disclosure-copy").textContent).toMatch(/rotate at the gateway.*per-key spend limits/i);
   });
 
@@ -731,5 +774,158 @@ describe("AdminSharedProviders — organization key card", () => {
     await renderPage([operator()]);
     fireEvent.click(screen.getByRole("button", { name: "Disable organization key for org-gateway" }));
     expect((await screen.findByRole("alert")).textContent).toMatch(/not organization-funded/);
+  });
+});
+
+describe("AdminSharedProviders — recipients (PRD #4540 M2)", () => {
+  const recipients = () => within(screen.getByTestId("recipients-o1"));
+
+  it("renders the recipients section only on an organization-key card", async () => {
+    await renderPage([shared(), operator()]);
+    expect(screen.getByTestId("recipients-o1")).toBeTruthy();
+    expect(screen.queryByTestId("recipients-s1")).toBeNull();
+    expect(screen.queryByRole("switch")).not.toBeNull();
+    expect(screen.getAllByRole("switch")).toHaveLength(1);
+    expect(screen.queryByRole("button", { name: /Revoke all recipients of platform-gateway/ })).toBeNull();
+    await waitFor(() => expect(mockApi.adminListProviderGrants).toHaveBeenCalledWith("o1", { cursor: undefined, limit: 50 }));
+    expect(mockApi.adminListProviderGrants).not.toHaveBeenCalledWith("s1", expect.anything());
+  });
+
+  it("reads neither users nor grants when no card is organization-funded", async () => {
+    await renderPage([shared()]);
+    expect(mockApi.listUsers).not.toHaveBeenCalled();
+    expect(mockApi.adminListProviderGrants).not.toHaveBeenCalled();
+  });
+
+  it("shows the named-grant count and the granted users joined to their names", async () => {
+    mockApi.adminListProviderGrants.mockResolvedValue(grantsPage(["u-ana", "u-bo", "u-gone"]));
+    await renderPage([operator({ named_grant_count: 3 })]);
+    expect(recipients().getByTestId("named-count-o1").textContent).toBe("Named users: 3");
+    expect(recipients().getByTestId("recipient-summary-o1").textContent).toBe("3 named users have access.");
+    const list = within(await recipients().findByRole("list", { name: "Users granted org-gateway" }));
+    expect(list.getByText("Ana Pop")).toBeTruthy();
+    expect(list.getByText("ana@example.com")).toBeTruthy();
+    expect(list.getByText("bo@example.com")).toBeTruthy();
+    // A grant the user list does not know shows its id, never a blank row.
+    expect(list.getByText("Unknown user")).toBeTruthy();
+    expect(list.getByText("u-gone")).toBeTruthy();
+  });
+
+  it("says nobody has access yet on a fresh definition", async () => {
+    await renderPage([operator()]);
+    expect(recipients().getByTestId("recipient-summary-o1").textContent).toBe("No recipients yet.");
+    expect((recipients().getByRole("switch", { name: "All users can use org-gateway" })).getAttribute("aria-checked")).toBe("false");
+  });
+
+  it("pages the grant list with the cursor", async () => {
+    mockApi.adminListProviderGrants
+      .mockResolvedValueOnce(grantsPage(["u-ana"], { named_grant_count: 2, next_cursor: "u-ana" }))
+      .mockResolvedValueOnce(grantsPage(["u-bo"], { named_grant_count: 2 }));
+    await renderPage([operator({ named_grant_count: 2 })]);
+    fireEvent.click(await recipients().findByRole("button", { name: "Show more recipients" }));
+    await waitFor(() => expect(mockApi.adminListProviderGrants).toHaveBeenLastCalledWith("o1", { cursor: "u-ana", limit: 50 }));
+    const list = within(await recipients().findByRole("list", { name: "Users granted org-gateway" }));
+    await waitFor(() => expect(list.getByText("bo@example.com")).toBeTruthy());
+    expect(list.getByText("Ana Pop")).toBeTruthy();
+    expect(recipients().queryByRole("button", { name: "Show more recipients" })).toBeNull();
+  });
+
+  it("grants a picked user through PUT and offers only users not already named", async () => {
+    mockApi.adminListProviderGrants.mockResolvedValue(grantsPage(["u-ana"]));
+    mockApi.adminPutProviderGrant.mockResolvedValue(null);
+    await renderPage([operator({ named_grant_count: 1 })]);
+    await recipients().findByText("Ana Pop");
+    const picker = recipients().getByLabelText("Grant access to a user") as HTMLSelectElement;
+    expect([...picker.options].map((o) => o.value)).toEqual(["", "u-bo", "u-cy"]);
+    const grant = recipients().getByRole("button", { name: "Grant org-gateway to the chosen user" }) as HTMLButtonElement;
+    expect(grant.disabled).toBe(true);
+    fireEvent.change(picker, { target: { value: "u-cy" } });
+    fireEvent.click(grant);
+    await waitFor(() => expect(mockApi.adminPutProviderGrant).toHaveBeenCalledWith("o1", "u-cy"));
+    expect(await screen.findByText(/Cy Ion can now use org-gateway; their runs receive the organization key/)).toBeTruthy();
+    expect(mockApi.adminListSharedProviders).toHaveBeenCalledTimes(2);
+  });
+
+  it("removes a granted user through DELETE", async () => {
+    mockApi.adminListProviderGrants.mockResolvedValue(grantsPage(["u-ana"]));
+    mockApi.adminDeleteProviderGrant.mockResolvedValue(null);
+    await renderPage([operator({ named_grant_count: 1 })]);
+    fireEvent.click(await recipients().findByRole("button", { name: "Remove Ana Pop from org-gateway" }));
+    await waitFor(() => expect(mockApi.adminDeleteProviderGrant).toHaveBeenCalledWith("o1", "u-ana"));
+    expect(await screen.findByText(/Ana Pop no longer has access to org-gateway/)).toBeTruthy();
+  });
+
+  it("turns all users on and off through the all-users PUT, with the effect stated", async () => {
+    mockApi.adminSetProviderAllUsers.mockResolvedValue(null);
+    await renderPage([operator()]);
+    expect(recipients().getByTestId("all-users-effect-o1").textContent).toMatch(/only the named users below have access/);
+    const sw = recipients().getByRole("switch", { name: "All users can use org-gateway" });
+    expect(sw.getAttribute("aria-describedby")).toBe(recipients().getByTestId("all-users-effect-o1").id);
+    mockApi.adminListSharedProviders.mockResolvedValue({ providers: [operator({ operator_all_users: true })] });
+    fireEvent.click(sw);
+    await waitFor(() => expect(mockApi.adminSetProviderAllUsers).toHaveBeenCalledWith("o1", true));
+    await waitFor(() => expect(recipients().getByRole("switch", { name: "All users can use org-gateway" }).getAttribute("aria-checked")).toBe("true"));
+    expect(recipients().getByTestId("recipient-summary-o1").textContent).toBe("All users have access.");
+    fireEvent.click(recipients().getByRole("switch", { name: "All users can use org-gateway" }));
+    await waitFor(() => expect(mockApi.adminSetProviderAllUsers).toHaveBeenLastCalledWith("o1", false));
+  });
+
+  it("revokes every recipient only after a confirmation on Cancel, and reports the removed count", async () => {
+    mockApi.adminListProviderGrants.mockResolvedValue(grantsPage(["u-ana", "u-bo"], { operator_all_users: true }));
+    mockApi.adminRevokeProviderRecipients.mockResolvedValue({ named_grants_removed: 2 });
+    await renderPage([operator({ operator_all_users: true, named_grant_count: 2 })]);
+    expect(recipients().getByTestId("revoke-effect-o1").textContent).toMatch(
+      /Turns all users off and removes every named grant\. Takes effect at the next claim; copies already obtained are revoked only by rotating the key at the gateway\./,
+    );
+    fireEvent.click(recipients().getByRole("button", { name: "Revoke all recipients of org-gateway" }));
+    expect(mockApi.adminRevokeProviderRecipients).not.toHaveBeenCalled();
+    const group = within(screen.getByRole("group", { name: "Confirm revoking all recipients of org-gateway" }));
+    expect(document.activeElement).toBe(group.getByRole("button", { name: "Cancel" }));
+    expect(group.getByText(/2 named grants are removed/)).toBeTruthy();
+    fireEvent.click(group.getByRole("button", { name: "Revoke all recipients" }));
+    await waitFor(() => expect(mockApi.adminRevokeProviderRecipients).toHaveBeenCalledWith("o1"));
+    expect(await screen.findByText(/Revoked every recipient of org-gateway: all users turned off and 2 named grants removed/)).toBeTruthy();
+  });
+
+  it("labels each incident stop with its effect", async () => {
+    await renderPage([operator()]);
+    expect(screen.getByTestId("disable-effect-o1").textContent).toMatch(/^Stops everyone at the next claim/);
+    expect(screen.getByTestId("delete-key-effect-o1").textContent).toMatch(/^\s*Stops everyone at the next claim/);
+    expect(recipients().getByTestId("stop-scope-o1").textContent).toMatch(/Retire stops fresh use only/);
+    fireEvent.click(screen.getByRole("button", { name: "Retire org-gateway" }));
+    expect(screen.getByTestId("retire-effect-o1").textContent).toMatch(/Retire stops fresh use only: runs already started keep the organization key/);
+  });
+
+  it("explains a grant refused at the cap", async () => {
+    mockApi.adminPutProviderGrant.mockRejectedValue(conflict("provider_grant_cap_reached"));
+    await renderPage([operator()]);
+    await recipients().findByLabelText("Grant access to a user");
+    fireEvent.change(recipients().getByLabelText("Grant access to a user"), { target: { value: "u-bo" } });
+    fireEvent.click(recipients().getByRole("button", { name: "Grant org-gateway to the chosen user" }));
+    expect((await recipients().findByRole("alert")).textContent).toMatch(/already has 10,000 named recipients, the limit\. Remove one first, or give access to all users/);
+  });
+
+  it("explains a grant to a user who no longer exists and refreshes the user list", async () => {
+    mockApi.adminPutProviderGrant.mockRejectedValue(new ApiError(404, "user not found", { error: "user not found", reason: "user_not_found" }));
+    await renderPage([operator()]);
+    await recipients().findByLabelText("Grant access to a user");
+    fireEvent.change(recipients().getByLabelText("Grant access to a user"), { target: { value: "u-bo" } });
+    fireEvent.click(recipients().getByRole("button", { name: "Grant org-gateway to the chosen user" }));
+    expect((await recipients().findByRole("alert")).textContent).toMatch(/That user no longer exists, so access was not granted/);
+    await waitFor(() => expect(mockApi.listUsers).toHaveBeenCalledTimes(2));
+  });
+
+  it("keeps removal but no new grant on a retired definition", async () => {
+    mockApi.adminListProviderGrants.mockResolvedValue(grantsPage(["u-ana"]));
+    await renderPage([operator({ retired: true, named_grant_count: 1 })]);
+    expect(await recipients().findByRole("button", { name: "Remove Ana Pop from org-gateway" })).toBeTruthy();
+    expect(recipients().getByRole("button", { name: "Revoke all recipients of org-gateway" })).toBeTruthy();
+    expect(recipients().queryByLabelText("Grant access to a user")).toBeNull();
+    expect((recipients().getByRole("switch", { name: "All users can use org-gateway" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("warns that recipients cannot run while the key is missing or disabled", async () => {
+    await renderPage([operator({ named_grant_count: 1, operator_key: { present: true, enabled: false } })]);
+    expect(recipients().getByTestId("recipients-blocked-o1").textContent).toMatch(/cannot run on it until its key is set and enabled/);
   });
 });

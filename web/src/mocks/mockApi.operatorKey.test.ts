@@ -146,3 +146,68 @@ describe("mock organization-funded definitions", () => {
     expect(flipped?.probe).toBeUndefined();
   });
 });
+
+// PRD #4540 M2 mock fidelity, admin side: recipient grants mirror the server's admin grant API.
+describe("mock recipient grants", () => {
+  it("starts a new definition with no recipients and reports both counts in the definition DTO", async () => {
+    const api = await load();
+    const { provider } = await api.adminCreateSharedProvider({
+      engine: "claude", name: "fresh-org", base_url: GW, auth_style: "bearer", model_map: MAP, credential_mode: "operator_key", acknowledge_recipient_trust: true,
+    });
+    expect(provider).toMatchObject({ operator_all_users: false, named_grant_count: 0 });
+    await expect(api.adminListProviderGrants(provider.id)).resolves.toEqual({ operator_all_users: false, named_grant_count: 0, grants: [], next_cursor: null });
+    const perUser = (await api.adminListSharedProviders()).providers.find((p) => p.id === "prov-shared-platform")!;
+    expect(perUser).toMatchObject({ operator_all_users: false, named_grant_count: 0 });
+  });
+
+  it("adds and removes grants idempotently and pages them by user id", async () => {
+    const api = await load();
+    const before = (await api.adminListProviderGrants(OP)).named_grant_count;
+    await expect(api.adminPutProviderGrant(OP, "u-admin")).resolves.toBeNull();
+    await expect(api.adminPutProviderGrant(OP, "u-admin")).resolves.toBeNull();
+    const all = await api.adminListProviderGrants(OP);
+    expect(all.named_grant_count).toBe(before + 1);
+    const ids = all.grants.map((g) => g.user_id);
+    expect(ids).toEqual([...ids].sort());
+    const first = await api.adminListProviderGrants(OP, { limit: 1 });
+    expect(first.grants).toHaveLength(1);
+    expect(first.next_cursor).toBe(first.grants[0].user_id);
+    const rest = await api.adminListProviderGrants(OP, { cursor: first.next_cursor!, limit: 500 });
+    expect([...first.grants, ...rest.grants].map((g) => g.user_id)).toEqual(ids);
+    expect(rest.next_cursor).toBeNull();
+    await expect(api.adminListProviderGrants(OP, { limit: 501 })).rejects.toMatchObject({ status: 400 });
+    await expect(api.adminDeleteProviderGrant(OP, "u-admin")).resolves.toBeNull();
+    await expect(api.adminDeleteProviderGrant(OP, "u-admin")).resolves.toBeNull();
+    expect((await api.adminListSharedProviders()).providers.find((p) => p.id === OP)!.named_grant_count).toBe(before);
+  });
+
+  it("refuses an unknown user with 404 user_not_found and a per-user definition with 409", async () => {
+    const api = await load();
+    await expect(api.adminPutProviderGrant(OP, "u-nobody")).rejects.toMatchObject({ status: 404, body: { reason: "user_not_found" } });
+    const id = "prov-shared-platform";
+    for (const call of [
+      () => api.adminListProviderGrants(id),
+      () => api.adminPutProviderGrant(id, "u-admin"),
+      () => api.adminDeleteProviderGrant(id, "u-admin"),
+      () => api.adminSetProviderAllUsers(id, true),
+      () => api.adminRevokeProviderRecipients(id),
+    ]) {
+      await expect(call()).rejects.toMatchObject({ status: 409, body: { reason: "provider_not_operator_key" } });
+    }
+    await expect(api.adminPutProviderGrant("nope", "u-admin")).rejects.toMatchObject({ status: 404 });
+  });
+
+  it("switches all users, and revoke-all turns it off and removes every named grant, also after retire", async () => {
+    const api = await load();
+    await api.adminPutProviderGrant(OP, "u-admin");
+    await expect(api.adminSetProviderAllUsers(OP, true)).resolves.toBeNull();
+    await expect(api.adminSetProviderAllUsers(OP, true)).resolves.toBeNull();
+    expect((await api.adminListSharedProviders()).providers.find((p) => p.id === OP)!.operator_all_users).toBe(true);
+    await api.adminRetireSharedProvider(OP);
+    const named = (await api.adminListProviderGrants(OP)).named_grant_count;
+    expect(named).toBeGreaterThan(0);
+    await expect(api.adminRevokeProviderRecipients(OP)).resolves.toEqual({ named_grants_removed: named });
+    await expect(api.adminListProviderGrants(OP)).resolves.toEqual({ operator_all_users: false, named_grant_count: 0, grants: [], next_cursor: null });
+    await expect(api.adminRevokeProviderRecipients(OP)).resolves.toEqual({ named_grants_removed: 0 });
+  });
+});
