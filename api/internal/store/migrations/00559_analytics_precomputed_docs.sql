@@ -4,8 +4,8 @@ SET LOCAL lock_timeout = '5s';
 -- Issue #4771: stored, background-built analytics documents (admin all-users Spend, window=all).
 -- Purely additive: two new tables, one function, four triggers on users and repos.
 --
--- NOTE (goose numbering): drafted as 00554; renumber above the live head at landing via
--- `task migration:renumber` if another migration lands first.
+-- NOTE (goose numbering): drafted as 00554; renumbered to 00559 at landing (`task migration:renumber`)
+-- because history retention (#4695) took 00555-00558 first.
 --
 -- analytics_precomputed_state is a single row (id is always true). invalidation moves once per
 -- transaction that deletes users or repos rows (or truncates them) and is only compared for

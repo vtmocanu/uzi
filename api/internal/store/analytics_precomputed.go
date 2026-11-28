@@ -26,7 +26,7 @@ import (
 //     (client_connection_check_interval) depends on the server's kernel observing the
 //     disconnect, and the TCP keepalive settings below are best effort. A half-open connection
 //     that neither side observes is NOT claimed to release promptly.
-//   - A committed delete of a users or repos row (migration 00554's triggers) empties every
+//   - A committed delete of a users or repos row (migration 00559's triggers) empties every
 //     stored set and moves the invalidation counter in its own transaction; Publish refuses to
 //     publish a build whose counter is stale.
 

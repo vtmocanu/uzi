@@ -830,7 +830,7 @@ It is controlled by `UZI_ANALYTICS_SNAPSHOT_INTERVAL` (a Go duration, default
 Code: `api/internal/handler/analytics_precomputed.go` (serving, builder),
 `api/internal/analyticsprecompute/scheduler.go` (scheduler),
 `api/internal/store/analytics_precomputed.go` and migration
-`00554_analytics_precomputed_docs.sql` (storage, triggers, lock).
+`00559_analytics_precomputed_docs.sql` (storage, triggers, lock).
 
 ## Spend performance limit
 
