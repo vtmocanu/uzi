@@ -51,7 +51,10 @@ var (
 )
 
 // ModuleDataConflict reports a failed precondition. Current is the stored
-// revision at the time of the check, nil when no document exists.
+// revision observed while building the conflict, nil when no document exists.
+// After a failed conditional write it comes from a read that follows the check,
+// so a concurrent writer can make it newer than the revision the check saw;
+// clients refetch on a conflict either way.
 type ModuleDataConflict struct{ Current *int64 }
 
 func (e *ModuleDataConflict) Error() string { return "store: module data revision conflict" }

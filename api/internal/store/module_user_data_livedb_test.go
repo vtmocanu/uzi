@@ -196,12 +196,29 @@ func TestModuleUserDataNeverMatchAndCreateExistingLiveDB(t *testing.T) {
 func TestModuleUserDataCascadeLiveDB(t *testing.T) {
 	ctx, pool := openModuleDataLiveDB(t)
 	u := mdSeedUser(ctx, t, pool)
-	mdSeedDocs(ctx, t, pool, u, 3)
-	if _, err := pool.Exec(ctx, `DELETE FROM users WHERE id = $1`, u); err != nil {
+	mods := []string{"m0", "m1", "m2"}
+	for _, mod := range mods {
+		rev, err := mdCreate(ctx, pool, u, mod, `{"i":1}`)
+		if err != nil {
+			t.Fatalf("seed %s: %v", mod, err)
+		}
+		mdWantDoc(ctx, t, pool, u, mod, `{"i": 1}`, rev)
+	}
+	tag, err := pool.Exec(ctx, `DELETE FROM users WHERE id = $1`, u)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if n := mdCount(ctx, t, pool, u); n != 0 {
-		t.Fatalf("want 0 documents after user delete, got %d", n)
+	if tag.RowsAffected() != 1 {
+		t.Fatalf("user delete affected %d rows, want 1", tag.RowsAffected())
+	}
+	for _, mod := range mods {
+		data, cur, err := GetModuleUserDataDoc(ctx, New(pool), u, mod)
+		if err != nil {
+			t.Fatalf("get %s: %v", mod, err)
+		}
+		if data != nil || cur != nil {
+			t.Fatalf("%s survived the user delete: %s@%v", mod, data, cur)
+		}
 	}
 }
 
