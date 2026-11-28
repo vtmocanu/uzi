@@ -2977,40 +2977,50 @@ export class SdkExecutor implements Executor {
           if ("released" in sourceStep) return { branch: ctx.branch, switchReleased: true };
           const runRevisionTurn = () =>
             this.drivePlanningTurn(ctx, baseConfig, resumeId, revisePrompt, state, idleMs, budget, !automatic);
-          let turn: TurnResult & { plan: string };
+          // Issue #4806: a HUMAN revision keeps its defer window open from before the planning turn (including its
+          // ask_user sub-park) until the revised gate is confirmed published and its revise settled, so no switch
+          // trips between the turn and the revised gate. The runner closes it early through releaseSwitchDefer;
+          // this finally closes it on every other exit (idempotent). An automatic checker revision keeps the
+          // turn-only window.
+          const humanDefer = !automatic && ctx.openCredentialSwitchDefer ? ctx.openCredentialSwitchDefer() : undefined;
           try {
-            turn = ctx.deferCredentialSwitch
-              ? await ctx.deferCredentialSwitch(runRevisionTurn)
-              : await runRevisionTurn();
-          } catch (error) {
-            if (!(error instanceof PlanRevisionReplacedError)) throw error;
-            resumeId = error.sessionId;
-            verdict = error.verdict;
-            serverAcceptedReplacement = verdict.automatic !== true;
-            continue;
-          }
-          resumeId = turn.sessionId ?? resumeId;
-          approvedPlan = turn.plan;
-          // Decision 2: the candidate is REPLACED across a revision round.
-          candidateMilestones = turn.milestones;
-          gateMilestones = turn.rejectedMilestones ?? turn.milestones;
-          semanticSubmission = turn.semanticSubmission;
-          // PRD #362 M3c: a re-plan REGENERATES the plan summary (Decision 2), fired from
-          // the gate's onPlanPersisted callback (after the re-report persists the NEW
-          // plan_md) so its stale-write guard matches the new plan.
-          const onPlanPersisted = this.beginPlanSummary(ctx, prdInputP);
-          const gRev = await this.runThroughSwitch(ctx, state, () =>
-            ctx.gatePlan!(
-              approvedPlan,
-              gateMilestones,
-              onPlanPersisted,
-              settles,
-              semanticSubmission,
-            ),
-            ctx.continueExistingPlanGate, { site: "plan_gate_revision", reopenPlanSummary: true },
-          );
-          if ("released" in gRev) return { branch: ctx.branch, switchReleased: true };
-          verdict = gRev.value;
+            let turn: TurnResult & { plan: string };
+            try {
+              turn = humanDefer ? await runRevisionTurn()
+                : ctx.deferCredentialSwitch
+                  ? await ctx.deferCredentialSwitch(runRevisionTurn)
+                  : await runRevisionTurn();
+            } catch (error) {
+              if (!(error instanceof PlanRevisionReplacedError)) throw error;
+              resumeId = error.sessionId;
+              verdict = error.verdict;
+              serverAcceptedReplacement = verdict.automatic !== true;
+              continue;
+            }
+            resumeId = turn.sessionId ?? resumeId;
+            approvedPlan = turn.plan;
+            // Decision 2: the candidate is REPLACED across a revision round.
+            candidateMilestones = turn.milestones;
+            gateMilestones = turn.rejectedMilestones ?? turn.milestones;
+            semanticSubmission = turn.semanticSubmission;
+            // PRD #362 M3c: a re-plan REGENERATES the plan summary (Decision 2), fired from
+            // the gate's onPlanPersisted callback (after the re-report persists the NEW
+            // plan_md) so its stale-write guard matches the new plan.
+            const onPlanPersisted = this.beginPlanSummary(ctx, prdInputP);
+            const gRev = await this.runThroughSwitch(ctx, state, () =>
+              ctx.gatePlan!(
+                approvedPlan,
+                gateMilestones,
+                onPlanPersisted,
+                settles,
+                semanticSubmission,
+                humanDefer?.release,
+              ),
+              ctx.continueExistingPlanGate, { site: "plan_gate_revision", reopenPlanSummary: true },
+            );
+            if ("released" in gRev) return { branch: ctx.branch, switchReleased: true };
+            verdict = gRev.value;
+          } finally { humanDefer?.release(); }
         }
         if (verdict.kind === "reject")
           throw new PlanRejectedError(verdict.reason, verdict.sourceGateRevision);
@@ -4113,7 +4123,7 @@ export class SdkExecutor implements Executor {
           //   - no hook wired (stub/test executor) → re-throw, byte-identical to the pre-fix behaviour
           //     (the runner's outer catch is then the safety net).
           if (err instanceof CredentialSwitchSignal) {
-            const outcome = await this.attemptCredentialSwitch(ctx, state, "implement_turn");
+            const outcome = await this.attemptCredentialSwitch(ctx, state, "implement_turn", err);
             if (outcome === "released") {
               switchReleased = true;
               break;
@@ -4988,7 +4998,7 @@ export class SdkExecutor implements Executor {
    * (usage it reports before the settle bound is still emitted).
    */
   private async attemptCredentialSwitch(
-    ctx: RunContext, state: RunDrive, site: InPlaceSwitchSite,
+    ctx: RunContext, state: RunDrive, site: InPlaceSwitchSite, signal?: unknown,
   ): Promise<"released" | "gave_up" | "applied" | undefined> {
     // PRD #4320 D8: no live credential switching on a provider run. The server refuses the switch at
     // admission; this is the second layer. Nothing is applied and no OAuth token is ever injected.
@@ -4999,7 +5009,9 @@ export class SdkExecutor implements Executor {
     // Issue #4201: the executor-side half of the quiescence proof. The lane failure is read from
     // the independent record, never from the first-wins carrier.
     const laneSettled = state.laneSettlementFailure === undefined && !(this.guardLane?.poisoned ?? false);
-    return ctx.attemptCredentialSwitch({ site, laneSettled });
+    // Issue #4806: the caught error rides along so the runner can tell a switch that surfaced outside every
+    // switch site (a receipt failure inside a deferred revision) from an ordinary trip.
+    return ctx.attemptCredentialSwitch({ site, laneSettled, ...(signal !== undefined ? { signal } : {}) });
   }
 
   /** Issue #4201: the run's credential as of this call (token and epoch ordinal). Read once at a consumer's
@@ -5100,7 +5112,7 @@ export class SdkExecutor implements Executor {
         return { value: await attempt() };
       } catch (err) {
         if (!(err instanceof CredentialSwitchSignal)) throw err;
-        const outcome = await this.attemptCredentialSwitch(ctx, state, options.site);
+        const outcome = await this.attemptCredentialSwitch(ctx, state, options.site, err);
         if (outcome === "released") return { released: true };
         if (outcome === "gave_up" || outcome === "applied") {
           this.throwIfTerminal(ctx);

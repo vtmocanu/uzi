@@ -565,6 +565,13 @@ export interface RunContext {
     onPlanPersisted?: (planMd: string) => Promise<void>,
     settles?: number,
     semanticSubmission?: import("./semantic-plan.js").SemanticSubmission,
+    /**
+     * Issue #4806: release of the credential-switch defer window the executor opened for a human revision
+     * (openCredentialSwitchDefer). The runner calls it, once, as soon as the revised gate is confirmed
+     * published and its revise settled, before the verdict wait. Idempotent; the executor also releases it
+     * in a finally, so a gate exit that never reaches the wait cannot leak the window.
+     */
+    releaseSwitchDefer?: () => void,
   ): Promise<PlanVerdict>;
   /**
    * Issue #1604 (D3): a resumed, unapproved claim with a persisted plan calls this before it
@@ -857,7 +864,7 @@ export interface RunContext {
    * Absent on the stub/test executors ⇒ the loop/waiters re-throw the CredentialSwitchSignal to the
    * runner's outer catch, byte-identical to the pre-fix behaviour.
    */
-  attemptCredentialSwitch?(opts?: { site: InPlaceSwitchSite; laneSettled: boolean }): Promise<"released" | "gave_up" | "applied">;
+  attemptCredentialSwitch?(opts?: { site: InPlaceSwitchSite; laneSettled: boolean; signal?: unknown }): Promise<"released" | "gave_up" | "applied">;
   /** Codex-only settled-boundary coordinator; only confirmed continuations return. */
   attemptCodexCredentialSwitch?(opts: { site: InPlaceSwitchSite; laneSettled: boolean }): Promise<"continued_A" | "resumed_B" | "fresh_B">;
   /**
@@ -872,6 +879,12 @@ export interface RunContext {
    * the stub/test executors ⇒ `fn` runs undeferred.
    */
   deferCredentialSwitch?<T>(fn: () => Promise<T>): Promise<T>;
+  /**
+   * Issue #4806: open a credential-switch defer window that outlives one call, for a human revision that
+   * spans its planning turn AND the revised gate's publication. Returns an idempotent `release` that closes
+   * the window exactly once. deferCredentialSwitch is this handle scoped to one function.
+   */
+  openCredentialSwitchDefer?(): { release: () => void };
   /**
    * PRD #517 M3: park an INTERACTIVE task run after a clean `signal_done`, waiting for the
    * next follow-up. The runner's implementation (a) reports `awaiting_followup` and verifies

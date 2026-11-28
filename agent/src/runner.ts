@@ -2733,6 +2733,12 @@ type MemoryFlight = {
   readonly feedback: Map<string, { readonly context: MemoryContext; readonly result: WorkerMemoryPressureResult;
     operation?: Promise<boolean> }>;
   unsubscribe?: () => void;
+  /** Issue #4806: set when a credential-switch trip retired the context of a flight PARKED at a human gate (not
+   *  running, holding its phase). The applied-switch arm renews exactly that context; every other retire clears it. */
+  parkedSwitchRetired?: boolean;
+  /** Issue #4806: removes the retire listeners of the CURRENT context (never chained into `unsubscribe`). Called and
+   *  cleared when that context retires, and at teardown. */
+  contextCleanup?: () => void;
   /** Issue #2471: executor listeners told when the worker memory runtime invalidates this flight
    *  (the invalidation subscription only; never a renewal, non-running report or preservation). */
   authorityLost?: Set<(stop: Error) => void>;
@@ -3265,6 +3271,11 @@ interface RunFlight {
   kickMidTurnTick?: () => void;
   runnerClone: RunnerClone | undefined;
   ciFixHumanApproved: boolean;
+  /** Issue #4806: the published human gate of a claim with no associated cross-check gate, kept across a
+   *  CredentialSwitchSignal rejection so an APPLIED in-place switch re-joins the very wait (never republishes). */
+  ordinaryGateWait?: { gate: symbol; wait: () => Promise<PlanVerdict> };
+  /** Issue #4806: the outcome of the last attemptCredentialSwitch hook call; consumed once by the continuation. */
+  lastSwitchOutcome?: "released" | "gave_up" | "applied";
   /** Issue #2083: the server enabled the private decisions memo for this run (set at claim
    *  time from a validated read; false on any failure). Gates the end-of-run memo save. */
   decisionsMemoEnabled: boolean;
@@ -7520,6 +7531,17 @@ export class RunRunner {
           await this.reportGenericFailure(claim, flight, new CandidateTransportInvariantError());
           return;
         }
+        // Issue #4806: a switch signal a receipt failure raised inside a deferred revision window is not a trip
+        // this arm may release or hold on. It becomes the typed control it stands for, or fails closed with the
+        // retention flags set; the fence and shutdown arms above already ran. Never thrown from here.
+        if (flight.steering.isDeferredReceiptSignal(err)) {
+          const stop = this.classifyDeferredReceiptSignal(flight, false);
+          if (stop.failClosed) this.retainForSwitchStop(flight);
+          // This dispatch is not a stopped-source denial, so restore the default selected above.
+          flight.sourceDispatchDenied = priorSourceExitDenied;
+          await dispatchFailure(stop.error);
+          return;
+        }
         // Issue #4201 (R2): an apply-negotiated worker never releases or requeues here. The executor has
         // unwound, so the proof decides between option A (proven) and the hold fence (unproven).
         await this.awaitPendingSwitchOpId(claim, flight);
@@ -7877,9 +7899,12 @@ export class RunRunner {
       await batcher.awaitPermanentFailureSettled();
       await this.reconcileWorkerMemory(flight);
       this.retireWorkerMemory(flight);
+      flight.ordinaryGateWait = undefined;
       if (flight.workerMemory) {
         flight.workerMemory.ended = true;
         flight.workerMemory.unsubscribe?.();
+        flight.workerMemory.contextCleanup?.();
+        flight.workerMemory.contextCleanup = undefined;
         const pending = [
           ...(!flight.workerMemory.settled && flight.workerMemory.operation ? [flight.workerMemory.operation] : []),
           ...(!flight.workerMemory.executorSettled && flight.workerMemory.executorRun ? [flight.workerMemory.executorRun] : []),
@@ -17669,6 +17694,12 @@ export class RunRunner {
         });
       }
     }
+    // Issue #4806: one credential-switch defer window; `release` is idempotent (the executor and the gate both call it).
+    const openSwitchDefer = (): { release: () => void } => {
+      steering.beginCredentialSwitchDefer();
+      let open = true;
+      return { release: () => { if (!open) return; open = false; steering.endCredentialSwitchDefer(); } };
+    };
     const ctx: RunContext = {
       semanticPlanning,
       managedGoWorkDir: flight.managedGoWorkDir,
@@ -17922,13 +17953,16 @@ export class RunRunner {
       // not tripped) — the executor wraps a plan-REVISION planning turn in this so a switch never
       // releases before gatePlan has persisted the revised plan. Balanced begin/finally-end.
       deferCredentialSwitch: async (fn) => {
-        steering.beginCredentialSwitchDefer();
+        const defer = openSwitchDefer();
         try {
           return await fn();
         } finally {
-          steering.endCredentialSwitchDefer();
+          defer.release();
         }
       },
+      // Issue #4806: the same window as a handle that outlives one call (a human revision's turn AND its
+      // revised gate). `release` closes it exactly once.
+      openCredentialSwitchDefer: () => openSwitchDefer(),
       // PRD #1247 M5b (data-integrity fix): attempt the held-state credential switch IN PLACE from
       // wherever the executor was when it tripped (a live implement turn, or an idle gate/question/
       // follow-up waiter), INSTEAD of letting the CredentialSwitchSignal reach the outer catch and
@@ -18410,6 +18444,15 @@ export class RunRunner {
           runLog.error(CANDIDATE_TRANSPORT_INVARIANT_MESSAGE, { run_id: flight.runId });
           throw new CandidateTransportInvariantError();
         }
+        flight.lastSwitchOutcome = undefined;
+        // Issue #4806: a switch signal a receipt failure raised inside a deferred revision window reached this
+        // hook from outside every switch site. It is never entered: it ends as the typed control it stands for,
+        // or fails closed with the retained custody flags set. Untagged and Codex signals keep the order above.
+        if (opts?.signal !== undefined && steering.isDeferredReceiptSignal(opts.signal)) {
+          const stop = this.classifyDeferredReceiptSignal(flight, true);
+          if (stop.failClosed) this.retainForSwitchStop(flight);
+          throw stop.error;
+        }
         const outcome = await this.runGatedSink(flight, async () => {
           // Issue #4201: the in-place switch goes first. It decides before anything destructive runs and
           // falls through to today's release path only on a clean `v1_release`.
@@ -18452,12 +18495,18 @@ export class RunRunner {
         });
         // The marker cleanup and the switch settle must leave the sink before the next tick starts.
         // A release or an uncertain settle keeps the interrupted lifecycle sticky.
+        flight.lastSwitchOutcome = outcome;
         if (outcome === "gave_up") steering.rearmLifecycle();
         if (outcome === "applied") {
           // The held-state trip is spent and the credential moved: re-arm the lifecycle (as a give-up
           // does) and point the context's token at the published credential.
           steering.rearmLifecycle();
           ctx.oauthToken = flight.credential!.current().token;
+          // Issue #4806: renew the memory context a trip retired at a parked human gate.
+          this.renewParkedWorkerMemory(flight, opts?.site ?? "implement_turn");
+        }
+        if (outcome === "gave_up" || outcome === "released") {
+          if (flight.workerMemory) flight.workerMemory.parkedSwitchRetired = undefined;
         }
         if (outcome === "released") {
           pendingCheckedApproval = undefined;
@@ -18501,7 +18550,7 @@ export class RunRunner {
         if (!(cause instanceof TransientRecoveryError) || (!cause.providerOrigin && cause.idleStallKind !== "zero_evidence") || !revisionRecovery) throw cause;
         return revisionRecovery.retry(cause, observer, remainingWallMs);
       },
-      gatePlan: async (rawPlanMd, rawMilestones, onPlanPersisted, settles, rawSemanticSubmission) => {
+      gatePlan: async (rawPlanMd, rawMilestones, onPlanPersisted, settles, rawSemanticSubmission, releaseSwitchDefer) => {
         // The semantic proposal is model-authored too and reaches the compile (and the persisted
         // candidate); `{ invalid: true }` keeps its shape since it carries no strings.
         const semanticSubmission = rawSemanticSubmission === undefined ? undefined : redactStrings(rawSemanticSubmission, flight.redactText);
@@ -18913,6 +18962,14 @@ export class RunRunner {
           gatedPresentation ? { ...gatedPresentation, milestones: presentedMilestones ?? [],
             claimGeneration: flight.claimGeneration } : undefined,
           claim.requested_agent_source,
+          releaseSwitchDefer,
+          // Issue #4806: an ordinary human gate (no associated checked gate) keeps its published wait so an applied
+          // in-place switch re-joins it.
+          !checkedHuman && !checkedApproval ? { set: (wait) => {
+            const gate = Symbol("ordinary-gate");
+            flight.ordinaryGateWait = { gate, wait };
+            return gate;
+          }, clear: (gate) => { if (flight.ordinaryGateWait?.gate === gate) flight.ordinaryGateWait = undefined; } } : undefined,
         ).catch((error) => {
           if (checkedHuman || checkedApproval) {
             if (error instanceof CredentialSwitchSignal) {
@@ -18928,23 +18985,14 @@ export class RunRunner {
         }
         // Human-in-the-loop iff the plan reached an approve verdict via the PARK path
         // (not the auto short-circuit). Read by the pre-push guard below.
-        flight.ciFixHumanApproved = verdict.kind === "approve" && !effectiveAutoApprove;
-        const memory = flight.workerMemory;
-        if (memory && verdict.kind === "approve") {
-          memory.resumeReady = true;
-          memory.epochReady = true;
-        } else if (memory && verdict.kind === "revise" && verdict.automatic !== true && verdict.inputId !== undefined && memory.context) {
-          if (memory.phaseToken && this.memoryRuntime!.commands.releasePhase(memory.phaseToken)) {
-            memory.phaseToken = undefined;
-            memory.revisionContext = memory.context;
-          }
-        }
-        revisionRecovery?.accept(verdict);
-        this.trackRevisionVerdict(flight, verdict);
+        this.settleGateVerdict(flight, verdict, revisionRecovery, effectiveAutoApprove);
         return verdict;
       },
       ...((claim.auto_approve && claim.plan_cross_check_required || !claim.auto_approve && claim.plan_cross_check_gated) && !seeded ? {
         continueExistingPlanGate: async (otherwise: () => Promise<PlanVerdict>) => {
+          // Issue #4806: the outcome of the switch that interrupted the wait, consumed once.
+          const switchOutcome = flight.lastSwitchOutcome;
+          flight.lastSwitchOutcome = undefined;
           // Issue #3953: a serviced switch after an automatic checker REVISE resumes with that
           // exact verdict (one-shot) instead of re-running the plan gate; any other continuation
           // clears it.
@@ -18962,8 +19010,30 @@ export class RunRunner {
           if (!checkedHuman) return tracked(await otherwise());
           if (!checkedHuman.continueWait || checkedHuman.phase === "terminal" || checkedHuman.phase === "revisionplanning")
             return checkedFailure(new Error("plan cross-check: existing human wait unavailable"));
-          try { return tracked(await checkedHuman.continueWait()); }
+          let verdict: PlanVerdict;
+          try { verdict = await checkedHuman.continueWait(); }
           catch (error) { return checkedFailure(error); }
+          // Issue #4806: after an APPLIED switch this wait is the only verdict path (the gatePlan tail never runs
+          // for it), so the same bookkeeping the tail does runs here, outside the failure handling above.
+          if (switchOutcome === "applied") {
+            this.settleGateVerdict(flight, verdict, revisionRecovery, false);
+            return verdict;
+          }
+          return tracked(verdict);
+        },
+      } : !claim.auto_approve && !seeded ? {
+        // Issue #4806: an ordinary human gate re-joins its very wait after an APPLIED switch, never republishing.
+        continueExistingPlanGate: async (otherwise: () => Promise<PlanVerdict>) => {
+          const switchOutcome = flight.lastSwitchOutcome;
+          flight.lastSwitchOutcome = undefined;
+          const held = flight.ordinaryGateWait;
+          if (switchOutcome === "applied" && held) {
+            const verdict = await held.wait();
+            this.settleGateVerdict(flight, verdict, revisionRecovery, false);
+            return verdict;
+          }
+          flight.ordinaryGateWait = undefined;
+          return otherwise();
         },
       } : {}),
       // PRD #88 clarification park: surface the question, post awaiting_input, and
@@ -29001,21 +29071,29 @@ export class RunRunner {
         try { listener(new RetainedRecoveryStop()); } catch { /* the listener owns its failure */ }
       }
     });
-    const retire = () => this.retireWorkerMemory(flight);
-    // Listeners own only this flight and are removed at its terminal reconciliation.
+    // Listeners own only this flight and are removed at its terminal reconciliation. Each passes its abort
+    // reason (issue #4806), so a credential-switch trip is told apart from any other stop.
     const signals = [flight.cancel.signal, flight.steering.terminalLifecycleSignal(), this.shutdownSignal.signal];
-    for (const signal of signals) signal.addEventListener("abort", retire, { once: true });
+    const listeners = signals.map((signal) => () => this.retireWorkerMemory(flight, signal.reason));
+    signals.forEach((signal, i) => signal.addEventListener("abort", listeners[i]!, { once: true }));
     const unsubscribe = memory.unsubscribe;
     memory.unsubscribe = () => {
       unsubscribe?.();
-      for (const signal of signals) signal.removeEventListener("abort", retire);
+      signals.forEach((signal, i) => signal.removeEventListener("abort", listeners[i]!));
     };
   }
 
-  private retireWorkerMemory(flight: RunFlight): void {
+  /**
+   * `cause` is the abort reason when a signal listener retires the context. Issue #4806: a credential-switch trip
+   * that retires the context of a flight parked at a human gate (not running, holding its phase) is recorded in
+   * `parkedSwitchRetired`, so the applied-switch arm can renew exactly that context. A call with no context to retire
+   * returns before touching the marker, so a later no-op retire never clears a recorded trip.
+   */
+  private retireWorkerMemory(flight: RunFlight, cause?: unknown): void {
     const memory = flight.workerMemory;
     const commands = this.memoryRuntime?.commands;
     if (!memory?.context || !commands) return;
+    memory.parkedSwitchRetired = cause instanceof CredentialSwitchSignal && !memory.running && memory.phaseToken !== undefined;
     const context = memory.context;
     const remaining = commands.remaining(context);
     if (remaining !== undefined && context.memory_policy)
@@ -29024,6 +29102,77 @@ export class RunRunner {
     commands.retire(context);
     memory.context = undefined;
     memory.phaseToken = undefined;
+    memory.contextCleanup?.();
+    memory.contextCleanup = undefined;
+  }
+
+  /**
+   * Issue #4806: the typed stop for a CredentialSwitchSignal that a receipt failure raised inside a deferred
+   * revision window (SteeringChannel.isDeferredReceiptSignal), outside every switch site. Modelled on
+   * launchControl, in this order: the claim fence, an owner cancel, a worker shutdown, a disk then a now/wall
+   * pause, an input-receipt failure that ended the flight, and otherwise the fail-closed retained stop. A terminal
+   * lifecycle abort alone is never read as a cancel. `early: false` skips the fence and shutdown steps (the earlier
+   * arms of executeClaim already handle them).
+   */
+  private classifyDeferredReceiptSignal(flight: RunFlight, early: boolean): { error: unknown; failClosed: boolean } {
+    const steering = flight.steering;
+    if (early) {
+      if (steering.claimFence() !== undefined) return { error: new StaleClaimError(), failClosed: false };
+    }
+    if (steering.isCancelled()) return { error: new Error("run cancelled"), failClosed: false };
+    if (early && (this.shutdownSignal.signal.aborted || flight.active?.shuttingDown || this.shuttingDownGlobal))
+      return { error: new Error("worker shutdown"), failClosed: false };
+    const mode = steering.getPauseMode();
+    if (mode === "disk") return { error: new DiskParkSignal(false), failClosed: false };
+    if (mode === "now" || mode === "wall") return { error: new PauseNowSignal(), failClosed: false };
+    const terminal = steering.terminalLifecycleSignal();
+    if (terminal.aborted && isInputReceiptError(terminal.reason)) return { error: terminal.reason, failClosed: false };
+    return { error: new CredentialSwitchRetainedStop("unconfirmed"), failClosed: true };
+  }
+
+  /** The four retention flags a fail-closed retained stop sets (as the Codex branch of the switch hook does). */
+  private retainForSwitchStop(flight: RunFlight): void {
+    flight.preserveRecoveryClone = true;
+    flight.preserveSession = true;
+    flight.keepGuardedInventoryOpen = true;
+    flight.retainedLocalCustody = true;
+  }
+
+  /**
+   * Issue #4806 (D): at an APPLIED in-place switch whose trip retired the context of a flight parked at a human
+   * gate, begin the renewed context from the original registration, episode, claim generation and spent
+   * allowance, holding the gate's phase as the parked flight did. Control stops skip the renewal (the flight
+   * continues as before); memory stops retire and throw the retained stop.
+   */
+  private renewParkedWorkerMemory(flight: RunFlight, site: InPlaceSwitchSite): void {
+    const memory = flight.workerMemory;
+    const runtime = this.memoryRuntime;
+    if (!memory || !runtime || memory.parkedSwitchRetired !== true) return;
+    const steering = flight.steering;
+    if (site !== "plan_gate" && site !== "plan_gate_revision" && site !== "plan_gate_exhausted") {
+      memory.parkedSwitchRetired = undefined;
+      return;
+    }
+    // A newer switch op owns the marker; every other outcome of this decision consumes it.
+    if (steering.pendingCredentialSwitch() !== undefined) return;
+    memory.parkedSwitchRetired = undefined;
+    const mode = steering.getPauseMode();
+    if (steering.isCancelled() || steering.claimFence() !== undefined ||
+        this.shutdownSignal.signal.aborted || flight.active?.shuttingDown || this.shuttingDownGlobal ||
+        mode === "disk" || steering.terminalLifecycleSignal().aborted || mode === "now" || mode === "wall") return;
+    if (memory.incarnation !== this.client.memoryIncarnation || memory.held || memory.hold || memory.ended) {
+      this.retireWorkerMemory(flight);
+      throw new RetainedRecoveryStop();
+    }
+    const context = this.beginMemoryContext(flight, memory);
+    this.assertMemoryAllowance(flight, memory, context);
+    const token = runtime.commands.holdPhase(context);
+    if (!token) {
+      this.retireWorkerMemory(flight);
+      throw new RetainedRecoveryStop();
+    }
+    memory.phaseToken = token;
+    this.watchMemoryContext(flight, memory, context);
   }
 
   private captureWorkerMemory(flight: RunFlight): CapturedMemoryContext | undefined {
@@ -29052,6 +29201,20 @@ export class RunRunner {
     }
     // Renewal uses only the original registration, episode and spent allowance.
     // A retired context is never made current again.
+    const context = this.beginMemoryContext(flight, memory);
+    // A persisted exhausted allowance has no new victim or outcome. Capture the
+    // full binding before retaining custody; executeClaim reconciles the same
+    // original owner operation used by pressure-triggered preservation.
+    this.assertMemoryAllowance(flight, memory, context);
+    if (!memory.running) memory.phaseToken = runtime.commands.holdPhase(context);
+    this.watchMemoryContext(flight, memory, context);
+    return Object.freeze({ commands: runtime.commands, context, flight,
+      lifecycleRevision: context.lifecycleRevision });
+  }
+
+  /** A new memory context for this flight from its original registration, episode, claim generation and spent allowance. */
+  private beginMemoryContext(flight: RunFlight, memory: MemoryFlight): MemoryContext {
+    const runtime = this.memoryRuntime!;
     const context = runtime.begin({
       run_id: flight.runId, worker_id: memory.incarnation.worker_id,
       register_nonce: memory.incarnation.register_nonce, claim_generation: memory.claim.claim_generation!,
@@ -29096,24 +29259,34 @@ export class RunRunner {
       preservationBudgetMs: this.memoryHoldDeadlineMs,
     });
     memory.context = context;
-    // A persisted exhausted allowance has no new victim or outcome. Capture the
-    // full binding before retaining custody; executeClaim reconciles the same
-    // original owner operation used by pressure-triggered preservation.
-    if (runtime.commands.remaining(context) === 0) {
-      this.retainWorkerMemoryCustody(flight);
-      memory.hold = Object.freeze({ context, deadline: Date.now() + this.memoryHoldDeadlineMs,
-        humanRevision: memory.revisionContext === context, origin: this.memoryHoldOrigin(flight),
-        interventionIds: Object.freeze([]) });
-      this.retireWorkerMemory(flight);
-      throw new RetainedRecoveryStop();
-    }
-    if (!memory.running) memory.phaseToken = runtime.commands.holdPhase(context);
-    const retire = () => { if (memory.context === context) this.retireWorkerMemory(flight); };
-    lifecycle.addEventListener("abort", retire, { once: true });
-    const unsubscribe = memory.unsubscribe;
-    memory.unsubscribe = () => { unsubscribe?.(); lifecycle.removeEventListener("abort", retire); };
-    return Object.freeze({ commands: runtime.commands, context, flight,
-      lifecycleRevision: context.lifecycleRevision });
+    memory.parkedSwitchRetired = undefined;
+    return context;
+  }
+
+  /** A persisted exhausted allowance holds the flight and stops it with the retained stop (the capture arm). */
+  private assertMemoryAllowance(flight: RunFlight, memory: MemoryFlight, context: MemoryContext): void {
+    if (this.memoryRuntime!.commands.remaining(context) !== 0) return;
+    this.retainWorkerMemoryCustody(flight);
+    memory.hold = Object.freeze({ context, deadline: Date.now() + this.memoryHoldDeadlineMs,
+      humanRevision: memory.revisionContext === context, origin: this.memoryHoldOrigin(flight),
+      interventionIds: Object.freeze([]) });
+    this.retireWorkerMemory(flight);
+    throw new RetainedRecoveryStop();
+  }
+
+  /** Retire `context` when the CURRENT lifecycle or cancel signal aborts (each passes its reason). */
+  private watchMemoryContext(flight: RunFlight, memory: MemoryFlight, context: MemoryContext): void {
+    memory.contextCleanup?.();
+    const lifecycle = flight.steering.lifecycleSignal();
+    const cancel = flight.cancel.signal;
+    const onLifecycle = (): void => { if (memory.context === context) this.retireWorkerMemory(flight, lifecycle.reason); };
+    const onCancel = (): void => { if (memory.context === context) this.retireWorkerMemory(flight, cancel.reason); };
+    lifecycle.addEventListener("abort", onLifecycle, { once: true });
+    cancel.addEventListener("abort", onCancel, { once: true });
+    memory.contextCleanup = () => {
+      lifecycle.removeEventListener("abort", onLifecycle);
+      cancel.removeEventListener("abort", onCancel);
+    };
   }
 
   /** The identity a hold is written under: read synchronously, so a later substitution of the flight's executor cannot rewrite it. */
@@ -33572,6 +33745,31 @@ export class RunRunner {
     return result;
   }
 
+  /**
+   * The bookkeeping every human gate verdict goes through once the gate wait settles (issue #4806: factored from
+   * the plan-gate callback so a wait re-joined after an applied switch does the same). In order: the ci_fix human
+   * approval flag, the memory flags of an approve, the revision recorder for every verdict, the phase release of a
+   * bound human revise, and the revision tracking.
+   */
+  private settleGateVerdict(
+    flight: RunFlight, verdict: PlanVerdict, revisionRecovery: PlanRevisionRecovery | undefined, effectiveAutoApprove: boolean,
+  ): void {
+    flight.ciFixHumanApproved = verdict.kind === "approve" && !effectiveAutoApprove;
+    const memory = flight.workerMemory;
+    if (memory && verdict.kind === "approve") {
+      memory.resumeReady = true;
+      memory.epochReady = true;
+    }
+    revisionRecovery?.accept(verdict);
+    if (memory && verdict.kind === "revise" && verdict.automatic !== true && verdict.inputId !== undefined && memory.context) {
+      if (memory.phaseToken && this.memoryRuntime!.commands.releasePhase(memory.phaseToken)) {
+        memory.phaseToken = undefined;
+        memory.revisionContext = memory.context;
+      }
+    }
+    this.trackRevisionVerdict(flight, verdict);
+  }
+
   private async gatePlan(
     runId: string,
     planMd: string,
@@ -33624,6 +33822,11 @@ export class RunRunner {
     onSemanticPresented?: (ack: StateAck) => Promise<void>,
     presentedCanonical?: Extract<PlanVerdict, { approval: "cross_check" }>["canonical"],
     requestedSource?: AgentSource | null,
+    // Issue #4806: closes the executor's credential-switch defer window once this revised gate is confirmed and
+    // its revise settled (idempotent; the executor also closes it on every other exit).
+    releaseSwitchDefer?: () => void,
+    // Issue #4806: where an ordinary human gate (no associated checked gate) keeps its published wait.
+    gateWaitSlot?: { set(wait: () => Promise<PlanVerdict>): symbol; clear(gate: symbol): void },
   ): Promise<PlanVerdict> {
     // PRD #1795 (decision 6): nothing is confirmed until THIS gate's own applied awaiting_approval
     // ACK says which revision it published, so a verdict bound to an earlier gate cannot act on
@@ -33907,6 +34110,14 @@ export class RunRunner {
     }
 
     }
+    // Issue #4806: the revised gate is confirmed published and its revise settled; the defer window the executor
+    // held across the revision closes here, before the verdict wait. A legacy lane (no revision recovery) settles
+    // the revise through a plain APPLIED receipt, which must land first.
+    if (releaseSwitchDefer) {
+      if (revisionRecovery === undefined && settles !== undefined && request.revision_input_id === undefined) {
+        try { await steering.awaitReceiptSettlement(); } finally { releaseSwitchDefer(); }
+      } else releaseSwitchDefer();
+    }
     // A terminal verdict ends the gate → clear the shared per-run gate state. A revise
     // keeps the shared budget/epoch state running; the re-report above does the bump.
     const settle = async (v: PlanVerdict): Promise<PlanVerdict> => {
@@ -33980,6 +34191,15 @@ export class RunRunner {
     const publishAndWait = (): Promise<PlanVerdict> =>
       inflight ??= presentAndWait().finally(() => { inflight = undefined; });
     if (associated) associated.continueWait = publishAndWait;
+    if (!associated && gateWaitSlot) {
+      // Kept across a CredentialSwitchSignal rejection (an applied switch re-joins it); dropped on a verdict or any
+      // other rejection.
+      const gate: symbol = gateWaitSlot.set(() => tracked());
+      const tracked = (): Promise<PlanVerdict> => publishAndWait().then(
+        (verdict) => { gateWaitSlot.clear(gate); return verdict; },
+        (error: unknown) => { if (!(error instanceof CredentialSwitchSignal)) gateWaitSlot.clear(gate); throw error; });
+      return tracked();
+    }
     return publishAndWait();
   }
 

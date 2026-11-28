@@ -717,6 +717,23 @@ export class SteeringChannel {
     for (const w of own) this.receiptWaiters.push(w);
   }
 
+  /** Issue #4806: instances of the switch signal created by a RECEIPT failure while a defer window was open
+   *  (see isDeferredReceiptSignal). A trip's own signal (maybeTripCredentialSwitch) is never tagged. */
+  private readonly deferredReceiptSignals = new WeakSet<CredentialSwitchSignal>();
+
+  /** A fresh switch signal for a receipt failure; tagged when a defer window is open at creation. */
+  private receiptSwitchSignal(): CredentialSwitchSignal {
+    const signal = new CredentialSwitchSignal();
+    if (this.switchDeferDepth > 0) this.deferredReceiptSignals.add(signal);
+    return signal;
+  }
+
+  /** Issue #4806: true when `signal` is a CredentialSwitchSignal that a receipt failure created while a defer
+   *  window was open, i.e. a switch that surfaced outside every runThroughSwitch site. */
+  isDeferredReceiptSignal(signal: unknown): boolean {
+    return signal instanceof CredentialSwitchSignal && this.deferredReceiptSignals.has(signal);
+  }
+
   private releaseHeld(): void {
     this.held = undefined;
     this.applyFailures = 0;
@@ -813,7 +830,7 @@ export class SteeringChannel {
         // dropped for the next claim to replay, and the switch is tripped as the GET's signal would.
         // The failure is not sticky, so the release report, finding nothing pending, goes out.
         if (reason === "switch_pending") {
-          this.rejectHeld(new CredentialSwitchSignal());
+          this.rejectHeld(this.receiptSwitchSignal());
           this.maybeTripCredentialSwitch(this.claimGeneration);
           return;
         }
@@ -1221,7 +1238,7 @@ export class SteeringChannel {
         this.settleWaiters();
       } else if (ids.some((id) => this.takenApproveIds.has(id))) {
         this.approveRefusedBySwitch = true;
-        for (const w of this.receiptWaiters.splice(0)) w.reject(new CredentialSwitchSignal());
+        for (const w of this.receiptWaiters.splice(0)) w.reject(this.receiptSwitchSignal());
         this.maybeTripCredentialSwitch(this.claimGeneration);
       } else this.settleWaiters();
       return "continue";
@@ -1242,7 +1259,7 @@ export class SteeringChannel {
       // switch trips.
       if (this.ready) this.parkReady([...this.ready.ids]);
       if (this.parkedReady.some((id) => this.takenApproveIds.has(id))) this.approveRefusedBySwitch = true;
-      for (const w of this.receiptWaiters.splice(0)) w.reject(new CredentialSwitchSignal());
+      for (const w of this.receiptWaiters.splice(0)) w.reject(this.receiptSwitchSignal());
       this.maybeTripCredentialSwitch(this.claimGeneration);
       return "stop";
     }

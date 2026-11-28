@@ -191,6 +191,12 @@ async function scenario(setup: Setup) {
   const last = setup.lastTurn ?? doneTurn(`the new token is ${NEW_TOKEN}`);
   let gates = 0;
   let asks = 0;
+  // Issue #4806: an APPLIED switch at a human gate re-joins the very wait (no republish), so there is no second
+  // awaiting_approval report to answer: the approve follows the final apply. A give-up still republishes.
+  const approveAfterApply = (): void => {
+    if (setup.apply.at(-1)?.outcome !== "applied") return;
+    void until(() => applied().length >= setup.apply.length, 30_000).then(() => { send(runId, row("approve_plan")); });
+  };
   let turnScripts: Array<(signal: AbortSignal) => AsyncIterable<SDKMessage>>;
   switch (setup.site) {
     case "plan_turn":
@@ -206,7 +212,7 @@ async function scenario(setup: Setup) {
       turnScripts = [planTurn(), last];
       api.onState(runId, (b) => {
         if (b.status !== "awaiting_approval") return;
-        if (++gates === 1) requestSwitch(); else send(runId, row("approve_plan"));
+        if (++gates === 1) { requestSwitch(); approveAfterApply(); } else send(runId, row("approve_plan"));
       });
       break;
     case "window":
@@ -224,7 +230,7 @@ async function scenario(setup: Setup) {
         if (b.status !== "awaiting_approval") return;
         ++gates;
         if (gates === 1) send(runId, row("revise_plan", "please revise"));
-        else if (gates === 2) requestSwitch();
+        else if (gates === 2) { requestSwitch(); approveAfterApply(); }
         else send(runId, row("approve_plan"));
       });
       break;
@@ -270,7 +276,7 @@ async function scenario(setup: Setup) {
         if (b.status !== "awaiting_approval") return;
         ++gates;
         if (gates === 1) send(runId, row("revise_plan", "please revise"));
-        else if (gates === 2) requestSwitch();
+        else if (gates === 2) { requestSwitch(); approveAfterApply(); }
         else send(runId, row("approve_plan"));
       });
       break;

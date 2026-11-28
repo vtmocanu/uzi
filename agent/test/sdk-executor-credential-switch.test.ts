@@ -1025,7 +1025,7 @@ describe("SdkExecutor — an applied in-place credential switch (issue #4201)", 
       (signal) => { cancel.abort(new CredentialSwitchSignal()); return hangUntilAbort(signal); },
       doneTurn(),
     ]);
-    const opts: Array<{ site: string; laneSettled: boolean } | undefined> = [];
+    const opts: Array<{ site: string; laneSettled: boolean; signal?: unknown } | undefined> = [];
     const commands = { protect: () => ({}), unprotect: () => true };
     const { ctx } = makeCtx({
       signal: cancel.signal,
@@ -1033,7 +1033,8 @@ describe("SdkExecutor — an applied in-place credential switch (issue #4201)", 
       attemptCredentialSwitch: async (o) => { opts.push(o); throw new Error("stop here"); },
     });
     await assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx), /stop here|unconfirmed/);
-    assert.deepEqual(opts, [{ site: "implement_turn", laneSettled: false }]);
+    // Issue #4806: the caught switch signal rides the hook options (the runner tells a deferred receipt signal by it).
+    assert.deepEqual(opts.map((o) => [o?.site, o?.laneSettled, o?.signal instanceof CredentialSwitchSignal]), [["implement_turn", false, true]]);
   });
 
   it("laneSettled is false when the guarded lane's quiesce failed after the switch trip took the carrier", async (t) => {
@@ -1049,7 +1050,7 @@ describe("SdkExecutor — an applied in-place credential switch (issue #4201)", 
       (signal) => { cancel.abort(new CredentialSwitchSignal()); return hangUntilAbort(signal); },
       doneTurn(),
     ]);
-    const opts: Array<{ site: string; laneSettled: boolean } | undefined> = [];
+    const opts: Array<{ site: string; laneSettled: boolean; signal?: unknown } | undefined> = [];
     const commands = { protect: () => ({}), unprotect: () => true };
     const { ctx } = makeCtx({
       signal: cancel.signal,
@@ -1058,6 +1059,7 @@ describe("SdkExecutor — an applied in-place credential switch (issue #4201)", 
       attemptCredentialSwitch: async (o) => { opts.push(o); throw new Error("stop here"); },
     });
     await assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx), /stop here|unconfirmed/);
-    assert.deepEqual(opts, [{ site: "implement_turn", laneSettled: false }]);
+    // Issue #4806: the caught switch signal rides the hook options (the runner tells a deferred receipt signal by it).
+    assert.deepEqual(opts.map((o) => [o?.site, o?.laneSettled, o?.signal instanceof CredentialSwitchSignal]), [["implement_turn", false, true]]);
   });
 });
