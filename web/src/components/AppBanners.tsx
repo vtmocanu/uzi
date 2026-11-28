@@ -32,7 +32,7 @@ export function AppBanners() {
       {user?.is_admin === true && <HealthAttentionBanner key={user.id} />}
       {/* Forge token expired / expiring / unverified (#4817): every signed-in user, admins
           included. Keyed on the user so a different account never shows the last one's data. */}
-      {user && <ForgeTokenBanner key={user.id} userId={user.id} />}
+      {user && <ForgeTokenBanner key={`forge-token:${user.id}`} userId={user.id} />}
     </>
   );
 }

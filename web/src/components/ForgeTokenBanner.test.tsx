@@ -109,6 +109,17 @@ describe("ForgeTokenBanner", () => {
     expect(screen.queryByRole("button", { name: "Dismiss" })).toBeNull();
   });
 
+  it("an expired banner ignores a stored dismissal for the same signature", async () => {
+    const c = conn("gh", "expired");
+    // Seed every signature form an expired banner could have, with and without its date.
+    const exp = c.privilege_report?.token.expires_at ?? "";
+    const sigs = [`expired|gh:`, `expired|gh:${exp}`];
+    window.sessionStorage.setItem("uzi:forge-token-banner:dismissed:u1", JSON.stringify(sigs));
+    mockApi.listConnectionsBackground.mockResolvedValue({ connections: [c] });
+    await renderBanner();
+    expect(screen.getByRole("alert", { name: "Forge token expired" })).toBeTruthy();
+  });
+
   it("unverified is neutral, lists forge and host, and carries no warn or danger classes", async () => {
     mockApi.listConnectionsBackground.mockResolvedValue({ connections: [conn("gh", "unverified")] });
     await renderBanner();

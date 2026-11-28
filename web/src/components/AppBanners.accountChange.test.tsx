@@ -129,4 +129,19 @@ describe("AppBanners across an account change (#4817)", () => {
     expect(handler).not.toHaveBeenCalled();
     expect(screen.getByRole("status", { name: "Forge token expiring" })).toBeTruthy();
   });
+  it("renders for an admin without a duplicate sibling key", async () => {
+    const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      vi.mocked(useAuth).mockReturnValue(authValue({ ...aUser, id: "admin-1", is_admin: true }));
+      render(tree());
+      await settle();
+      respond(0, 200, { connections: [connection("adm", 3 * DAY)] });
+      await settle();
+      expect(screen.getByRole("status", { name: "Forge token expiring" })).toBeTruthy();
+      const dup = errors.mock.calls.filter((c) => c.some((a) => String(a).includes("same key")));
+      expect(dup).toEqual([]);
+    } finally {
+      errors.mockRestore();
+    }
+  });
 });
