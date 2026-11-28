@@ -71,7 +71,6 @@ const (
 	heStmtTimeout = 300 * time.Millisecond
 	heLockTimeout = 200 * time.Millisecond
 	heMaxBatch    = int32(1000)
-	heMinBatch    = int32(50)
 	heSampleArr   = 250
 	heMarker      = "recovery-reset-v1"
 	// heEvidenceMarker marks only the hrev database this harness created. An ordinary LiveDB
@@ -988,13 +987,13 @@ func TestHistoryRetentionWarmEvidenceLiveDB(t *testing.T) {
 // deadline logic around the production session; the real Pass is exercised by the smoke.
 type hePassState struct {
 	counter uint64
-	batch   map[store.HistoryRetentionTable]int32
+	batch   map[store.HistoryRetentionTable]*historyretention.BatchController
 }
 
 func newPassState(tables []store.HistoryRetentionTable) *hePassState {
-	ps := &hePassState{batch: map[store.HistoryRetentionTable]int32{}}
+	ps := &hePassState{batch: map[store.HistoryRetentionTable]*historyretention.BatchController{}}
 	for _, t := range tables {
-		ps.batch[t] = heMaxBatch
+		ps.batch[t] = historyretention.NewBatchController()
 	}
 	return ps
 }
@@ -1022,13 +1021,14 @@ func (fx *heFx) passTick(ps *hePassState, cutoffs map[store.HistoryRetentionTabl
 		if !sel {
 			continue
 		}
-		r := heTickRes{Table: table, Batch: ps.batch[table]}
+		ctl := ps.batch[table]
+		r := heTickRes{Table: table, Batch: ctl.Limit()}
 		r.N, r.Err = fx.deleteOn(workCtx, sess, table, cutoff, r.Batch, &r)
 		switch r.Err {
 		case "":
-			ps.batch[table] = min(r.Batch*2, heMaxBatch)
+			ctl.Succeeded(r.Batch, r.N)
 		case "57014":
-			ps.batch[table] = max(r.Batch/2, heMinBatch)
+			ctl.TimedOut(r.Batch)
 		}
 		out = append(out, r)
 		if strings.HasPrefix(r.Err, "unknown") {
