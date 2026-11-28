@@ -40,7 +40,7 @@ const (
 	phaseRecheck               = "recheck"
 	phaseBuild                 = "build"
 	phasePublish               = "publish"
-	phasePanic                 = "panic"
+	lockBusyRetry              = time.Minute
 	analyticsPrecomputeLogName = "analytics precompute"
 )
 
@@ -125,7 +125,8 @@ func (s *Scheduler) Start(ctx context.Context) {
 func (s *Scheduler) Wait() { s.wg.Wait() }
 
 // Pass is the sweeper pass. It does no I/O: when no build is running, the process context is live
-// and the local backoff has passed, it starts one build goroutine and returns 1; otherwise 0.
+// and the local backoff has passed, it starts one build goroutine. It always returns 0: the sweeper
+// logs only rows touched; the build logs its own outcome.
 func (s *Scheduler) Pass(_ context.Context) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -135,13 +136,14 @@ func (s *Scheduler) Pass(_ context.Context) (int64, error) {
 	s.running = true
 	s.wg.Add(1)
 	go s.run(s.base)
-	return 1, nil
+	return 0, nil
 }
 
 type sectionOutcome struct {
 	failed      bool      // recorded failure (counts toward the backoff)
 	unresolved  bool      // publish commit result unknown: local backoff only
 	invalidated bool      // a delete committed mid-build: short local retry
+	busy        bool      // another replica holds the build lock: local retry after lockBusyRetry
 	deferUntil  time.Time // shared backoff seen: do not look again before this
 	at          time.Time // when the outcome was observed
 }
@@ -156,8 +158,8 @@ func (s *Scheduler) run(base context.Context) {
 	ctx, cancel := context.WithTimeout(base, s.buildBound)
 	defer cancel()
 
-	var failed, invalidated bool
-	var failedAt, invalidatedAt, until time.Time
+	var failed, invalidated, busy bool
+	var failedAt, invalidatedAt, busyAt, until time.Time
 	for _, sec := range s.sections {
 		o := s.runSection(ctx, base, sec)
 		switch {
@@ -165,6 +167,8 @@ func (s *Scheduler) run(base context.Context) {
 			failed, failedAt = true, o.at
 		case o.invalidated:
 			invalidated, invalidatedAt = true, o.at
+		case o.busy:
+			busy, busyAt = true, o.at
 		}
 		if o.deferUntil.After(until) {
 			until = o.deferUntil
@@ -183,6 +187,10 @@ func (s *Scheduler) run(base context.Context) {
 	case invalidated:
 		s.invalidations++
 		if t := invalidatedAt.Add(backoff(invalidationBackoffBase, s.invalidations)); t.After(next) {
+			next = t
+		}
+	case busy:
+		if t := busyAt.Add(lockBusyRetry); t.After(next) {
 			next = t
 		}
 	default:
@@ -221,14 +229,15 @@ func backedOff(st store.AnalyticsPrecomputeState, now time.Time) time.Time {
 // runSection works one section. base is the process context; ctx is base bounded by buildBound.
 func (s *Scheduler) runSection(ctx, base context.Context, sec Section) (out sectionOutcome) {
 	phase := phaseStatus
+	panicked := false
 	fail := func(err error) {
 		out = sectionOutcome{failed: true, at: s.d.clock()}
-		s.logFailure(sec.Name, phase, err)
+		s.logFailure(base, sec.Name, phase, err, panicked)
 		s.recordFailure(base, out.at, err)
 	}
 	defer func() {
 		if r := recover(); r != nil {
-			phase = phasePanic
+			panicked = true
 			fail(fmt.Errorf("panic: %v", r))
 		}
 	}()
@@ -249,7 +258,7 @@ func (s *Scheduler) runSection(ctx, base context.Context, sec Section) (out sect
 		return
 	}
 	if !acquired {
-		return sectionOutcome{}
+		return sectionOutcome{busy: true, at: s.d.clock()}
 	}
 	defer func() {
 		cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), closeTimeout)
@@ -317,8 +326,13 @@ func (s *Scheduler) skip(st store.AnalyticsPrecomputeState, sec Section) (bool, 
 	return false, time.Time{}
 }
 
-func (s *Scheduler) logFailure(section, phase string, err error) {
-	slog.Error(analyticsPrecomputeLogName+": build failed", "section", section, "phase", phase, "error", err)
+// logFailure logs a failed section. A process shutdown (base cancelled) is expected, not an error.
+func (s *Scheduler) logFailure(base context.Context, section, phase string, err error, panicked bool) {
+	if base.Err() != nil {
+		slog.Info(analyticsPrecomputeLogName+": build cancelled by shutdown", "section", section, "phase", phase)
+		return
+	}
+	slog.Error(analyticsPrecomputeLogName+": build failed", "section", section, "phase", phase, "panic", panicked, "error", err)
 }
 
 // recordFailure writes the failure on a fresh pooled connection under its own deadline. A process

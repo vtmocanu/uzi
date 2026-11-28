@@ -66,8 +66,8 @@ func TestAnalyticsSchedulerSharedStateLiveDB(t *testing.T) {
 		}}}, func() time.Time { return bClock })
 	run := func(s *analyticsprecompute.Scheduler) {
 		t.Helper()
-		if n, err := s.Pass(context.Background()); err != nil || n != 1 {
-			t.Fatalf("Pass = (%d, %v), want a started build", n, err)
+		if n, err := s.Pass(context.Background()); err != nil || n != 0 {
+			t.Fatalf("Pass = (%d, %v), want (0, nil): a build start is not a row", n, err)
 		}
 		s.Wait()
 	}
@@ -125,8 +125,8 @@ func TestAnalyticsSchedulerEndToEndLiveDB(t *testing.T) {
 	}}, func() time.Time { return f.now })
 	build := func() {
 		t.Helper()
-		if n, err := sched.Pass(context.Background()); err != nil || n != 1 {
-			t.Fatalf("Pass = (%d, %v), want a started build", n, err)
+		if n, err := sched.Pass(context.Background()); err != nil || n != 0 {
+			t.Fatalf("Pass = (%d, %v), want (0, nil): a build start is not a row", n, err)
 		}
 		sched.Wait()
 	}
@@ -146,8 +146,11 @@ func TestAnalyticsSchedulerEndToEndLiveDB(t *testing.T) {
 
 	// A committed user delete empties the set.
 	doomed := f.user(false)
-	build() // the set is fresh: no build, no publish
 	publications := apSchedPublications(t, f.pool)
+	build() // the set is fresh: no build, no publish
+	if got := apSchedPublications(t, f.pool); got != publications {
+		t.Fatalf("a fresh set was published again: publications %v -> %v", publications, got)
+	}
 	cliMustExec(t, f.pool, `DELETE FROM users WHERE id = $1`, doomed)
 	if rec := f.cookie(admin, path); rec.Code != http.StatusServiceUnavailable || rec.Result().Header.Get("Retry-After") != "60" {
 		t.Fatalf("after the delete: %d %v %s, want pending", rec.Code, rec.Result().Header, rec.Body.String())

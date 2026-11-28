@@ -913,8 +913,7 @@ func TestAnalyticsPrecomputeStatusLiveDB(t *testing.T) {
 	}
 }
 
-// Mutation it must catch: ReadAnalyticsPrecomputeStatus or the session's Status ignoring the keys, or
-// the session variant reading through another connection than the locked one.
+// Mutation it must catch: ReadAnalyticsPrecomputeStatus or the session's Status ignoring the keys.
 func TestAnalyticsPrecomputeStatusHelpersLiveDB(t *testing.T) {
 	e := apOpenEnv(t)
 	at := apNow().Add(-time.Minute)
