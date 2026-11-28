@@ -1,6 +1,6 @@
 {
   "harness_versions": {
-    "claude_agent_sdk": "0.3.325",
+    "claude_agent_sdk": "0.3.330",
     "codex": "0.171.0"
   },
   "invariants": [
@@ -958,6 +958,31 @@
       "value": "OTEL_RESOURCE_ATTRIBUTES",
       "invariant": "harness_control",
       "note": "telemetry resource attributes and statusline collector eligibility in Codex"
+    },
+    {
+      "value": "OTEL_RESOURCE_INCLUDE_HOST",
+      "invariant": "harness_control",
+      "note": "Claude CLI telemetry host metadata selection"
+    },
+    {
+      "value": "PROGRAMFILES",
+      "invariant": "managed_dirs",
+      "note": "Windows sandbox PowerShell module path root used by the Claude CLI"
+    },
+    {
+      "value": "SANDBOX_OFFICE_PDF_DIR",
+      "invariant": "managed_dirs",
+      "note": "host-managed Claude CLI Office attachment conversion directory"
+    },
+    {
+      "value": "SANDBOX_OFFICE_PDF_SEND",
+      "invariant": "harness_control",
+      "note": "Claude CLI Office attachment delivery selection"
+    },
+    {
+      "value": "SANDBOX_RUNTIME",
+      "invariant": "harness_control",
+      "note": "trusted sandbox runtime marker used by Claude CLI permission-mode transitions"
     }
   ],
   "denied_prefixes": [
@@ -2637,6 +2662,36 @@
       "harness": "codex",
       "decision": "denied",
       "reason": "workload identity ID read by login/src/auth/workload_identity.rs ProcessEnvironment::read; already denied by OPENAI_"
+    },
+    {
+      "name": "OTEL_RESOURCE_INCLUDE_HOST",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "Claude CLI telemetry host metadata is harness-controlled"
+    },
+    {
+      "name": "PROGRAMFILES",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "Claude CLI uses this Windows directory to construct its sandbox PowerShell module path"
+    },
+    {
+      "name": "SANDBOX_OFFICE_PDF_DIR",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "Claude CLI uses this host-managed directory for Office attachment conversion"
+    },
+    {
+      "name": "SANDBOX_OFFICE_PDF_SEND",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "Claude CLI uses this flag to select Office attachment types for bridge delivery"
+    },
+    {
+      "name": "SANDBOX_RUNTIME",
+      "harness": "claude",
+      "decision": "denied",
+      "reason": "Claude CLI reads this trusted runtime marker when evaluating permission-mode transitions"
     }
   ]
 }

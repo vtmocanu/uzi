@@ -6,7 +6,7 @@
 /** Harness versions the lists below were derived from. A bump of either harness must
  *  update the fixture, which test/run-env-names.test.ts enforces. */
 export const RUN_ENV_HARNESS_VERSIONS = {
-  claude_agent_sdk: "0.3.325",
+  claude_agent_sdk: "0.3.330",
   codex: "0.171.0",
 } as const;
 
@@ -219,6 +219,11 @@ export const RUN_ENV_DENIED_NAMES: readonly RunEnvDeniedRule[] = [
   { value: "SPIFFE_ENDPOINT_SOCKET", invariant: "provider_auth", note: "workload identity endpoint Codex reads to obtain provider credentials" },
   { value: "SSH2_CLIENT", invariant: "git_authority", note: "its presence changes Codex network proxy credential brokerage" },
   { value: "OTEL_RESOURCE_ATTRIBUTES", invariant: "harness_control", note: "telemetry resource attributes and statusline collector eligibility in Codex" },
+  { value: "OTEL_RESOURCE_INCLUDE_HOST", invariant: "harness_control", note: "Claude CLI telemetry host metadata selection" },
+  { value: "PROGRAMFILES", invariant: "managed_dirs", note: "Windows sandbox PowerShell module path root used by the Claude CLI" },
+  { value: "SANDBOX_OFFICE_PDF_DIR", invariant: "managed_dirs", note: "host-managed Claude CLI Office attachment conversion directory" },
+  { value: "SANDBOX_OFFICE_PDF_SEND", invariant: "harness_control", note: "Claude CLI Office attachment delivery selection" },
+  { value: "SANDBOX_RUNTIME", invariant: "harness_control", note: "trusted sandbox runtime marker used by Claude CLI permission-mode transitions" },
 ];
 
 /** Name prefixes reserved for the worker and the agent harnesses. */

@@ -212,6 +212,11 @@ var deniedNames = []deniedRule{
 	{"SPIFFE_ENDPOINT_SOCKET", "provider_auth", "workload identity endpoint Codex reads to obtain provider credentials"},
 	{"SSH2_CLIENT", "git_authority", "its presence changes Codex network proxy credential brokerage"},
 	{"OTEL_RESOURCE_ATTRIBUTES", "harness_control", "telemetry resource attributes and statusline collector eligibility in Codex"},
+	{"OTEL_RESOURCE_INCLUDE_HOST", "harness_control", "Claude CLI telemetry host metadata selection"},
+	{"PROGRAMFILES", "managed_dirs", "Windows sandbox PowerShell module path root used by the Claude CLI"},
+	{"SANDBOX_OFFICE_PDF_DIR", "managed_dirs", "host-managed Claude CLI Office attachment conversion directory"},
+	{"SANDBOX_OFFICE_PDF_SEND", "harness_control", "Claude CLI Office attachment delivery selection"},
+	{"SANDBOX_RUNTIME", "harness_control", "trusted sandbox runtime marker used by Claude CLI permission-mode transitions"},
 }
 
 // deniedPrefixes are name prefixes reserved for the worker and the agent harnesses.
