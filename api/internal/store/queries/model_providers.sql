@@ -400,9 +400,10 @@ SELECT pg_advisory_xact_lock(
 );
 
 -- name: CountSharedModelProviders :one
--- The shared cap count: retired definitions included (retiring must not free a slot). Run under
+-- The shared cap count: retired definitions included (retiring must not free a slot), and both
+-- credential modes (an organization-funded definition holds a slot too). Run under
 -- LockSharedModelProviderCatalogue. Authorized caller: the admin create path.
-SELECT count(*) FROM model_providers WHERE owner_user_id IS NULL AND credential_mode = 'per_user_key';
+SELECT count(*) FROM model_providers WHERE owner_user_id IS NULL AND credential_mode IN ('per_user_key', 'operator_key');
 
 -- name: InsertSharedModelProvider :one
 -- A shared definition of the named engine (claude or codex): NULL owner, per-user-key mode, the nil
@@ -413,13 +414,21 @@ INSERT INTO model_providers (owner_user_id, name, engine, current_revision, cred
 VALUES (NULL, @name, @engine, 1, 'per_user_key', '00000000-0000-0000-0000-000000000000'::uuid)
 RETURNING id, owner_user_id, name, engine, current_revision, retired_at, created_at, credential_mode, scope_owner_id;
 
+-- name: InsertSharedOperatorModelProvider :one
+-- An organization-funded shared definition: NULL owner, operator-key mode, Claude only (the engine is a
+-- literal here and model_providers_operator_engine_check enforces it), the nil shared scope. Its key is
+-- held in model_provider_operator_keys. Authorized caller: the admin create path.
+INSERT INTO model_providers (owner_user_id, name, engine, current_revision, credential_mode, scope_owner_id)
+VALUES (NULL, @name, 'claude', 1, 'operator_key', '00000000-0000-0000-0000-000000000000'::uuid)
+RETURNING id, owner_user_id, name, engine, current_revision, retired_at, created_at, credential_mode, scope_owner_id;
+
 -- name: LockSharedModelProviderForEdit :one
 -- The edit transaction's first statement for a shared definition: FOR NO KEY UPDATE takes the same lock
 -- the bump and the rename would, so the order is fixed up front and a concurrent run-create share lock
 -- (LockModelProviderForShare) waits for the edit. No per-user lock is involved. A retired definition is
 -- returned so the handler can refuse it with the right error. Authorized caller: admin edit.
-SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at FROM model_providers p
-WHERE p.id = @id AND p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'
+SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at, p.credential_mode FROM model_providers p
+WHERE p.id = @id AND p.owner_user_id IS NULL AND p.credential_mode IN ('per_user_key', 'operator_key')
 FOR NO KEY UPDATE OF p;
 
 -- name: LockSharedModelProviderForDelete :one
@@ -428,7 +437,7 @@ FOR NO KEY UPDATE OF p;
 -- the selection and key counts that follow cannot change before the delete commits. Authorized caller:
 -- admin delete.
 SELECT p.id, p.name, p.current_revision, p.retired_at FROM model_providers p
-WHERE p.id = @id AND p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'
+WHERE p.id = @id AND p.owner_user_id IS NULL AND p.credential_mode IN ('per_user_key', 'operator_key')
 FOR UPDATE OF p;
 
 -- name: BumpSharedModelProviderRevision :one
@@ -436,19 +445,19 @@ FOR UPDATE OF p;
 -- definition is not edited (0 rows). Authorized caller: admin edit, after LockSharedModelProviderForEdit.
 UPDATE model_providers
 SET current_revision = current_revision + 1
-WHERE id = @id AND owner_user_id IS NULL AND credential_mode = 'per_user_key' AND retired_at IS NULL
+WHERE id = @id AND owner_user_id IS NULL AND credential_mode IN ('per_user_key', 'operator_key') AND retired_at IS NULL
 RETURNING current_revision;
 
 -- name: RenameSharedModelProvider :execrows
 -- Authorized caller: admin edit. A case-insensitive name collision is a unique violation
 -- (model_providers_shared_name_lower_key).
 UPDATE model_providers SET name = @name
-WHERE id = @id AND owner_user_id IS NULL AND credential_mode = 'per_user_key';
+WHERE id = @id AND owner_user_id IS NULL AND credential_mode IN ('per_user_key', 'operator_key');
 
 -- name: RetireSharedModelProvider :execrows
 -- Idempotent: the first retirement time is kept. Authorized caller: admin retire.
 UPDATE model_providers SET retired_at = COALESCE(retired_at, now())
-WHERE id = @id AND owner_user_id IS NULL AND credential_mode = 'per_user_key';
+WHERE id = @id AND owner_user_id IS NULL AND credential_mode IN ('per_user_key', 'operator_key');
 
 -- name: PruneSharedModelProviderRevisions :execrows
 -- Deletes a shared definition's non-current revisions that NO run row references, as
@@ -458,7 +467,7 @@ DELETE FROM model_provider_revisions rev
 USING model_providers p
 WHERE rev.provider_id = @id
   AND p.id = rev.provider_id
-  AND p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'
+  AND p.owner_user_id IS NULL AND p.credential_mode IN ('per_user_key', 'operator_key')
   AND rev.revision <> p.current_revision
   AND NOT EXISTS (
         SELECT 1 FROM runs r
@@ -486,17 +495,26 @@ WHERE (claude_provider_id = @id::uuid AND claude_provider_scope_id = '00000000-0
 -- name: DeleteSharedModelProvider :execrows
 -- Cascades to the definition's revisions and legacy probe rows. Refused with a foreign-key violation
 -- while any user has it selected. Authorized caller: admin delete.
-DELETE FROM model_providers WHERE id = @id AND owner_user_id IS NULL AND credential_mode = 'per_user_key';
+DELETE FROM model_providers WHERE id = @id AND owner_user_id IS NULL AND credential_mode IN ('per_user_key', 'operator_key');
 
 -- name: ListSharedModelProvidersAdmin :many
--- The shared catalogue as an admin sees it: the current revision's fields and two counts, never a key
--- or a per-user result. Authorized caller: admin list (cookie, or the admin-read token).
+-- The shared catalogue as an admin sees it: the current revision's fields and two counts, and for an
+-- organization-funded definition whether its key is set, enabled and when, plus the Test evidence for
+-- that exact key. Never a key, its ciphertext, its revision or a per-user result. Authorized caller: admin list (cookie, or the admin-read token).
 SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at, p.created_at,
+       p.credential_mode,
        r.protocol, r.base_url, r.auth_style, r.model_map,
        COALESCE(su.n, 0)::bigint AS selected_user_count,
-       COALESCE(ak.n, 0)::bigint AS attached_key_count
+       COALESCE(ak.n, 0)::bigint AS attached_key_count,
+       (cust.provider_id IS NOT NULL)::boolean AS operator_key_present,
+       cust.disabled_at AS operator_key_disabled_at,
+       cust.set_at AS operator_key_set_at,
+       cev.auth_result, cev.tool_result, cev.probed_at
 FROM model_providers p
 JOIN model_provider_revisions r ON r.provider_id = p.id AND r.revision = p.current_revision
+LEFT JOIN model_provider_operator_keys cust ON cust.provider_id = p.id
+LEFT JOIN model_provider_operator_key_test_results cev ON cev.provider_id = p.id AND cev.revision = p.current_revision
+     AND cev.key_id = cust.id AND cev.key_rev = cust.key_rev AND p.retired_at IS NULL
 LEFT JOIN (SELECT sel.pid, count(*) AS n FROM (
               SELECT id AS uid, claude_provider_id AS pid FROM users
                WHERE claude_provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid
@@ -507,17 +525,25 @@ LEFT JOIN (SELECT sel.pid, count(*) AS n FROM (
 LEFT JOIN (SELECT provider_id AS pid, count(*) AS n FROM user_secrets
             WHERE provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid
             GROUP BY provider_id) ak ON ak.pid = p.id
-WHERE p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key'
+WHERE p.owner_user_id IS NULL AND p.credential_mode IN ('per_user_key', 'operator_key')
 ORDER BY lower(p.name), p.id;
 
 -- name: GetSharedModelProviderAdmin :one
 -- One shared definition as ListSharedModelProvidersAdmin returns it. Authorized caller: admin get.
 SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at, p.created_at,
+       p.credential_mode,
        r.protocol, r.base_url, r.auth_style, r.model_map,
        COALESCE(su.n, 0)::bigint AS selected_user_count,
-       COALESCE(ak.n, 0)::bigint AS attached_key_count
+       COALESCE(ak.n, 0)::bigint AS attached_key_count,
+       (cust.provider_id IS NOT NULL)::boolean AS operator_key_present,
+       cust.disabled_at AS operator_key_disabled_at,
+       cust.set_at AS operator_key_set_at,
+       cev.auth_result, cev.tool_result, cev.probed_at
 FROM model_providers p
 JOIN model_provider_revisions r ON r.provider_id = p.id AND r.revision = p.current_revision
+LEFT JOIN model_provider_operator_keys cust ON cust.provider_id = p.id
+LEFT JOIN model_provider_operator_key_test_results cev ON cev.provider_id = p.id AND cev.revision = p.current_revision
+     AND cev.key_id = cust.id AND cev.key_rev = cust.key_rev AND p.retired_at IS NULL
 LEFT JOIN (SELECT sel.pid, count(*) AS n FROM (
               SELECT id AS uid, claude_provider_id AS pid FROM users
                WHERE claude_provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid
@@ -528,4 +554,101 @@ LEFT JOIN (SELECT sel.pid, count(*) AS n FROM (
 LEFT JOIN (SELECT provider_id AS pid, count(*) AS n FROM user_secrets
             WHERE provider_scope_id = '00000000-0000-0000-0000-000000000000'::uuid
             GROUP BY provider_id) ak ON ak.pid = p.id
-WHERE p.id = @id AND p.owner_user_id IS NULL AND p.credential_mode = 'per_user_key';
+WHERE p.id = @id AND p.owner_user_id IS NULL AND p.credential_mode IN ('per_user_key', 'operator_key');
+
+-- name: LockOperatorProviderKeyForWrite :one
+-- The organization key's identity, revision and enablement, locked FOR UPDATE inside a key write or a
+-- definition delete. It reads no ciphertext. A key write takes the definition's edit lock first, so the
+-- order is always definition then key; a delete takes it as a presence read, and no row (pgx.ErrNoRows)
+-- means no key is set. Authorized callers: the admin key writes and admin delete.
+SELECT id, key_rev, disabled_at FROM model_provider_operator_keys
+WHERE provider_id = @provider_id
+FOR UPDATE;
+
+-- name: InsertOperatorProviderKey :one
+-- Sets the organization key of a definition: the first key only (provider_id is unique). key_rev comes
+-- from the column default, the one sequence every write to custody draws from. The caller seals the key
+-- with operatorkey.Seal. Authorized caller: admin key set, after LockSharedModelProviderForEdit.
+INSERT INTO model_provider_operator_keys (provider_id, ciphertext, set_by)
+VALUES (@provider_id, @ciphertext, @set_by)
+RETURNING id, key_rev, disabled_at, set_at;
+
+-- name: ReplaceOperatorProviderKey :one
+-- Replaces the sealed key in place: a new key_rev from the sequence, the setter and the time, and the
+-- enablement kept as it was. Authorized caller: admin key replace, after LockOperatorProviderKeyForWrite.
+UPDATE model_provider_operator_keys
+SET ciphertext = @ciphertext, key_rev = nextval('model_provider_operator_key_rev_seq'), set_by = @set_by, set_at = now()
+WHERE provider_id = @provider_id
+RETURNING id, key_rev, disabled_at, set_at;
+
+-- name: DisableOperatorProviderKey :execrows
+-- Disabling is a state change: it draws a new key_rev. Disabling a disabled key matches no row, so a
+-- repeat leaves key_rev alone. Authorized caller: admin key disable, after LockOperatorProviderKeyForWrite.
+UPDATE model_provider_operator_keys
+SET disabled_at = now(), key_rev = nextval('model_provider_operator_key_rev_seq')
+WHERE provider_id = @provider_id AND disabled_at IS NULL;
+
+-- name: EnableOperatorProviderKey :execrows
+-- Enabling is a state change: it draws a new key_rev. Enabling an enabled key matches no row.
+-- Authorized caller: admin key enable, after LockOperatorProviderKeyForWrite.
+UPDATE model_provider_operator_keys
+SET disabled_at = NULL, key_rev = nextval('model_provider_operator_key_rev_seq')
+WHERE provider_id = @provider_id AND disabled_at IS NOT NULL;
+
+-- name: DeleteOperatorProviderKey :execrows
+-- Removes the organization key and, through the foreign key, its Test evidence. A later set inserts a
+-- new row with a new id and a larger key_rev. Authorized caller: admin key delete, which holds
+-- LockSharedModelProviderForEdit first and then LockOperatorProviderKeyForWrite.
+DELETE FROM model_provider_operator_keys WHERE provider_id = @provider_id;
+
+-- name: GetOperatorProviderKeyForTest :one
+-- The ONE read of the sealed organization key, for the admin Test probe. It matches only the exact key
+-- the probe captured (row id, definition and key_rev) while it is enabled, so a replaced, disabled or
+-- deleted key reads as no row. Authorized caller: admin Test.
+SELECT ciphertext, key_rev FROM model_provider_operator_keys
+WHERE id = @id AND provider_id = @provider_id AND key_rev = @key_rev AND disabled_at IS NULL;
+
+-- name: GetOperatorProviderForTest :one
+-- The admin Test probe's snapshot of an organization-funded definition in one statement: whether it is
+-- retired, its current revision and that revision's profile, and the key's identity, revision and
+-- enablement (all NULL when no key is set). It never returns ciphertext. Authorized caller: admin Test.
+SELECT p.id, p.name, p.current_revision, p.retired_at,
+       r.protocol, r.base_url, r.auth_style, r.model_map,
+       cust.id AS key_id, cust.key_rev AS key_rev, cust.disabled_at AS key_disabled_at
+FROM model_providers p
+JOIN model_provider_revisions r ON r.provider_id = p.id AND r.revision = p.current_revision
+LEFT JOIN model_provider_operator_keys cust ON cust.provider_id = p.id
+WHERE p.id = @id AND p.owner_user_id IS NULL AND p.credential_mode = 'operator_key';
+
+-- name: LockOperatorProviderForEvidence :one
+-- First half of the admin Test evidence fence, in one short transaction AFTER the probe returns: the
+-- definition must still be an organization-funded one at the probed revision and not retired. FOR SHARE
+-- (not KEY SHARE) so a revision bump, which takes FOR NO KEY UPDATE, waits for this transaction instead
+-- of committing past it. Followed by LockOperatorProviderKeyForEvidence, then
+-- UpsertOperatorProviderKeyTestResult. Authorized caller: admin Test.
+SELECT p.id, p.current_revision
+FROM model_providers p
+WHERE p.id = @id AND p.owner_user_id IS NULL AND p.credential_mode = 'operator_key'
+  AND p.current_revision = @revision
+  AND p.retired_at IS NULL
+FOR SHARE OF p;
+
+-- name: LockOperatorProviderKeyForEvidence :one
+-- Second half of the admin Test evidence fence: the exact key row the probe used, locked FOR SHARE, only
+-- while it is at the probed key_rev and enabled. A replace, disable or delete that committed first finds
+-- no row; one in flight holds the row FOR UPDATE, so this waits for it and re-checks (READ COMMITTED).
+-- Authorized caller: admin Test.
+SELECT k.id, k.key_rev FROM model_provider_operator_keys k
+WHERE k.id = @key_id AND k.provider_id = @provider_id AND k.key_rev = @key_rev AND k.disabled_at IS NULL
+FOR SHARE;
+
+-- name: UpsertOperatorProviderKeyTestResult :exec
+-- Records the Test evidence for one definition: the exact tuple the probe ran against. Called only after
+-- LockOperatorProviderForEvidence and LockOperatorProviderKeyForEvidence both returned a row in the same
+-- transaction; the foreign keys (revision, custody) are the structural backstop. Authorized caller: admin Test.
+INSERT INTO model_provider_operator_key_test_results (provider_id, revision, key_id, key_rev, auth_result, tool_result, probed_at, probed_by)
+VALUES (@provider_id, @revision, @key_id, @key_rev, @auth_result, @tool_result, now(), @probed_by)
+ON CONFLICT (provider_id) DO UPDATE
+SET revision = EXCLUDED.revision, key_id = EXCLUDED.key_id, key_rev = EXCLUDED.key_rev,
+    auth_result = EXCLUDED.auth_result, tool_result = EXCLUDED.tool_result,
+    probed_at = EXCLUDED.probed_at, probed_by = EXCLUDED.probed_by;

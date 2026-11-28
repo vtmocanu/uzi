@@ -29,6 +29,9 @@ export type NavDef = {
   label: string;
   to: string;
   icon: ReactNode;
+  // The sidebar motion key (sidebarMotion.tsx) when it differs from `key`: a module entry keeps
+  // its `module:<id>` key and plays its vocabulary icon's motion. The command menu ignores it.
+  motionKey?: string;
   // Rendered (and listed in the command menu) for admins only.
   adminOnly?: boolean;
   // Active only on an exact path match, so a parent is not lit by its children.

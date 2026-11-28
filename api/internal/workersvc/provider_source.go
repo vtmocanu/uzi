@@ -29,9 +29,11 @@ var (
 	// (retired, URL no longer allowlisted, key missing or disabled). Never falls back to a vendor
 	// credential or to the other engine. 409 provider_source_unusable.
 	ErrProviderSourceUnusable = errors.New("provider_source_unusable")
-	// ErrProviderLaneUnsupported: cross-check and isolated (egress-profile, i.e. site-list job) runs
-	// do not support a provider-sourced owner until PRD #4322; a Claude judge (PRD #4322 M1a), a Codex
-	// judge (PRD #4574 M1) and a Claude job without a site list (M1b) are provider-bound, while a
+	// ErrProviderLaneUnsupported: a Refused cross-check lane (PRD #4574 M2 checkerLaneDecision: a Claude
+	// checker under a provider-bound lead or a Claude source, or a Codex checker with no Codex source
+	// under either) and isolated (egress-profile, i.e. site-list job) runs; a Codex checker under a
+	// selected Codex source is provider-bound (PRD #4574 M2), as are a Claude judge (PRD #4322 M1a), a Codex
+	// judge (PRD #4574 M1) and a Claude job without a site list (M1b), while a
 	// site-list job under a selected Claude source is refused, usable or not. 409 provider_lane_unsupported.
 	ErrProviderLaneUnsupported = errors.New("provider_lane_unsupported")
 	// ErrProviderModelUnmapped: a model the run would use is neither a mapped alias nor a mapped

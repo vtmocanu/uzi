@@ -452,7 +452,7 @@ func mustParseAnalytics(t *testing.T, query string, admin bool, section string, 
 	if err != nil {
 		t.Fatal(err)
 	}
-	req, msg := parseAnalyticsRequest(q, admin, section, caller)
+	req, msg := parseAnalyticsRequest(q, admin, section, caller, false)
 	if msg != "" {
 		t.Fatalf("parse %q: %s", query, msg)
 	}
@@ -483,7 +483,7 @@ func TestAnalyticsSpendStatementScopeAndReveal(t *testing.T) {
 	// A query that tries to smuggle the flag or a user is rejected before any statement exists.
 	for _, q := range []string{"reveal_repos=true", "user=" + selected.String()} {
 		vals, _ := url.ParseQuery(q)
-		if _, msg := parseAnalyticsRequest(vals, false, analytics.SectionSpend, caller); msg == "" {
+		if _, msg := parseAnalyticsRequest(vals, false, analytics.SectionSpend, caller, false); msg == "" {
 			t.Fatalf("owner route accepted %q", q)
 		}
 	}

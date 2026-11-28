@@ -70,8 +70,8 @@ func TestWireUsageFolderToleratesNoExistingLifecycle(t *testing.T) {
 }
 
 // main.go is not unit-testable end to end, so this pins its usage-fold wiring from source:
-// wireUsageFolder is called, the pass it returns is an argument of sweeper.New (dropping it
-// silently disables the safety net), and the same folder's Wait is called at shutdown.
+// wireUsageFolder is called, the pass it returns is the last element of the pass slice given to
+// sweeper.New (dropping it silently disables the safety net), and the same folder's Wait is called at shutdown.
 func TestMainWiresUsageFolderPassAndWait(t *testing.T) {
 	fset := token.NewFileSet()
 	file, err := parser.ParseFile(fset, "main.go", nil, 0)
@@ -79,13 +79,21 @@ func TestMainWiresUsageFolderPassAndWait(t *testing.T) {
 		t.Fatal(err)
 	}
 	var passVar, folderVar string
-	var sweeperNewArgs []string
-	sweeperLast := ""
+	// main.go builds the passes as the `sweepPasses` slice literal, lets wireAnalyticsPrecompute
+	// insert before its last element, and spreads it into sweeper.New.
+	sweepPassesLast, sweeperSpread := "", ""
 	waited := map[string]bool{}
 	ast.Inspect(file, func(n ast.Node) bool {
 		switch x := n.(type) {
 		case *ast.AssignStmt:
 			if len(x.Lhs) == 1 && len(x.Rhs) == 1 {
+				if l, ok := x.Lhs[0].(*ast.Ident); ok && l.Name == "sweepPasses" {
+					if lit, ok := x.Rhs[0].(*ast.CompositeLit); ok && len(lit.Elts) > 0 {
+						if id, ok := lit.Elts[len(lit.Elts)-1].(*ast.Ident); ok {
+							sweepPassesLast = id.Name
+						}
+					}
+				}
 				if call, ok := x.Rhs[0].(*ast.CallExpr); ok {
 					if id, ok := call.Fun.(*ast.Ident); ok && id.Name == "wireUsageFolder" && len(call.Args) == 3 {
 						if l, ok := x.Lhs[0].(*ast.Ident); ok {
@@ -106,14 +114,9 @@ func TestMainWiresUsageFolderPassAndWait(t *testing.T) {
 			if !ok {
 				return true
 			}
-			if recv.Name == "sweeper" && sel.Sel.Name == "New" {
+			if recv.Name == "sweeper" && sel.Sel.Name == "New" && x.Ellipsis.IsValid() {
 				if id, ok := x.Args[len(x.Args)-1].(*ast.Ident); ok {
-					sweeperLast = id.Name
-				}
-				for _, a := range x.Args {
-					if id, ok := a.(*ast.Ident); ok {
-						sweeperNewArgs = append(sweeperNewArgs, id.Name)
-					}
+					sweeperSpread = id.Name
 				}
 			}
 			if sel.Sel.Name == "Wait" {
@@ -125,15 +128,11 @@ func TestMainWiresUsageFolderPassAndWait(t *testing.T) {
 	if passVar == "" || folderVar == "" {
 		t.Fatalf("main.go does not call wireUsageFolder with an identifier folder (pass=%q folder=%q)", passVar, folderVar)
 	}
-	found := false
-	for _, a := range sweeperNewArgs {
-		found = found || a == passVar
+	if sweeperSpread != "sweepPasses" {
+		t.Errorf("sweeper.New must spread the sweepPasses slice (got %q)", sweeperSpread)
 	}
-	if !found {
-		t.Errorf("the pass returned by wireUsageFolder (%s) is not an argument of sweeper.New (args: %v)", passVar, sweeperNewArgs)
-	}
-	if sweeperLast != passVar {
-		t.Errorf("the usage-fold pass (%s) must be the LAST sweeper.New argument so its slow lanes delay no other extra pass; last is %q", passVar, sweeperLast)
+	if sweepPassesLast != passVar {
+		t.Errorf("the usage-fold pass (%s) must be the LAST element of the sweepPasses literal so its slow lanes delay no other extra pass; last is %q", passVar, sweepPassesLast)
 	}
 	if !waited[folderVar] {
 		t.Errorf("%s.Wait is never called in main.go: in-flight usage-fold kicks would not be drained at shutdown", folderVar)

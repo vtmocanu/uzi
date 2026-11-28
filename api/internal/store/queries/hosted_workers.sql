@@ -351,7 +351,7 @@ WHERE w.ephemeral
                           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities)
                               AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
                               AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)
-                              AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities))))
+                              AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities)) AND (r.kind <> 'cross_check' OR 'codex_provider_checker_v1' = ANY(w.protocol_capabilities))))
                       AND r.status NOT IN ('completed', 'failed', 'cancelled')))
       OR (w.online_since IS NOT NULL
           AND NOT ('codex_runtime_v3' = ANY(w.protocol_capabilities))
@@ -422,7 +422,7 @@ WHERE w.id = ANY(@ids::uuid[])
                           OR (r.harness = 'codex' AND 'codex_provider_v1' = ANY(w.protocol_capabilities)
                               AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
                               AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)
-                              AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities))))
+                              AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities)) AND (r.kind <> 'cross_check' OR 'codex_provider_checker_v1' = ANY(w.protocol_capabilities))))
                       AND r.status NOT IN ('completed', 'failed', 'cancelled')))
       OR (w.online_since IS NOT NULL
           AND NOT ('codex_runtime_v3' = ANY(w.protocol_capabilities))

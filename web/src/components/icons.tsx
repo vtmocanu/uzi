@@ -254,6 +254,16 @@ export const ExternalLinkIcon = (p: SVGProps<SVGSVGElement>) => (
   </Icon>
 );
 
+// ChartLineIcon: axes plus a rising trace ending in a filled dot (issue #4777), the module
+// vocabulary's metrics/reporting glyph, distinct from ActivityIcon (the Runs entry).
+export const ChartLineIcon = (p: SVGProps<SVGSVGElement>) => (
+  <Icon {...p}>
+    <path d="M3 3v18h18" />
+    <path d="M7 15l4-4 3 3 5-6" />
+    <circle cx="19" cy="8" r="1" fill="currentColor" />
+  </Icon>
+);
+
 export const TerminalIcon = (p: SVGProps<SVGSVGElement>) => (
   <Icon {...p}>
     <path d="m4 17 6-6-6-6M12 19h8" />

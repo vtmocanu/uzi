@@ -102,6 +102,10 @@ describe("module vocabulary parity across the host, the chart and the compose ge
     expect(MODULE_ICON_NAMES.length).toBeGreaterThan(10);
     expect(sorted(chartIcons)).toEqual(sorted(MODULE_ICON_NAMES));
     expect(sorted(genIcons)).toEqual(sorted(MODULE_ICON_NAMES));
+    // Issue #4777: the line-chart glyph is in all three lists.
+    expect(MODULE_ICON_NAMES).toContain("chart-line");
+    expect(chartIcons).toContain("chart-line");
+    expect(genIcons).toContain("chart-line");
   });
 
   it("navGroup set: the chart and the generator equal the host's", () => {

@@ -1,12 +1,20 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, render, screen, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { AppShell } from "./AppShell";
 import { NAV_SECTIONS } from "./navItems";
 import { api } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
 import { unknownDoc } from "../mocks/data/health";
+import type { ModuleEntry } from "../modules/manifest";
+
+// Module entries come from the runtime list; these tests feed it directly.
+const modulesState = vi.hoisted(() => ({ modules: [] as ModuleEntry[] }));
+vi.mock("../modules/registry", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../modules/registry")>()),
+  useModules: () => ({ status: "ready" as const, modules: modulesState.modules }),
+}));
 
 // Issue #4510: the real sidebar wires the animated glyph to every NAV_SECTIONS row (by its
 // key) and to nothing else. Mocks mirror AppShell.test.tsx.
@@ -19,6 +27,10 @@ vi.mock("../lib/api", () => ({
     getJudgeStats: vi.fn().mockResolvedValue({ total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_positives: 0 }),
     runsInProgressCount: vi.fn().mockResolvedValue({ count: 0 }),
     listSchedules: vi.fn().mockResolvedValue([]),
+    listAgentTemplates: vi.fn().mockResolvedValue({ templates: [] }),
+    listWorkers: vi.fn().mockResolvedValue({ workers: [] }),
+    listSkills: vi.fn().mockResolvedValue({ skills: [] }),
+    getRecoveryHolds: vi.fn().mockRejectedValue(new Error("no holds")),
     listFindings: vi.fn().mockResolvedValue({ bucket: "to_file", repo: "", run: "", open_count: 0, findings: [] }),
     getFindingsStats: vi.fn().mockResolvedValue({ total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_positives: 0 }),
     listRuns: vi.fn().mockResolvedValue({ runs: [] }),
@@ -141,6 +153,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  modulesState.modules = [];
   cleanup();
   vi.clearAllMocks();
 });
@@ -171,5 +184,57 @@ describe("sidebar motion wiring in the real AppShell", () => {
       expect(child.querySelector("svg"), "repo child glyph").not.toBeNull();
       expect(child.querySelector("[data-nav-motion]"), "repo child motion").toBeNull();
     }
+  });
+
+  it("gives a module row its vocabulary icon's motion while its key and link stay the module's (issue #4777)", async () => {
+    modulesState.modules = [
+      { id: "wmod", version: "1", page: "Page", label: "Work Mod", icon: "chart-line", navGroup: "work", adminOnly: false },
+      { id: "mmod", version: "1", page: "Page", label: "Own Mod", icon: "terminal", navGroup: "modules", adminOnly: false },
+    ];
+    signIn(false);
+    const { container } = render(
+      <MemoryRouter initialEntries={["/dashboard"]}>
+        <AppShell>
+          <div>content</div>
+        </AppShell>
+      </MemoryRouter>,
+    );
+    await screen.findByRole("link", { name: "vtmocanu/atlas" });
+    for (const [id, icon] of [
+      ["wmod", "chart-line"],
+      ["mmod", "terminal"],
+    ]) {
+      const svg = container.querySelector(`svg[data-nav-motion="module-${icon}"]`);
+      expect(svg, `${id} svg`).not.toBeNull();
+      expect(svg?.closest("a")?.getAttribute("href")).toBe(`/m/${id}`);
+    }
+    const builtin = NAV_SECTIONS.flatMap((s) => s.items).filter((d) => !d.adminOnly).length;
+    expect(container.querySelectorAll("svg[data-nav-motion]")).toHaveLength(builtin + 2);
+  });
+
+  it("renders a module's command-menu option with a static glyph, never the animated one (issue #4777)", async () => {
+    modulesState.modules = [
+      { id: "cmod", version: "1", page: "Page", label: "Charty Mod", icon: "chart-line", navGroup: "work", adminOnly: false },
+    ];
+    signIn(false);
+    render(
+      <MemoryRouter initialEntries={["/dashboard"]}>
+        <AppShell>
+          <div>content</div>
+        </AppShell>
+      </MemoryRouter>,
+    );
+    await screen.findByRole("link", { name: "vtmocanu/atlas" });
+    act(() => {
+      document.body.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "k", code: "KeyK", ctrlKey: true, bubbles: true, cancelable: true }),
+      );
+    });
+    const dialog = screen.getByRole("dialog", { name: "Command menu" });
+    const option = within(dialog).getByRole("option", { name: /Charty Mod/ });
+    const glyph = option.querySelector("svg");
+    expect(glyph, "option glyph").not.toBeNull();
+    expect(glyph!.hasAttribute("data-nav-motion")).toBe(false);
+    expect(option.querySelector("[data-nav-motion]")).toBeNull();
   });
 });

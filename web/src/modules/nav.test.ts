@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { NAV_SECTIONS, visibleNavItems } from "../components/navItems";
 import type { ModuleEntry } from "./manifest";
@@ -46,6 +47,19 @@ describe("mergeModuleNav", () => {
     expect(a).toMatchObject({ to: "/m/a", adminOnly: true, label: "A" });
     expect(b.to).toBe("/m/b");
     expect(b.adminOnly).toBeUndefined();
+  });
+
+  it("keeps the module key and static glyph, and names the icon's motion key (issue #4777)", () => {
+    const merged = mergeModuleNav(NAV_SECTIONS, [mod({ id: "m1", icon: "chart-line" })]);
+    const def = merged.find((s) => s.id === "modules")!.items[0];
+    expect(def.key).toBe("module:m1");
+    expect(def.motionKey).toBe("module-chart-line");
+    // The static icon is what the command menu renders (it reads def.icon): never animated.
+    const html = renderToStaticMarkup(def.icon);
+    expect(html).toContain("<svg");
+    expect(html).not.toContain("data-nav-motion");
+    const viaMenu = visibleNavItems(false, merged).find((i) => i.key === "module:m1")!;
+    expect(viaMenu.icon).toBe(def.icon);
   });
 
   it("does not mutate the static sections", () => {

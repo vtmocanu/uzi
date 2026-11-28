@@ -2321,6 +2321,10 @@ type Service struct {
 	// transaction right after the job lane read, holding the shared secret-mutation lock, before the
 	// provider branch freezes its source. Nil in production.
 	jobDecidedHook func(ctx context.Context)
+	// checkerDecidedHook is the same seam for the cross-check checker lane (PRD #4574 M2): it runs in
+	// the create transaction right after the lane decision, holding the shared secret-mutation lock
+	// and before the creation closure takes the lead row lock. Nil in production.
+	checkerDecidedHook func(ctx context.Context)
 	// claimHooks are the run-lane claim race seams (PRD #1590 M1): a LiveDB test injects a
 	// concurrent account or claim mutation between ClaimRun and assembly, after the Codex mint,
 	// or between assembly and the final exact-claim transaction. Nil in production, so every

@@ -184,12 +184,16 @@ unless the provider is yours (or an [admin-shared definition](#admin-shared-prov
   matching covers only the key's raw, JSON-escaped, `\/`, `\u`-escaped and percent-encoded forms (other
   encodings such as base64 are not detected), so this guards against accidental
   publication only, not a malicious or prompt-injected job; see the linked section.
-- **Other lanes that cannot use a provider refuse.** The cross-check lane refuses an
-  owner whose Claude source is set, with `provider_lane_unsupported`, including that owner's runs
-  that use an Anthropic token. A plan cross-check whose
-  checker would be refused sends the plan to the human plan gate instead; for a Codex lead that
-  means a Codex lead with plan cross-check, owned by someone with a Claude source, waits for you
-  to approve the plan. The isolated research lane refuses provider runs.
+- **Other lanes that cannot use a provider refuse.** The Codex checker lane runs on a selected
+  Codex source. Without one, a Codex checker is refused for an owner with a Claude source or a
+  provider-bound lead (#4762). A Claude checker is refused under a provider-bound lead or for an
+  owner with a Claude source. Refusals use `provider_lane_unsupported`, including for that
+  owner's runs that use an Anthropic token. A plan
+  cross-check whose checker would be refused sends the plan to the human plan gate instead; for a
+  Codex lead that means a Codex lead with plan cross-check, owned by someone with a Claude source,
+  waits for you to approve the plan. See
+  [Cross-check on a Codex provider](#cross-check-on-a-codex-provider) for the open and refused rows. The isolated research lane
+  refuses provider runs.
 - **Where judged traces go.** A provider judge sends the judged run's trace to your gateway, including
   the trace of a run that used an Anthropic token. A pinned vendor judge sends a provider run's trace to
   Anthropic. Because the Claude CLI follows gateway redirects (the warning above), judged trace bodies
@@ -307,18 +311,53 @@ never `provider_model_unmapped`. Failure behavior, the `codex_provider_judge_v1`
 trace destination: [A Codex judge on a model provider](./judge.md#a-codex-judge-on-a-model-provider). Older
 `provider_lane_unsupported` skip rows for a Codex judge are historical.
 
+### Cross-check on a Codex provider
+
+A plan or code cross-check whose checker is Codex runs on your selected, usable Codex source,
+frozen when the checker is created, with no vendor fallback. The decision is taken under the same
+secret-mutation lock as the freeze, so a source edit made while the check is being created either
+lands before it or affects only later checks. A selected Codex source that is unusable (for example
+a disabled key or a map without `default`) refuses the check rather than falling back to the vendor
+Codex credential: the plan goes to the human plan gate and the code stage records the checker as
+unavailable with no verdict (`provider_source_unusable` internally; no new public reason).
+
+- **Which rows stay refused.** These keep `provider_lane_unsupported` (plan: human plan gate;
+  code: checker unavailable): a Claude checker when the lead is bound to a provider or your Claude
+  source is selected; a Codex checker when you have no Codex source and either the lead is bound to
+  a provider or a Claude source is selected (a vendor Claude lead with a vendor Codex checker, and
+  a Claude-provider lead with a vendor Codex checker, stay refused while a Claude source is
+  selected); and Codex-lead checks for an owner who has both sources, until the Claude checker lane
+  ships with #4322 M2.
+- **The same model cannot check itself.** When either side is bound to a provider, the claim
+  compares the lead's model with the checker's model and gateway host; a match, or evidence that
+  cannot be resolved, makes the check unavailable. See
+  [the same-model guard](./cross-check.md#the-same-model-guard) for the inputs and limits.
+- **Worker capability.** Only a worker advertising `codex_provider_checker_v1`, together with the
+  Codex provider capabilities, can claim or be placed a provider checker. At the code stage the
+  checker runs on the lead's worker, so a lead on a worker without it fails the check immediately;
+  at the plan stage the checker waits up to its deadline for a capable worker, which also happens
+  while an API rollout is ahead of the worker fleet.
+- **A revoked key never parks the checker.** A key revoked, rotated or disabled while the checker is
+  queued, or a destination removed from the allowlist, decides the check unavailable; the
+  checker is not paused for you to resume.
+- **Private CA.** A provider checker receives the same worker extra-CA bundle as other Codex
+  provider runs (see [Gateways behind a private CA](#gateways-behind-a-private-ca)); the same
+  `workers.extraCA` upgrade note applies.
+- **Cost reads as unknown.** The checker's usage is reported as tokens only: cost is unreported,
+  and no vendor pricing is applied to a gateway model. A gateway 429 or overload is a non-pass
+  with no vendor cooldown. A key echoed by the gateway is redacted from the verdict, usage frames
+  and logs for the whole claim, within the exact-match limits above. An explicit checker model pin
+  that is missing from the provider's model map makes the check unavailable.
+
 ### What a Codex provider run does not do
 
-- **Cross-check.** Plan and code cross-check refuse when either side would be bound to a Codex
-  provider, with `provider_lane_unsupported`. For the plan stage this means a human plan gate: a
-  Claude lead with plan cross-check, owned by someone with a Codex source, has its Codex checker
-  refused and waits for you to approve the plan. The code stage records the checker as
-  unavailable with no verdict.
+- **Cross-check, held rows.** The rows listed under
+  [Cross-check on a Codex provider](#cross-check-on-a-codex-provider) stay refused with
+  `provider_lane_unsupported`, and a Codex provider lead's check on a Claude checker waits for
+  #4322 M2.
 - **Jobs and chat** are Claude-only and unchanged by a Codex source. A Codex source does not
   affect them. A job follows your **Claude** source (see
   [Use a provider as your Claude source](#use-a-provider-as-your-claude-source)).
-
-Codex providers on the cross-check lane are tracked in #4574.
 
 ### Operators: rollout and keys
 
@@ -396,11 +435,18 @@ results.
   Codex credential while it is your selected source.
 - **The accepted redirect risk applies to a shared definition under either auth style** (owner
   decision, 2026-11-20), and the operator allowlist still governs where its URL may point.
+- **Organization key: not yet available to you.** An admin can also define a Claude definition
+  funded by one organization key (see [Organization key (staged)](#organization-key-staged)). In this
+  release such a definition is staged only: it does not appear in your Settings, `uzi provider list`
+  or source selection, you cannot attach a key to it, test it or select it, and no run can use it.
+  Recipient grants, which would let an admin authorize users to spend the organization key, are not
+  yet available.
 
 ### Admin: manage shared providers
 
 In the web app, **Admin → Shared providers** (admin only). Create a definition (engine, name, one of
-the allowed base URLs, auth style, model map; it has no key), edit its name and model map, retire it,
+the allowed base URLs, auth style, model map; a per-user-key definition has no key, and an
+[organization-funded](#organization-key-staged) Claude definition gets its key afterwards), edit its name and model map, retire it,
 or delete it. **The engine is chosen at creation**: Claude is the default and Codex the alternative.
 A Codex definition uses `openai_responses` with Bearer auth and needs a `default` model slot. When a
 create request omits the protocol, it defaults to `anthropic_messages` for Claude and
@@ -421,8 +467,75 @@ allowlist is admission control, not confinement to that host (see the Codex warn
 this page). Share only a gateway you trust not to redirect; the create form says so. A mistake here
 exposes every recipient who attached a key, not one user.
 
+### Organization key (staged)
+
+A **Claude** shared definition can instead be **organization-funded**: its one credential is a key
+the admin sets, not a key each user attaches. In this release this is **staged only**. An admin can
+create such a definition, set its key and verify it with **Test**, but **recipient grants are not yet
+available**: no user can see, attach, test or select an organization-funded definition, and no run can
+bind one. The key is spent only by the admin's own Test. Nothing here changes how per-user-key
+definitions work.
+
+- **Create.** In **Admin → Shared providers**, choose the organization-key option when creating a
+  Claude definition (the option is not offered for Codex; the API refuses it with a 400). The
+  create form shows a recipient-trust warning and the **Create shared provider** button stays disabled until you acknowledge it
+  (`acknowledge_recipient_trust: true` in the API; a request without it is refused with a 400).
+  The warning says that:
+  - recipients who are later granted the key can copy it, so rotating it at the gateway is the only
+    revocation;
+  - a redirecting gateway can forward request bodies and the key, with differences by auth style
+    (Bearer is recommended);
+  - product-token jobs can spend the key;
+  - a shared gateway identity can expose recipients' work to one another;
+  - rotating `UZI_SECRET_KEY` invalidates the stored key, which must then be set again;
+  - use is limited to authorized users.
+- **The mode is fixed.** `credential_mode` (`per_user_key`, the default, or `operator_key`) cannot be
+  changed afterwards: a PATCH naming it is refused. To switch, create a new definition.
+- **The key.** It is sealed with the instance key (`UZI_SECRET_KEY`) with the definition's id bound
+  into the encryption, so a copied ciphertext does not open under another definition. There is no
+  reveal route and no API or CLI returns the key; only its presence, enablement, set time and last
+  Test outcome are shown. Key controls, all cookie and CSRF admin writes:
+
+  | Control | Route | Effect |
+  |---|---|---|
+  | Set or replace | `PUT /api/admin/providers/{id}/key` | Stores the key (16 to 4096 printable ASCII characters, excluding space: 0x21 to 0x7E). A replace makes a new key version, keeps enabled or disabled as it was, and makes the previous Test result read as not tested. Allowed on a retired definition, so a key can be staged before the definition is used. |
+  | Enable or disable | `PATCH /api/admin/providers/{id}/key/enabled` | Sets `{"enabled": true\|false}`. Changing it makes a new key version, so the previous Test result is hidden. Test is refused while the key is disabled. |
+  | Delete | `DELETE /api/admin/providers/{id}/key` | Removes the key and its Test result. |
+
+  A key route on a per-user-key definition returns 409; on a personal or unknown id it returns 404.
+- **Test.** **Test** (`POST /api/admin/providers/{id}/test`) decrypts the key and sends one probe to
+  the definition's allowlisted gateway. It refuses before any outbound request (409) when the
+  definition is retired, has no key or has a disabled key, and refuses a base URL that is no longer on
+  the allowlist. The probe follows no redirects. Just before dialling it re-checks that the
+  definition, its model map and its key have not changed, and refuses with 409 if they have. The
+  result (auth and tool outcome, time) is stored for the current definition and key only, so editing
+  the model map, replacing, disabling, enabling or deleting the key, or retiring the definition
+  hides it: the page shows the current state, not history. A rename does not hide it. A change made
+  after that last check can still let the probe already in flight use the key and endpoint it
+  captured. A Test is refused with 429 when another Test of the same definition is running, when 4
+  provider Tests (admin and users' own) are already in flight, or after 30 Tests per hour for that
+  definition. These limits are held in memory by the API process, so each API process counts them
+  separately and they reset when it restarts. The web
+  page shows the key controls on retired definitions too (set or replace, enable or disable and delete
+  are allowed there; only Test is refused when the definition is retired).
+- **Audit.** Each key change writes a `provider_audit` line (`admin_key_set`, `admin_key_replace`,
+  `admin_key_enable`, `admin_key_disable`, `admin_key_delete`), and each Test admitted past the rate
+  limiter (including one that ends `key_unavailable` or `key_read_error` before decrypting) writes one `admin_test` line with the provider id, key id and version, and an outcome
+  (for example `probed_recorded`, `refused_not_allowed` or `changed_before_dial`). No line contains
+  the key, a header or a response body. A process crash mid-Test writes no line.
+- **Cap and delete.** Organization-funded definitions count toward the same 50-definition cap as
+  per-user-key ones, retired included. Deleting one is allowed while no user has it selected (none
+  can in this release) and also deletes its key and Test result.
+- **Boundaries.** The key is sealed under the instance key, not a user vault, so anyone who holds
+  `UZI_SECRET_KEY` and database access can decrypt it ([vault threat model](./vault-threat-model.md)).
+  Rotating `UZI_SECRET_KEY` makes it unreadable; set it again after a rotation. An image-only rollback
+  to an earlier release hides these definitions from that release's checks, so its 50-definition
+  count can let the combined catalogue exceed 50; see
+  [ADR-4324](../adr/4324-admin-shared-providers.md#amended-for-4540-m1-2026-11-27).
+
 `uzi admin provider list` and `uzi admin provider get <id|name>`
-are the read-only terminal view and need an admin-read token. Design and the lock and rollback
+are the read-only terminal view and need an admin-read token; they show each definition's mode and
+whether an organization key is set, never key material. Design and the lock and rollback
 details: [ADR-4324](../adr/4324-admin-shared-providers.md).
 
 ## Gateways behind a private CA
@@ -430,7 +543,8 @@ details: [ADR-4324](../adr/4324-admin-shared-providers.md).
 For a Codex provider, the worker's extra-CA bundle is delivered to the Codex runtime with
 TLS verification left on, so a private-CA gateway works there, but only on workers the controller recorded as
 created with it (see the `workers.extraCA` upgrade note in [Configuration](./configuration.md)); a worker without
-that record fails TLS until it is reprovisioned. A stalled connection fails with a
+that record fails TLS until it is reprovisioned. The Codex provider cross-check checker passes the same
+bundle to its runtime, so its private-CA gateway works under the same condition. A stalled connection fails with a
 typed timeout (setup through the first model response is bounded at 10 seconds per runtime
 root); it is reported as a certificate error only when the runtime reports one. This page does not
 separately document the `workers.uidSplit` case for Codex; the paragraph below describes Claude.

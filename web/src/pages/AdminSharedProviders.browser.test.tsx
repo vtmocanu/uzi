@@ -113,3 +113,54 @@ it("keeps the Codex edit form's focus order: name, then each Codex slot's model 
   expect(formEl.scrollWidth).toBeLessThanOrEqual(formEl.clientWidth + 1);
   expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(390);
 });
+
+// Issue #4540: an operator_key card (staged notice, key controls) and the organization-key
+// create form (six disclosures, acknowledgment gate) at phone width.
+it("keeps an organization-key card, its staged notice and key controls inside 390px", async () => {
+  await page.viewport(390, 844);
+  const mock = vi.mocked(api);
+  const url = "https://gateway.example.com/a/very/long/path/that/must/wrap/inside/the/card/anthropic/v1";
+  const row: AdminSharedProvider = {
+    id: "o1", name: "organization-gateway-with-a-rather-long-name", engine: "claude", retired: false, current_revision: 1,
+    protocol: "anthropic_messages", base_url: url, auth_style: "bearer",
+    model_map: { haiku: { model: "org-small" } },
+    credential_mode: "operator_key", selected_user_count: 0, attached_key_count: 0,
+    operator_key: { present: true, enabled: true, set_at: "2026-11-20T10:00:00Z" },
+  };
+  mock.adminListSharedProviders.mockResolvedValue({ providers: [row] });
+  mock.listProviders.mockResolvedValue({ enabled: true, allowed_base_urls: [url], providers: [] });
+  render(<MemoryRouter><div className="px-4"><AdminSharedProviders /></div></MemoryRouter>);
+  const panel = await screen.findByTestId("operator-key-o1");
+  expect(within(panel).getByTestId("staged-notice-o1").textContent).toMatch(/Staged: not yet available to users or runs/);
+  for (const name of [
+    `Replace organization key for ${row.name}`,
+    `Disable organization key for ${row.name}`,
+    `Test organization key for ${row.name}`,
+    `Delete organization key for ${row.name}`,
+  ]) {
+    expect(within(panel).getByRole("button", { name })).toBeTruthy();
+  }
+  expect(panel.scrollWidth).toBeLessThanOrEqual(panel.clientWidth + 1);
+  expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(390);
+});
+
+it("shows the six disclosures at 390px and gates Create on the acknowledgment", async () => {
+  await page.viewport(390, 844);
+  const mock = vi.mocked(api);
+  const url = "https://gateway.example.com/a/very/long/path/that/must/wrap/inside/the/form/anthropic/v1";
+  mock.adminListSharedProviders.mockResolvedValue({ providers: [] });
+  mock.listProviders.mockResolvedValue({ enabled: true, allowed_base_urls: [url], providers: [] });
+  render(<MemoryRouter><div className="px-4"><AdminSharedProviders /></div></MemoryRouter>);
+  await userEvent.click(await screen.findByRole("button", { name: "New shared provider" }));
+  const formEl = screen.getByRole("form", { name: "New shared provider" });
+  const form = within(formEl);
+  await userEvent.selectOptions(form.getByLabelText("Credential source"), "operator_key");
+  const group = form.getByRole("group", { name: "Organization key disclosures" });
+  expect(group.querySelectorAll("li").length).toBe(6);
+  const create = form.getByRole("button", { name: "Create shared provider" }) as HTMLButtonElement;
+  expect(create.disabled).toBe(true);
+  await userEvent.click(form.getByRole("checkbox", { name: /acknowledge/i }));
+  expect(create.disabled).toBe(false);
+  expect(formEl.scrollWidth).toBeLessThanOrEqual(formEl.clientWidth + 1);
+  expect(document.documentElement.scrollWidth).toBeLessThanOrEqual(390);
+});

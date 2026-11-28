@@ -13,6 +13,9 @@ export const PRIVATE_CA_CASES = [
   "private CA completes Responses",
   "no extra CA refuses private TLS",
   "unrelated CA refuses private TLS",
+  // Issue #4574 M2: the provider-bound Codex checker, with and without the startup-captured bundle.
+  "provider checker completes with the private CA bundle",
+  "provider checker refuses private TLS without the CA bundle",
 ];
 
 export const PRIVATE_CA_OBSERVATIONS = [
@@ -22,16 +25,18 @@ export const PRIVATE_CA_OBSERVATIONS = [
   "interrupted-root-settled-observed trusted active-turn cancelled owned-root-absent",
   "fresh-executor-resume-observed trusted same-runtime-session prior-history distinct-root-auth-home old-root-absent",
   ...["stalled", "trusted", "no-extra", "unrelated"].map(row => `owned-roots-absent ${row} `),
+  ...["checker-trusted", "checker-no-extra"].map(row => `provider-checker-observed ${row}`),
 ];
 
 /** Accept only the complete TAP run, not a successful shell with partial output. */
 export function requirePrivateCaProof(stdout: string): void {
   const lines = stdout.split("\n");
   const passes = lines.filter(line => /^ok \d+ - /.test(line));
-  if (passes.length !== 10 || PRIVATE_CA_CASES.some(
+  const count = PRIVATE_CA_CASES.length;
+  if (passes.length !== count || PRIVATE_CA_CASES.some(
     (title, index) => passes[index] !== `ok ${index + 1} - ${title}`,
   )) throw new Error("private CA: missing or unexpected named case");
-  for (const summary of ["1..10", "# tests 10", "# pass 10", "# fail 0", "# cancelled 0", "# skipped 0", "# todo 0", "CONTAINER_EXIT=0"]) {
+  for (const summary of [`1..${count}`, `# tests ${count}`, `# pass ${count}`, "# fail 0", "# cancelled 0", "# skipped 0", "# todo 0", "CONTAINER_EXIT=0"]) {
     if (lines.filter(line => line === summary).length !== 1) {
       throw new Error(`private CA: missing/duplicate summary ${summary}`);
     }

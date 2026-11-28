@@ -59,6 +59,19 @@ records browser re-unlock and its rollback boundary. Users should start at
   and unprotected personal credentials. An operator can still recover the bot
   PAT; its blast radius is bounded by
   PRD #5's least-privilege checks (a Developer-role bot on protected repos).
+- **Not protected (by design)**: an **organization key** for an admin-shared
+  provider definition (`credential_mode = operator_key`,
+  [Organization key (staged)](./providers.md#organization-key-staged),
+  `model_provider_operator_keys`). It belongs to the instance, not to a user, so
+  it has no user DEK or password KEK: it is sealed with `UZI_SECRET_KEY` (the
+  instance secretbox) with additional authenticated data bound to the
+  definition's id, which stops a ciphertext copied to another definition from
+  opening. An admin or operator who holds `UZI_SECRET_KEY` and database access
+  can decrypt it. No route or CLI reveals it; the admin Test path is the only
+  place the API process decrypts it, and it clears the plaintext copies it
+  controls, not the Go strings the HTTP decoder and request builder make.
+  Rotating `UZI_SECRET_KEY` makes it unreadable; there is no re-encrypt path,
+  so the admin must set it again. In this release no user or run can reach it.
 
 ## OIDC-only users: the vault passphrase (PRD #45)
 

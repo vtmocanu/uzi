@@ -306,10 +306,25 @@ cache_cur AS (
            jsonb_build_object('metered', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered'), 'subscription', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'subscription'), 'unreported', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'unreported'), 'missing', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'missing'), 'incomplete', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status <> 'metered') > 0) AS disclosure
     FROM rfb x WHERE x.win = 'cur'
 ),
+-- Identity fields (issue_iid, issue_title, mr_iid) are looked up after the LIMIT
+-- (at most 10 primary-key probes) so the materialized rfb cohort stays narrow.
+-- Disclosure: a revealed repo shows all three, no_repo shows the title only,
+-- inaccessible_repo shows none. mr_iid_out is separate from run_fold's mr_iid,
+-- which feeds pr_agg and the merged witness and must stay plain runs.mr_iid (#4776).
 top_runs AS (
-    SELECT x.* FROM rfb x WHERE x.win = 'cur'
-    ORDER BY x.cost DESC, x.created_at DESC, x.run_id
-    LIMIT 10
+    SELECT t.*,
+           CASE WHEN t.repo_id_out IS NOT NULL THEN COALESCE(ri.issue_iid, ri.continued_issue_iid) END AS issue_iid_out,
+           CASE WHEN t.repo_key <> 'inaccessible_repo' THEN ri.issue_title END AS issue_title_out,
+           CASE WHEN t.repo_id_out IS NOT NULL THEN COALESCE(t.mr_iid, CASE WHEN t.kind = 'ci_fix' THEN ri.ci_fix_mr_iid END) END AS mr_iid_out
+    FROM (
+        SELECT x.* FROM rfb x WHERE x.win = 'cur'
+        ORDER BY x.cost DESC, x.created_at DESC, x.run_id
+        LIMIT 10
+    ) t
+    LEFT JOIN LATERAL (
+        SELECT r.issue_iid, r.continued_issue_iid, r.issue_title, r.ci_fix_mr_iid
+        FROM runs r WHERE r.id = t.run_id OFFSET 0
+    ) ri ON true
 ),
 pr_agg AS (
     SELECT rf.repo_id, rf.mr_iid, bool_or(rf.witnessed) AS wit,
@@ -552,7 +567,7 @@ SELECT jsonb_build_object(
             'cost', t.cost::numeric(24,6)::text,
             'input_tokens', t.input_tokens::bigint, 'cache_read_tokens', t.cache_read_tokens::bigint,
             'cache_creation_tokens', t.cache_creation_tokens::bigint, 'output_tokens', t.output_tokens::bigint,
-            'repo_key', t.repo_key, 'repo_id', t.repo_id_out, 'repo_path', t.repo_path_out,
+            'repo_key', t.repo_key, 'repo_id', t.repo_id_out, 'repo_path', t.repo_path_out, 'issue_iid', t.issue_iid_out, 'issue_title', t.issue_title_out, 'mr_iid', t.mr_iid_out,
             'user_id', t.user_id, 'user_email', t.email)
             ORDER BY t.cost DESC, t.created_at DESC, t.run_id)
         FROM top_runs t), '[]'::jsonb),
@@ -831,10 +846,25 @@ cache_cur AS (
            jsonb_build_object('metered', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'metered'), 'subscription', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'subscription'), 'unreported', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'unreported'), 'missing', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status = 'missing'), 'incomplete', count(DISTINCT x.run_id) FILTER (WHERE x.usage_status <> 'metered') > 0) AS disclosure
     FROM rfb x WHERE x.win = 'cur'
 ),
+-- Identity fields (issue_iid, issue_title, mr_iid) are looked up after the LIMIT
+-- (at most 10 primary-key probes) so the materialized rfb cohort stays narrow.
+-- Disclosure: a revealed repo shows all three, no_repo shows the title only,
+-- inaccessible_repo shows none. mr_iid_out is separate from run_fold's mr_iid,
+-- which feeds pr_agg and the merged witness and must stay plain runs.mr_iid (#4776).
 top_runs AS (
-    SELECT x.* FROM rfb x WHERE x.win = 'cur'
-    ORDER BY x.cost DESC, x.created_at DESC, x.run_id
-    LIMIT 10
+    SELECT t.*,
+           CASE WHEN t.repo_id_out IS NOT NULL THEN COALESCE(ri.issue_iid, ri.continued_issue_iid) END AS issue_iid_out,
+           CASE WHEN t.repo_key <> 'inaccessible_repo' THEN ri.issue_title END AS issue_title_out,
+           CASE WHEN t.repo_id_out IS NOT NULL THEN COALESCE(t.mr_iid, CASE WHEN t.kind = 'ci_fix' THEN ri.ci_fix_mr_iid END) END AS mr_iid_out
+    FROM (
+        SELECT x.* FROM rfb x WHERE x.win = 'cur'
+        ORDER BY x.cost DESC, x.created_at DESC, x.run_id
+        LIMIT 10
+    ) t
+    LEFT JOIN LATERAL (
+        SELECT r.issue_iid, r.continued_issue_iid, r.issue_title, r.ci_fix_mr_iid
+        FROM runs r WHERE r.id = t.run_id OFFSET 0
+    ) ri ON true
 ),
 pr_agg AS (
     SELECT rf.repo_id, rf.mr_iid, bool_or(rf.witnessed) AS wit,
@@ -1077,7 +1107,7 @@ SELECT jsonb_build_object(
             'cost', t.cost::numeric(24,6)::text,
             'input_tokens', t.input_tokens::bigint, 'cache_read_tokens', t.cache_read_tokens::bigint,
             'cache_creation_tokens', t.cache_creation_tokens::bigint, 'output_tokens', t.output_tokens::bigint,
-            'repo_key', t.repo_key, 'repo_id', t.repo_id_out, 'repo_path', t.repo_path_out,
+            'repo_key', t.repo_key, 'repo_id', t.repo_id_out, 'repo_path', t.repo_path_out, 'issue_iid', t.issue_iid_out, 'issue_title', t.issue_title_out, 'mr_iid', t.mr_iid_out,
             'user_id', t.user_id, 'user_email', t.email)
             ORDER BY t.cost DESC, t.created_at DESC, t.run_id)
         FROM top_runs t), '[]'::jsonb),

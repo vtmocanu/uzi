@@ -81,6 +81,23 @@ type AgentTemplateAllocation struct {
 	CreatedAt  pgtype.Timestamptz `json:"created_at"`
 }
 
+type AnalyticsPrecomputedDocRecord struct {
+	Section      string             `json:"section"`
+	VariantKey   string             `json:"variant_key"`
+	GeneratedAt  pgtype.Timestamptz `json:"generated_at"`
+	Invalidation int64              `json:"invalidation"`
+	Document     []byte             `json:"document"`
+}
+
+type AnalyticsPrecomputedState struct {
+	ID              bool               `json:"id"`
+	Invalidation    int64              `json:"invalidation"`
+	Publications    int64              `json:"publications"`
+	FailureCount    int32              `json:"failure_count"`
+	LastFailureAt   pgtype.Timestamptz `json:"last_failure_at"`
+	InvalidatedXact pgtype.Uint64      `json:"invalidated_xact"`
+}
+
 type AnthropicRateLimit struct {
 	UserSecretID     uuid.UUID          `json:"user_secret_id"`
 	UserID           uuid.UUID          `json:"user_id"`
@@ -781,6 +798,27 @@ type ModelProviderKeyTestResult struct {
 	AuthResult       string             `json:"auth_result"`
 	ToolResult       pgtype.Text        `json:"tool_result"`
 	ProbedAt         pgtype.Timestamptz `json:"probed_at"`
+}
+
+type ModelProviderOperatorKey struct {
+	ID         uuid.UUID          `json:"id"`
+	ProviderID uuid.UUID          `json:"provider_id"`
+	Ciphertext []byte             `json:"ciphertext"`
+	KeyRev     int64              `json:"key_rev"`
+	DisabledAt pgtype.Timestamptz `json:"disabled_at"`
+	SetBy      uuid.UUID          `json:"set_by"`
+	SetAt      pgtype.Timestamptz `json:"set_at"`
+}
+
+type ModelProviderOperatorKeyTestResult struct {
+	ProviderID uuid.UUID          `json:"provider_id"`
+	Revision   int32              `json:"revision"`
+	KeyID      uuid.UUID          `json:"key_id"`
+	KeyRev     int64              `json:"key_rev"`
+	AuthResult string             `json:"auth_result"`
+	ToolResult pgtype.Text        `json:"tool_result"`
+	ProbedAt   pgtype.Timestamptz `json:"probed_at"`
+	ProbedBy   uuid.UUID          `json:"probed_by"`
 }
 
 type ModelProviderProbeResult struct {

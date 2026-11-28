@@ -59,5 +59,15 @@
   },
   "credential_mode": "x",
   "selected_user_count": 1,
-  "attached_key_count": 1
+  "attached_key_count": 1,
+  "operator_key": {
+    "present": true,
+    "enabled": true,
+    "set_at": "2020-01-02T03:04:05Z",
+    "probe": {
+      "auth_result": "x",
+      "tool_result": "x",
+      "probed_at": "2020-01-02T03:04:05Z"
+    }
+  }
 }

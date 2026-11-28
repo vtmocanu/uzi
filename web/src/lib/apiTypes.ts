@@ -192,9 +192,17 @@ export interface AdminSharedProvider {
   base_url: string;
   auth_style: ProviderAuthStyle;
   model_map: ProviderModelMap;
-  credential_mode: "per_user_key";
+  credential_mode: "per_user_key" | "operator_key";
   selected_user_count: number;
   attached_key_count: number;
+  /** Present only for an organization-funded definition (credential_mode "operator_key", PRD #4540):
+   *  the state of its one organization key. Never the key itself. */
+  operator_key?: {
+    present: boolean;
+    enabled: boolean;
+    set_at?: string;
+    probe?: ProviderProbe;
+  };
 }
 
 export interface AdminSharedProviderList {
@@ -210,6 +218,11 @@ export interface AdminSharedProviderCreateInput {
   base_url: string;
   auth_style: ProviderAuthStyle;
   model_map: ProviderModelMap;
+  /** Omitted means "per_user_key". "operator_key" (Claude only, PRD #4540) is an
+   *  organization-funded definition: the admin sets one key that granted users' runs receive. */
+  credential_mode?: "per_user_key" | "operator_key";
+  /** Required true for an operator_key definition: the admin accepts the recipient-trust disclosures. */
+  acknowledge_recipient_trust?: boolean;
 }
 
 export interface ProvidersList {
@@ -7138,6 +7151,15 @@ export interface AnalyticsTopRunDTO {
   repo_key: string;
   repo_id: string | null;
   repo_path: string | null;
+  /**
+   * Null = withheld (inaccessible_repo: all three; no_repo: the numbers) or none recorded.
+   * The internal issue number; links go through the issue-key/URL contract.
+   */
+  issue_iid: number | null;
+  /** The run's stored title, untruncated ("" when stored empty). Render as plain text. */
+  issue_title: string | null;
+  /** The run's MR number; null for an unbound CI fix or when withheld. */
+  mr_iid: number | null;
   user_id: string;
   user_email: string;
 }
@@ -7190,6 +7212,17 @@ export interface AnalyticsSpendDTO extends AnalyticsEnvelopeDTO {
   top_runs: AnalyticsTopRunDTO[];
   breakdown: AnalyticsBreakdownDTO;
 }
+
+/** Snapshot metadata of a stored all-time Spend document (issue #4771). */
+export interface AnalyticsSnapshotMetaDTO {
+  /** When the build that produced the document took its snapshot (RFC 3339). */
+  generated_at: string;
+  /** True once the document is older than twice the configured build interval. */
+  stale: boolean;
+}
+
+/** The admin all-users all-time Spend response: the live Spend body plus a snapshot member. */
+export type AnalyticsSpendSnapshotDTO = AnalyticsSpendDTO & { snapshot: AnalyticsSnapshotMetaDTO };
 
 // ── Reliability analytics (issue #4685) ──────────────────────────────────────
 // Mirrors the Reliability types of api/internal/apitypes/analytics.go: GET

@@ -552,7 +552,116 @@ func (e *genericPlanEnv) checkPlan(t *testing.T, name string, c genericPlanCase,
 				name, n.NodeType, n.ActualLoops, total, 4*e.runsTotal)
 		}
 	}
+	// Issue #4776: the top_runs identity lookup is one primary-key probe per top run.
+	for _, p := range topRunsIdentityProblems(root) {
+		t.Errorf("%s: %s", name, p)
+	}
 }
+
+// topRunsIdentityProblems is the issue #4776 pin on the top_runs identity lookup: the lateral
+// read of runs for the (at most 10) top runs is a primary-key probe, executed once per top run
+// and not once per cohort row. It looks for the Nested Loop whose inner side scans runs and
+// whose outer side is a Limit (the top-runs LIMIT 10) and requires:
+//   - exactly one scan of runs on the inner side, an Index Scan or Index Only Scan on
+//     runs_pkey whose Index Cond is an equality on id;
+//   - with no Memoize above the scan, scan loops == the Limit's rows (L); with a Memoize,
+//     cache hits + misses == L and scan loops == cache misses;
+//   - 1 <= loops <= 10 (the LIMIT).
+//
+// A scan that never executed (loops 0), or no such join at all, is a problem: an empty top_runs
+// would make the pin vacuous, so the seed must produce a non-empty one.
+func topRunsIdentityProblems(root *planNode) []string {
+	var problems []string
+	var joins int
+	var walk func(n *planNode)
+	walk = func(n *planNode) {
+		if n.NodeType == "Nested Loop" && len(n.Plans) == 2 {
+			if scans := collectRunsScans(&n.Plans[1]); len(scans) > 0 {
+				if limit := findLimit(&n.Plans[0]); limit != nil {
+					joins++
+					problems = append(problems, checkTopRunsJoin(n, limit, scans)...)
+				}
+			}
+		}
+		for i := range n.Plans {
+			walk(&n.Plans[i])
+		}
+	}
+	walk(root)
+	if joins != 1 {
+		problems = append(problems, fmt.Sprintf("found %d Nested Loops joining a Limit to an inner runs scan, want exactly 1 (the top_runs identity lookup)", joins))
+	}
+	return problems
+}
+
+func collectRunsScans(n *planNode) []*planNode {
+	var out []*planNode
+	if n.RelationName == "runs" {
+		out = append(out, n)
+	}
+	for i := range n.Plans {
+		out = append(out, collectRunsScans(&n.Plans[i])...)
+	}
+	return out
+}
+
+// findLimit descends the outer side through single-child wrappers (Subquery Scan, Result) to
+// the Limit node, or nil when the outer side is not a Limit.
+func findLimit(n *planNode) *planNode {
+	for {
+		if n.NodeType == "Limit" {
+			return n
+		}
+		if len(n.Plans) != 1 || (n.NodeType != "Subquery Scan" && n.NodeType != "Result") {
+			return nil
+		}
+		n = &n.Plans[0]
+	}
+}
+
+func checkTopRunsJoin(join, limit *planNode, scans []*planNode) []string {
+	var problems []string
+	if len(scans) != 1 {
+		return []string{fmt.Sprintf("the top_runs identity lookup has %d scans of runs, want exactly 1", len(scans))}
+	}
+	scan := scans[0]
+	if scan.NodeType != "Index Scan" && scan.NodeType != "Index Only Scan" {
+		problems = append(problems, fmt.Sprintf("runs is read by a %s, want an Index Scan on runs_pkey", scan.NodeType))
+	}
+	if scan.IndexName != "runs_pkey" {
+		problems = append(problems, fmt.Sprintf("runs is read through index %q, want runs_pkey", scan.IndexName))
+	}
+	if !topRunsIndexCond.MatchString(scan.IndexCond) {
+		problems = append(problems, fmt.Sprintf("Index Cond %q is not an equality on runs.id against the top run's id", scan.IndexCond))
+	}
+	if scan.ActualLoops < 1 || scan.ActualLoops > 10 {
+		problems = append(problems, fmt.Sprintf("the runs scan ran %.0f loops, want 1..10", scan.ActualLoops))
+	}
+	l := limit.ActualRows * limit.ActualLoops
+	if l < 1 {
+		problems = append(problems, "the top_runs Limit emitted no rows, so the pin is vacuous (empty top_runs in the seed)")
+	}
+	var memo *planNode
+	if inner := &join.Plans[1]; inner.NodeType == "Memoize" {
+		memo = inner
+	}
+	if memo == nil {
+		if scan.ActualLoops != l {
+			problems = append(problems, fmt.Sprintf("the runs scan ran %.0f loops for %.0f top runs, want one probe per top run", scan.ActualLoops, l))
+		}
+	} else {
+		if memo.CacheHits+memo.CacheMisses != l {
+			problems = append(problems, fmt.Sprintf("Memoize hits %.0f + misses %.0f != %.0f top runs", memo.CacheHits, memo.CacheMisses, l))
+		}
+		if scan.ActualLoops != memo.CacheMisses {
+			problems = append(problems, fmt.Sprintf("the runs scan ran %.0f loops but Memoize missed %.0f times", scan.ActualLoops, memo.CacheMisses))
+		}
+	}
+	return problems
+}
+
+// topRunsIndexCond matches `(r.id = t.run_id)` and the commuted form, with any aliases.
+var topRunsIndexCond = regexp.MustCompile(`^\(?\(?(\w+\.)?id = (\w+\.)?run_id\)?\)?$|^\(?\(?(\w+\.)?run_id = (\w+\.)?id\)?\)?$`)
 
 // spendArgs renders the EXECUTE arguments of a Spend statement for a 30d window ending at
 // the transaction's now(), with the bucket and rolling arrays from the real calendar code.
@@ -811,6 +920,9 @@ type planNode struct {
 	RelationName        string     `json:"Relation Name"`
 	Alias               string     `json:"Alias"`
 	IndexName           string     `json:"Index Name"`
+	IndexCond           string     `json:"Index Cond"`
+	CacheHits           float64    `json:"Cache Hits"`
+	CacheMisses         float64    `json:"Cache Misses"`
 	ActualRows          float64    `json:"Actual Rows"`
 	ActualLoops         float64    `json:"Actual Loops"`
 	RowsRemovedByFilter float64    `json:"Rows Removed by Filter"`
@@ -1076,6 +1188,9 @@ func renderPlan(n *planNode, depth int) string {
 	}
 	if n.IndexName != "" {
 		fmt.Fprintf(&b, " using %s", n.IndexName)
+	}
+	if n.IndexCond != "" {
+		fmt.Fprintf(&b, " cond %s", n.IndexCond)
 	}
 	fmt.Fprintf(&b, " (rows=%.0f loops=%.0f", n.ActualRows, n.ActualLoops)
 	if n.RowsRemovedByFilter > 0 {

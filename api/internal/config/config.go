@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -481,6 +482,10 @@ type Config struct {
 	RunIdleTimeout             time.Duration // worker-side no-message idle cap
 	WorkerTaskIdleTimeout      time.Duration // PRD #517 M5: interactive-task park idle cap (worker-side); rides the claim
 	RunMaxIterations           int           // implement⇄review loop cap (worker-side)
+
+	// AnalyticsSnapshotInterval is the cadence of the stored admin all-time Spend documents
+	// (issue #4771); 0 turns the feature off. UZI_ANALYTICS_SNAPSHOT_INTERVAL, default 4h.
+	AnalyticsSnapshotInterval time.Duration
 	// HandoffRunTimeout / HandoffRunMaxIterations (issue #785) are the dedicated default
 	// wall-clock budget and iteration cap for a NON-interactive `uzi handoff` task run.
 	// Decoupled from RunTimeout / RunMaxIterations so raising one does not move the other.
@@ -859,6 +864,13 @@ type Config struct {
 	// to boot rather than silently running with a different lease.
 	EphemeralLease time.Duration
 
+	// HistoryRetention (UZI_HISTORY_RETENTION, issue #4695) is the opt-in age after which the
+	// history_retention sweeper pass deletes recorded history (pr_history_events except
+	// first_merge rows, and the usage and capacity sample tables). 0 (the default) is off; any
+	// other value must be at least MinHistoryRetention. Load refuses a malformed, negative or
+	// too-short value so the api never boots with a retention the operator did not mean.
+	HistoryRetention time.Duration
+
 	// Durable-recovery archive limits (PRD #1296 M2, D4/D6). Every knob is
 	// operator-configurable via env with the PRD default; byte ceilings are int64 so
 	// a 4 GiB instance quota is representable on every platform. They bound the
@@ -994,6 +1006,13 @@ const minSecretLen = 16
 // defaultForgeBaseURL is the single allowlisted forge by default, overridable via
 // FORGE_ALLOWED_BASE_URLS.
 const defaultForgeBaseURL = "https://github.com"
+
+// DefaultAnalyticsSnapshotInterval is the stored-analytics build cadence when
+// UZI_ANALYTICS_SNAPSHOT_INTERVAL is absent.
+const DefaultAnalyticsSnapshotInterval = 4 * time.Hour
+
+// AnalyticsSnapshotIntervalError is Load's error for an invalid UZI_ANALYTICS_SNAPSHOT_INTERVAL.
+const AnalyticsSnapshotIntervalError = "UZI_ANALYTICS_SNAPSHOT_INTERVAL must be 0 (off) or a Go duration of at least 1h"
 
 // Load reads configuration from the environment and validates it. It returns
 // an error (rather than exiting) so the caller controls the failure path.
@@ -1236,6 +1255,14 @@ func Load() (Config, error) {
 		if cfg.RunWallCeiling < time.Second || cfg.RunWallCeiling < cfg.RunTimeout || cfg.RunWallCeiling > 72*time.Hour {
 			return Config{}, fmt.Errorf("RUN_WALL_CEILING must be at least 1s, at least RUN_TIMEOUT, and at most 72h")
 		}
+	}
+	cfg.AnalyticsSnapshotInterval = DefaultAnalyticsSnapshotInterval
+	if raw, present := os.LookupEnv("UZI_ANALYTICS_SNAPSHOT_INTERVAL"); present {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d < 0 || (d != 0 && d < time.Hour) {
+			return Config{}, errors.New(AnalyticsSnapshotIntervalError)
+		}
+		cfg.AnalyticsSnapshotInterval = d
 	}
 	cfg.PlanCrossCheckMaxRevisions = DefaultPlanCrossCheckMaxRevisions
 	if raw, present := os.LookupEnv("PLAN_CROSS_CHECK_MAX_REVISIONS"); present {
@@ -1558,6 +1585,11 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg.EphemeralLease = lease
+	historyRetention, err := parseHistoryRetention(os.Getenv("UZI_HISTORY_RETENTION"))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.HistoryRetention = historyRetention
 	// The default size must be a preset the controller can resolve — an unknown value
 	// would provision a worker that never renders and sits pending until its token
 	// expires (workersize's own doc). Reject a bad value at load rather than at use, and
@@ -2583,6 +2615,33 @@ func parseEphemeralLease(raw string) (time.Duration, error) {
 	}
 	if d > MaxEphemeralLease {
 		return 0, fmt.Errorf("UZI_EPHEMERAL_LEASE: %q exceeds the maximum of %s", raw, MaxEphemeralLease)
+	}
+	return d, nil
+}
+
+// MinHistoryRetention is the shortest UZI_HISTORY_RETENTION Load accepts besides 0 (off).
+const MinHistoryRetention = 24 * time.Hour
+
+// parseHistoryRetention is the strict parser of UZI_HISTORY_RETENTION: unset, empty or a zero
+// duration is off (0); anything malformed, negative or shorter than MinHistoryRetention is an
+// error naming the key. There is no maximum.
+func parseHistoryRetention(raw string) (time.Duration, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("UZI_HISTORY_RETENTION: %q is not a valid duration (use e.g. 720h, or 0 to disable): %w", raw, err)
+	}
+	if d == 0 {
+		return 0, nil
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("UZI_HISTORY_RETENTION: %q is negative (use 0 to disable)", raw)
+	}
+	if d < MinHistoryRetention {
+		return 0, fmt.Errorf("UZI_HISTORY_RETENTION: %q is shorter than the minimum of %s (use 0 to disable)", raw, MinHistoryRetention)
 	}
 	return d, nil
 }

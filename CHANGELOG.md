@@ -438,6 +438,18 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **Hosted worker wake no longer deadlocks with a duplicate-canary roll hold ([#4723](https://github.com/vtmocanu/uzi/pull/4723), [#4726](https://github.com/vtmocanu/uzi/pull/4726)).**
   A waking current canary now settles its own wake through the metadata-only op write while the pool stays held; a claim mirror on its data claim still holds the wake, and a roll write in the pool refuses it for that tick.
 
+- **uzi refuses a YouTrack State field it cannot read instead of writing to it ([#4173](https://github.com/vtmocanu/uzi/pull/4173)).**
+  A State field missing from an issue, or not a plain State field, now answers 409 at link, on Map States and on a board move, and nothing is written.
+
+- **The issue tracker link control appears only where a link can succeed, and a project whose State field is run by a state machine is refused ([#4173](https://github.com/vtmocanu/uzi/pull/4173)).**
+  "Link to an issue tracker" shows for a never-enabled, unlinked repo only when the allowed base URLs are set or you have an issue tracker connection, so with nothing configured the Repos page looks as before. Linking checks the first page of the project's issues and refuses a State field run by a state-machine workflow; an existing link writes nothing and shows the reason on the States panel and on a card move (409), and a project with no issues yet is checked on its first State write.
+
+- **Flow analytics reports duplicate older-revision approvals as ambiguous ([#4751](https://github.com/vtmocanu/uzi/pull/4751), [#4754](https://github.com/vtmocanu/uzi/pull/4754)).**
+  A run whose only eligible approve_plan receipts are two or more on one older revision is now classified `ambiguous` (unless auto-approve is configured) instead of `historical_approval_only`, and is no longer counted in `disclosure.historical_approval_only`.
+
+- **Usage history copy timeouts are logged as outcome unknown ([#4755](https://github.com/vtmocanu/uzi/pull/4755), [#4756](https://github.com/vtmocanu/uzi/pull/4756)).**
+  A timed-out copy may still have been committed, so its warning no longer claims the sample was not recorded.
+
 ### Added
 
 - **A preview of the new Overview at /overview/next, decisions first ([#3878](https://github.com/vtmocanu/uzi/pull/3878), [#3952](https://github.com/vtmocanu/uzi/pull/3952)).**
@@ -710,6 +722,33 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 - **Owner and admin Quality analytics API ([#4730](https://github.com/vtmocanu/uzi/pull/4730), [#4743](https://github.com/vtmocanu/uzi/pull/4743)).**
   Read-only `GET /api/analytics/quality` and `/api/admin/analytics/quality` report retained rework per merged PR, CI-fix outcomes, plan and code cross-check results and judge review coverage from one snapshot; judge coverage is the retained latest review with non-historical eligibility, and admin all-users `window=all` is refused like Spend.
 
+- **Spend top runs identify the work ([#4776](https://github.com/vtmocanu/uzi/pull/4776), [#4781](https://github.com/vtmocanu/uzi/pull/4781)).**
+  Each `top_runs` entry now carries `issue_iid`, the stored run title `issue_title` and `mr_iid`, masked like the repo path: all null for an inaccessible repo, the title only for a repo-less run.
+
+- **Worker capacity samples are recorded, at most one per worker per five-minute bucket ([#4693](https://github.com/vtmocanu/uzi/pull/4693), [#4706](https://github.com/vtmocanu/uzi/pull/4706)).**
+  Each worker gets at most one sample per five-minute bucket (caps, freshness and, when attributable to the owner, active-run counts), kept until its owner is deleted; nothing reads them yet.
+
+- **Admins can stage and verify an organization-funded Claude provider key ([#4540](https://github.com/vtmocanu/uzi/pull/4540), [#4783](https://github.com/vtmocanu/uzi/pull/4783)).**
+  A new `operator_key` shared definition holds one key sealed with `UZI_SECRET_KEY`, set and tested from Admin, Shared providers; no user or run can reach it yet, so recipient grants are not yet available, and rotating `UZI_SECRET_KEY` requires setting the key again.
+
+- **Runtime module nav icons animate, and modules can pick a line-chart icon ([#4777](https://github.com/vtmocanu/uzi/pull/4777), [#4782](https://github.com/vtmocanu/uzi/pull/4782)).**
+  With sidebar motion on, a module nav entry plays a motion for its icon on click or Enter like the built-in entries, and the module icon vocabulary gains `chart-line`.
+
+- **Optional Go memory target for worker commands ([#3382](https://github.com/vtmocanu/uzi/pull/3382), [#4764](https://github.com/vtmocanu/uzi/pull/4764)).**
+  The new `workers.goMemLimit` chart key and `WORKER_GO_MEMLIMIT` worker setting (for example `6GiB`) set `GOMEMLIMIT` for the Go programs a worker runs.
+
+- **A Codex `docker login` now lasts for the rest of the run ([#4416](https://github.com/vtmocanu/uzi/pull/4416), [#4768](https://github.com/vtmocanu/uzi/pull/4768)).**
+  On Claude a login already did. The worker now sets `DOCKER_CONFIG` to the run home's `.docker` directory (on Claude only when Docker is wired on the worker); a login is only useful where Docker is wired. A resumed run may need to log in again, and other runs of the same user on the worker can read the directory except where Landlock is applied (always in the Codex `required` sandbox mode, and in `best-effort` on a kernel with Landlock). See docs/run-env-vars.md.
+
+- **Runtime web modules can name their sidebar section with navSection ([#4767](https://github.com/vtmocanu/uzi/pull/4767), [#4773](https://github.com/vtmocanu/uzi/pull/4773)).**
+  An optional navSection on a navGroup modules entry sets its sidebar heading (1 to 24 characters after trimming); entries sharing a heading share a section, and lists without it are unchanged.
+
+- **A Codex plan or code cross-check checker runs on your Codex model provider ([#4574](https://github.com/vtmocanu/uzi/pull/4574), [#4785](https://github.com/vtmocanu/uzi/pull/4785)).**
+  The checker uses only your selected, usable Codex source with no vendor fallback, and an unusable source makes the check unavailable; a same-model guard also makes a check unavailable when the lead and checker resolve to the same model (aliases, case and differing gateway hosts are accepted limits), the consent toggle now counts a selected usable source, and Claude checkers under a provider and Codex-lead checks for owners with both sources stay refused ([#4322](https://github.com/vtmocanu/uzi/pull/4322) M2). A Codex checker with no Codex source is also still refused for an owner with a Claude source or a provider-bound lead (CV/XV, CP/XV, #4762). It needs the `codex_provider_checker_v1` worker capability, so roll the api first: the plan stage waits for a capable worker and the code stage fails fast, and hosted acceptance is pending ([#4761](https://github.com/vtmocanu/uzi/pull/4761)).
+
+- **Settings → Issue trackers, linking a repo to a YouTrack project and mapping its board to States now work in the web, with issue keys in the CLI and TUI ([#4173](https://github.com/vtmocanu/uzi/pull/4173), [#4757](https://github.com/vtmocanu/uzi/pull/4757)).**
+  Two read-only CLI verbs, `uzi issue-tracker list` and `uzi repo issue-tracker-states`, show connections and State mapping; connecting and linking stay web-only because they take a token or change the repo's issue source, and docs/issue-trackers.md covers setup.
+
 ### Changed
 
 - **Routine dependency updates ([#4650](https://github.com/vtmocanu/uzi/pull/4650)).**
@@ -945,6 +984,12 @@ one-physical-line-per-bullet was the interim rule from 2026-08-21 through `[0.52
 
 - **Jobs run on your custom model provider ([#4322](https://github.com/vtmocanu/uzi/pull/4322), [#4742](https://github.com/vtmocanu/uzi/pull/4742)).**
   A job created through /api/v1/jobs for an owner whose Claude source is a provider is frozen onto that provider at creation, never parks (revocation or a gateway limit fails it) and needs a worker advertising `claude_provider_job_v1`; a site-list job is still refused, and the bound key is scrubbed from result text, while an output file whose name or contents carry it is withheld, not uploaded sanitised; both by byte-exact matching only, which protects against accidental publication and not against the job's own agent.
+
+- **Run scratch guidance says worker-managed tool caches are not run artifacts ([#4758](https://github.com/vtmocanu/uzi/pull/4758), [#4760](https://github.com/vtmocanu/uzi/pull/4760)).**
+  Lead, subagent, plan-revision and plan cross-check prompts now state that `GOCACHE`, `GOMODCACHE` and `UZI_SQLC_DIR` stay where the worker points them, that a tool's cache-local `.stage` population is part of that cache, and that private per-invocation temp work still goes in scratch via `TMPDIR`.
+
+- **Admin all-users Spend reads stored per-run usage totals ([#4700](https://github.com/vtmocanu/uzi/pull/4700), [#4763](https://github.com/vtmocanu/uzi/pull/4763)).**
+  Admin all-users `7d`, `30d` and `90d` are about 36 to 43% faster on the evidence seed once the stored totals are backfilled; all-time (`window=all`) stays unavailable because the steady state still misses the 8 s budget.
 
 ### Security
 
