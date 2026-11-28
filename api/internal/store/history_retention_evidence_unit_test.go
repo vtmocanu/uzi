@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -305,5 +307,74 @@ func TestHistoryRetentionEvidenceRunReasons(t *testing.T) {
 	}
 	if r := heRunReasons(heRunFacts{Required: 100, Confirmed: 130, Stop: heStopWallCap}); !strings.Contains(strings.Join(r, ";"), heStopWallCap) {
 		t.Fatalf("wall-capped reasons %v do not name the stop", r)
+	}
+}
+
+func heColdFixture() heColdBinding {
+	return heColdBinding{SetupID: uuid.New(), Table: store.HistoryRetentionCodexUsage, Cand: "btree", Rows: 20000, Arrivals: 250,
+		Codex: "typical", Start: heBase}
+}
+
+// The binding is accepted only when table, candidate, rows, arrivals, codex variant and start all
+// match; each field alone refuses.
+func TestHistoryRetentionEvidenceColdCheck(t *testing.T) {
+	want := heColdFixture()
+	got := want
+	got.Start = want.Start.In(time.FixedZone("x", 3600)) // same instant, different zone
+	if err := heColdCheck(got, want); err != nil {
+		t.Fatalf("exact match refused: %v", err)
+	}
+	for name, mut := range map[string]func(*heColdBinding){
+		"table":     func(b *heColdBinding) { b.Table = store.HistoryRetentionAnthropicUsage },
+		"candidate": func(b *heColdBinding) { b.Cand = "none" },
+		"rows":      func(b *heColdBinding) { b.Rows++ },
+		"arrivals":  func(b *heColdBinding) { b.Arrivals++ },
+		"codex":     func(b *heColdBinding) { b.Codex = "max" },
+		"start":     func(b *heColdBinding) { b.Start = b.Start.Add(time.Microsecond) },
+	} {
+		g := want
+		mut(&g)
+		err := heColdCheck(g, want)
+		if err == nil {
+			t.Fatalf("a mismatching %s was accepted", name)
+		}
+	}
+}
+
+func TestHistoryRetentionEvidenceColdCutoffCase(t *testing.T) {
+	b := heColdBinding{CutoffC: heBase, CutoffA: heBase.Add(time.Hour), CutoffB: heBase.Add(2 * time.Hour)}
+	for c, want := range map[string]time.Time{"c": b.CutoffC, "a": b.CutoffA, "b": b.CutoffB} {
+		if got, err := b.cutoff(c); err != nil || !got.Equal(want) {
+			t.Fatalf("cutoff(%q) = %v, %v; want %v", c, got, err, want)
+		}
+	}
+	if _, err := b.cutoff("d"); err == nil {
+		t.Fatal("cutoff(d) accepted")
+	}
+}
+
+func TestHistoryRetentionEvidenceParseExplain(t *testing.T) {
+	plan := []string{
+		"Delete on pr_history_events  (cost=0.43..8.45 rows=1 width=18) (actual time=1.2..1.2 rows=0 loops=1)",
+		"  Buffers: shared hit=12 read=3 dirtied=1 written=2",
+		"Planning Time: 0.1 ms",
+		"Execution Time: 12.345 ms",
+	}
+	ex, err := heParseExplain(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ex.ExecMS != 12.345 || ex.Hit != 12 || ex.Read != 3 || ex.Dirtied != 1 || ex.Wrte != 2 || len(ex.Plan) != 4 {
+		t.Fatalf("parsed %+v", ex)
+	}
+	for name, lines := range map[string][]string{
+		"empty":             nil,
+		"no execution time": plan[:3],
+		"malformed time":    {"Execution Time: soon ms"},
+		"short line":        {"Execution Time:"},
+	} {
+		if _, err := heParseExplain(lines); err == nil {
+			t.Fatalf("%s: accepted, want an error", name)
+		}
 	}
 }

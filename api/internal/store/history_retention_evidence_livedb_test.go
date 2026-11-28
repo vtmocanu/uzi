@@ -44,27 +44,46 @@ import (
 //	WarmEvidenceLiveDB       cases (c) no-op, (a) ~2% expired, (b) 90% backlog per candidate index
 //	CompressedEvidenceLiveDB compressed-time drain runs (mode backlog = case b, mode churn = case d)
 //	SmokeEvidenceLiveDB      the production historyretention.Pass under a real sweeper.Engine
-//	ColdEvidenceLiveDB       fixture setup, or the first tick after a container restart
+//	ColdEvidenceLiveDB       fixture setup (publishes a binding), or the first tick after a container restart
 //
 // Environment (all optional unless marked):
 //
-//	UZI_HISTORY_RETENTION_EVIDENCE=1   required
+//	UZI_HISTORY_RETENTION_EVIDENCE=1   required; without it every entrypoint skips
 //	UZI_EVIDENCE_LOG                   required, absolute path, JSON lines are appended
 //	UZI_TEST_DATABASE_URL              required
 //	UZI_EVIDENCE_ROWS                  rows per table (default 1000000)
-//	UZI_EVIDENCE_TABLES                comma list of pr,anthropic,codex,worker (default all four)
+//	UZI_EVIDENCE_TABLES                comma list of pr,anthropic,codex,worker (default all four);
+//	                                   deduplicated, an unknown name is refused
 //	UZI_EVIDENCE_CODEX                 typical (default) or max: the codex jsonb size
-//	UZI_EVIDENCE_CANDS                 comma list of none,btree,brin_off,brin_on
+//	UZI_EVIDENCE_CANDS                 comma list of none,btree,brin_off,brin_on (default all four);
+//	                                   deduplicated, an unknown name is refused
 //	UZI_EVIDENCE_MODE                  backlog or churn (Compressed)
-//	UZI_EVIDENCE_TICKS                 compressed ticks (default 1100 backlog, 4400 churn)
+//	UZI_EVIDENCE_TICKS                 compressed ticks; the default is the required ticks, the
+//	                                   maximum over the selected tables (heRequiredTicks)
+//	UZI_EVIDENCE_BACKLOG_PREFLIGHT=1   Compressed, mode backlog: one production DeleteBatch at the
+//	                                   initial backlog cutoff plus a rolled-back EXPLAIN per selected
+//	                                   table and candidate, then exit without the drain loop
 //	UZI_EVIDENCE_PR_ARRIVALS           pr_history_events arrivals per 15 s tick (default 6)
 //	UZI_EVIDENCE_MAX_MINUTES           wall-clock cap of one compressed run (default 20)
-//	UZI_EVIDENCE_SMOKE_INDEXES         pr=btree,anthropic=btree,codex=btree,worker=btree (Smoke)
+//	UZI_EVIDENCE_SMOKE_INDEXES         table=candidate list (Smoke); an omitted table keeps btree,
+//	                                   the production index
 //	UZI_EVIDENCE_SMOKE_SECONDS         smoke length (default 300)
-//	UZI_EVIDENCE_COLD_TABLE / _CASE / _SETUP / _LABEL   see ColdEvidenceLiveDB
+//	UZI_EVIDENCE_COLD_TABLE / _CASE / _SETUP / _SETUP_ID / _LABEL   see ColdEvidenceLiveDB
+//
+// Labels. Every record that supports a claim carries coverage_reasons (settings that narrow the run
+// below the evidence fixture: fewer tables, candidates or rows, a changed arrival rate or codex
+// variant, autovacuum off, a short or non-btree smoke) and run_reasons (what this run itself
+// observed: short or failed ticks, a wall-clock or error stop, a residual backlog, a probe error).
+// Only a record with both lists empty is qualifying.
 //
 // Measurements use the production session (store.OpenHistoryRetentionSession, DeleteBatch, a fresh
 // connection per tick, 300 ms statement timeout and 200 ms lock timeout). Run without -race.
+//
+// Scope. The harness is an opt-in single-operator tool. Running two invocations against one hrev at
+// once is unsupported and is not fenced. The hrev database is trusted only when it carries the
+// evidence marker this harness writes when it creates the database; an unmarked hrev left behind by
+// a creator that exited is refused by the marker check, and the operator drops it only after
+// verifying that they created it.
 
 const (
 	heDBName            = "hrev"
@@ -782,11 +801,14 @@ func (fx *heFx) insertRows(s heSpec, from, to int64) {
 	}
 }
 
-// reseed empties the table and loads spec s, then VACUUM ANALYZE so the heap, visibility map and
+// reseed first deletes the table's cold binding (any fixture change invalidates a published setup),
+// then empties the table and loads spec s, then VACUUM ANALYZE so the heap, visibility map and
 // statistics are in the state a settled table has.
 func (fx *heFx) reseed(s heSpec) time.Duration {
 	fx.t.Helper()
 	t0 := time.Now()
+	fx.ensureBindingTable()
+	fx.exec(`DELETE FROM `+heBindingTable+` WHERE table_name = $1`, string(s.table))
 	// An interrupted compressed run with UZI_EVIDENCE_NO_AV=1 can leave the table with autovacuum
 	// disabled; every fixture starts from the default.
 	fx.exec(`ALTER TABLE ` + string(s.table) + ` RESET (autovacuum_enabled)`)
@@ -1034,64 +1056,145 @@ func (fx *heFx) statio(conn *pgxpool.Conn, table store.HistoryRetentionTable) (m
 	return m, nil
 }
 
-// explain runs the production DELETE of one batch under EXPLAIN (ANALYZE, BUFFERS) with a custom
+// explainE runs the production DELETE of one batch under EXPLAIN (ANALYZE, BUFFERS) with a custom
 // plan (a fresh session's first execution is always planned for its parameters) inside a
 // transaction that is rolled back, so the fixture is unchanged. Per-relation block counters
 // (heap, index, TOAST) come from pg_statio_user_tables before and after.
-func (fx *heFx) explain(table store.HistoryRetentionTable, cutoff time.Time, batch int32) heExplain {
-	fx.t.Helper()
+//
+// Every resource the call acquires is released on every path, in order: the rows are closed, the
+// transaction is rolled back, then the harness's own prepared statement (heExplainStmt, never
+// DEALLOCATE ALL) is deallocated. A connection whose cleanup fails is destroyed instead of being
+// returned to the pool. The error is returned; the caller decides whether it is fatal.
+func (fx *heFx) explainE(table store.HistoryRetentionTable, cutoff time.Time, batch int32) (heExplain, error) {
 	conn, err := fx.pool.Acquire(fx.ctx)
 	if err != nil {
-		fx.t.Fatalf("explain acquire: %v", err)
+		return heExplain{}, fmt.Errorf("explain acquire: %w", err)
 	}
-	defer conn.Release()
-	var ex heExplain
+	destroy := false
+	defer func() {
+		if destroy {
+			// Hijack takes the connection out of the pool; closing it ends the backend.
+			_ = conn.Hijack().Close(context.Background())
+			return
+		}
+		conn.Release()
+	}()
 	before, errBefore := fx.statio(conn, table)
-	mustExec := func(sql string) {
-		if _, err := conn.Exec(fx.ctx, sql); err != nil {
-			fx.t.Fatalf("explain setup: %v\n%s", err, sql)
+	lines, err := fx.explainLines(conn, table, cutoff, batch, &destroy)
+	if err != nil {
+		return heExplain{}, err
+	}
+	ex, err := heParseExplain(lines)
+	if err != nil {
+		return heExplain{}, err
+	}
+	after, errAfter := fx.statio(conn, table)
+	if err := errors.Join(errBefore, errAfter); err != nil {
+		ex.ObsUnavailable = err.Error()
+		return ex, nil
+	}
+	ex.StatIO = map[string]int64{}
+	for k, v := range after {
+		ex.StatIO[k] = v - before[k]
+	}
+	return ex, nil
+}
+
+// heExplainStmt is the only prepared statement name the EXPLAIN uses and deallocates.
+const heExplainStmt = "hrev_p"
+
+// explainLines runs the EXPLAIN on conn and returns its plan lines. Its deferred cleanup closes the
+// rows, rolls the transaction back and deallocates heExplainStmt, in that order; a failed cleanup
+// step sets *destroy and joins its error into the result.
+func (fx *heFx) explainLines(conn *pgxpool.Conn, table store.HistoryRetentionTable, cutoff time.Time, batch int32, destroy *bool) (lines []string, err error) {
+	var rows pgx.Rows
+	began, prepared := false, false
+	defer func() {
+		cctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if rows != nil {
+			// A server-side error in the rows is returned to the caller; the connection is judged by
+			// whether the rollback and deallocate below succeed.
+			rows.Close()
+		}
+		if began {
+			if _, cerr := conn.Exec(cctx, `ROLLBACK`); cerr != nil {
+				*destroy = true
+				err = errors.Join(err, fmt.Errorf("explain cleanup rollback: %w", cerr))
+				return // the session state is unknown; a DEALLOCATE would not be trustworthy
+			}
+		}
+		if prepared {
+			if _, cerr := conn.Exec(cctx, `DEALLOCATE `+heExplainStmt); cerr != nil {
+				*destroy = true
+				err = errors.Join(err, fmt.Errorf("explain cleanup deallocate: %w", cerr))
+			}
+		}
+	}()
+	step := func(sql string) error {
+		if _, serr := conn.Exec(fx.ctx, sql); serr != nil {
+			return fmt.Errorf("explain setup: %w\n%s", serr, sql)
+		}
+		return nil
+	}
+	if err = step(`BEGIN`); err != nil {
+		return nil, err
+	}
+	began = true
+	for _, s := range []string{`SET LOCAL plan_cache_mode = force_custom_plan`, `SET LOCAL statement_timeout = 0`} {
+		if err = step(s); err != nil {
+			return nil, err
 		}
 	}
-	mustExec(`BEGIN`)
-	mustExec(`SET LOCAL plan_cache_mode = force_custom_plan`)
-	mustExec(`SET LOCAL statement_timeout = 0`)
-	mustExec(`PREPARE hrev_p(timestamptz, int) AS ` + store.HistoryRetentionDeleteSQLForTest(table))
-	rows, err := conn.Query(fx.ctx, fmt.Sprintf(`EXPLAIN (ANALYZE, BUFFERS) EXECUTE hrev_p('%s'::timestamptz, %d)`,
+	if err = step(`PREPARE ` + heExplainStmt + `(timestamptz, int) AS ` + store.HistoryRetentionDeleteSQLForTest(table)); err != nil {
+		return nil, err
+	}
+	prepared = true
+	rows, err = conn.Query(fx.ctx, fmt.Sprintf(`EXPLAIN (ANALYZE, BUFFERS) EXECUTE `+heExplainStmt+`('%s'::timestamptz, %d)`,
 		cutoff.UTC().Format("2006-01-02T15:04:05.999999Z07:00"), batch))
 	if err != nil {
-		fx.t.Fatalf("explain: %v", err)
+		return nil, fmt.Errorf("explain: %w", err)
 	}
-	seenTop := false
 	for rows.Next() {
 		var line string
-		if err := rows.Scan(&line); err != nil {
-			fx.t.Fatalf("explain scan: %v", err)
+		if serr := rows.Scan(&line); serr != nil {
+			return nil, fmt.Errorf("explain scan: %w", serr)
 		}
-		ex.Plan = append(ex.Plan, line)
+		lines = append(lines, line)
+	}
+	if rerr := rows.Err(); rerr != nil {
+		return nil, fmt.Errorf("explain rows: %w", rerr)
+	}
+	return lines, nil
+}
+
+// heParseExplain reads the plan lines of EXPLAIN (ANALYZE, BUFFERS): the first Buffers line is the
+// top node's counters and the Execution Time line is required, so a truncated or unexpected result
+// is an error and never a zero.
+func heParseExplain(lines []string) (heExplain, error) {
+	ex := heExplain{Plan: append([]string(nil), lines...)}
+	seenTop, seenExec := false, false
+	for _, line := range lines {
 		if !seenTop && strings.Contains(line, "Buffers:") {
 			seenTop = true
 			ex.Hit, ex.Read, ex.Dirtied, ex.Wrte = heParseBuffers(line)
 		}
 		if strings.HasPrefix(line, "Execution Time:") {
 			f := strings.Fields(line)
-			if len(f) >= 3 {
-				ex.ExecMS, _ = strconv.ParseFloat(f[2], 64)
+			if len(f) < 3 {
+				return heExplain{}, fmt.Errorf("explain: malformed Execution Time line %q", line)
 			}
+			ms, err := strconv.ParseFloat(f[2], 64)
+			if err != nil {
+				return heExplain{}, fmt.Errorf("explain: Execution Time %q: %w", line, err)
+			}
+			ex.ExecMS, seenExec = ms, true
 		}
 	}
-	rows.Close()
-	mustExec(`ROLLBACK`)
-	mustExec(`DEALLOCATE hrev_p`)
-	after, errAfter := fx.statio(conn, table)
-	if err := errors.Join(errBefore, errAfter); err != nil {
-		ex.ObsUnavailable = err.Error()
-		return ex
+	if !seenExec {
+		return heExplain{}, fmt.Errorf("explain: no Execution Time line in %d plan lines", len(lines))
 	}
-	ex.StatIO = map[string]int64{}
-	for k, v := range after {
-		ex.StatIO[k] = v - before[k]
-	}
-	return ex
+	return ex, nil
 }
 
 func (e heExplain) kv() map[string]any {
@@ -1126,7 +1229,9 @@ func (fx *heFx) tableLabel(table store.HistoryRetentionTable) string {
 	return string(table)
 }
 
-func (fx *heFx) runCase(spec heSpec, cand string, c heCase) {
+// runCase runs one warm case on the fixture as it stands; seedD is the time the fixture that this
+// case starts from took to seed.
+func (fx *heFx) runCase(spec heSpec, cand string, c heCase, seedD time.Duration) {
 	fx.t.Helper()
 	cutoff, eligibleExp := heCaseCutoff(spec, c.frac)
 	if c.drain {
@@ -1134,7 +1239,10 @@ func (fx *heFx) runCase(spec heSpec, cand string, c heCase) {
 	}
 	expired := fx.one(`SELECT count(*) FROM `+string(spec.table)+` WHERE `+heEligibleWhere(spec.table), cutoff)
 	before := fx.one(`SELECT count(*) FROM ` + string(spec.table))
-	ex := fx.explain(spec.table, cutoff, heMaxBatch)
+	ex, err := fx.explainE(spec.table, cutoff, heMaxBatch)
+	if err != nil {
+		fx.t.Fatalf("warm %s %s case %s: %v", spec.table, cand, c.name, err)
+	}
 	var del, open, closeMS []float64
 	var deleted int64
 	errs := map[string]int{}
@@ -1151,7 +1259,7 @@ func (fx *heFx) runCase(spec heSpec, cand string, c heCase) {
 		}
 	}
 	after := fx.one(`SELECT count(*) FROM ` + string(spec.table))
-	kv := map[string]any{"table": fx.tableLabel(spec.table), "cand": cand, "case": c.name, "ticks": c.ticks,
+	kv := map[string]any{"table": fx.tableLabel(spec.table), "cand": cand, "case": c.name, "ticks": c.ticks, "seed_seconds": seedD.Seconds(),
 		"expired_before": expired, "eligible_expected": eligibleExp, "count_before": before, "count_after": after, "confirmed_deleted": deleted,
 		"median_ms": heQuant(del, 0.5), "p95_ms": heQuant(del, 0.95), "max_ms": heMaxF(del), "first_ms": del[0],
 		"open_median_ms": heQuant(open, 0.5), "close_median_ms": heQuant(closeMS, 0.5), "errors": errs,
@@ -1187,8 +1295,9 @@ func TestHistoryRetentionSeedEvidenceLiveDB(t *testing.T) {
 }
 
 // TestHistoryRetentionWarmEvidenceLiveDB runs cases (c), (a) and (b) for every selected
-// table and candidate index. Each (table, candidate) starts from a fresh fixture, because (a) and
-// (b) delete committed rows.
+// table and candidate index. Each (table, candidate) starts from a freshly seeded fixture, and every
+// committing case, (a) and (b), is preceded by its own reseed and ANALYZE because it deletes
+// committed rows; the seed time each case started from is its seed_seconds.
 func TestHistoryRetentionWarmEvidenceLiveDB(t *testing.T) {
 	fx := newHeFx(t, true)
 	for _, table := range fx.tables {
@@ -1200,7 +1309,12 @@ func TestHistoryRetentionWarmEvidenceLiveDB(t *testing.T) {
 			kv["table"], kv["cand"], kv["build_ms"], kv["seed_seconds"] = fx.tableLabel(table), cand, heMS(build), seedD.Seconds()
 			fx.log.rec("sizes", kv)
 			for _, c := range heWarmCases {
-				fx.runCase(spec, cand, c)
+				caseSeed := seedD
+				if c.commit {
+					caseSeed = fx.reseed(spec)
+					fx.exec(`ANALYZE ` + string(table))
+				}
+				fx.runCase(spec, cand, c, caseSeed)
 			}
 			kv = fx.sizes(table, cand).kv()
 			kv["table"], kv["cand"], kv["after"] = fx.tableLabel(table), cand, "warm"
@@ -1424,6 +1538,17 @@ func TestHistoryRetentionCompressedEvidenceLiveDB(t *testing.T) {
 	if mode == "backlog" {
 		offFrac = 0.90
 	}
+	if os.Getenv("UZI_EVIDENCE_BACKLOG_PREFLIGHT") == "1" {
+		if mode != "backlog" {
+			t.Fatalf("UZI_EVIDENCE_BACKLOG_PREFLIGHT=1 needs UZI_EVIDENCE_MODE=backlog, got %q", mode)
+		}
+		for _, table := range fx.tables {
+			for _, cand := range fx.cands {
+				fx.preflight(table, cand, offFrac)
+			}
+		}
+		return
+	}
 	required := map[store.HistoryRetentionTable]int{}
 	defTicks := 0
 	for _, table := range fx.tables {
@@ -1440,6 +1565,51 @@ func TestHistoryRetentionCompressedEvidenceLiveDB(t *testing.T) {
 	for _, cand := range fx.cands {
 		fx.compressedRun(mode, cand, ticks, offFrac, wall, required)
 	}
+}
+
+// preflight is the support check of one (table, candidate) before a backlog drain is attempted: on a
+// freshly seeded fixture it runs one production DeleteBatch at the initial backlog cutoff (the
+// production 300 ms statement and 200 ms lock timeouts) and records whether it timed out (57014) and
+// what the outcome was; on a second fresh fixture it runs the rolled-back EXPLAIN (ANALYZE, BUFFERS)
+// of the same ordered statement. Nothing loops. An error of the preflight itself is a run reason of
+// the record, never a silent gap, and a timeout is a result, not an error.
+func (fx *heFx) preflight(table store.HistoryRetentionTable, cand string, offFrac float64) {
+	fx.t.Helper()
+	spec := fx.stdSpec(table)
+	cutoff, eligible := heCaseCutoff(spec, offFrac)
+	reasons := []string{}
+	fx.reseed(spec)
+	fx.setIndex(table, cand)
+	r := fx.oneTick(table, cutoff, heMaxBatch)
+	outcome := "confirmed"
+	switch heErrKind(r.Err) {
+	case heKindOK:
+	case heKindTimeout:
+		outcome = "timed_out"
+	case heKindUnknown:
+		outcome = "unknown"
+		reasons = append(reasons, "delete outcome unknown: "+r.Err)
+	default:
+		outcome = "rolled_back:" + r.Err
+		reasons = append(reasons, "delete rolled back with "+r.Err)
+	}
+	kv := map[string]any{"table": fx.tableLabel(table), "cand": cand, "cutoff": cutoff.UTC().Format(time.RFC3339Nano),
+		"rows": spec.n, "eligible_expected": eligible, "timed_out": r.Err == "57014", "outcome": outcome, "deleted": r.N,
+		"open_ms": r.OpenMS, "delete_ms": r.DelMS, "close_ms": r.CloseMS, "err": r.Err}
+	fx.reseed(spec)
+	fx.setIndex(table, cand)
+	ex, err := fx.explainE(table, cutoff, heMaxBatch)
+	if err != nil {
+		reasons = append(reasons, "explain: "+err.Error())
+	} else {
+		for k, v := range ex.kv() {
+			kv[k] = v
+		}
+	}
+	kv["run_reasons"], kv["coverage_reasons"] = reasons, fx.coverageReasons(false, nil)
+	fx.log.rec("preflight", kv)
+	fx.t.Logf("preflight %s %s: outcome %s timed_out %v deleted %d delete %.1f ms; run_reasons %v",
+		fx.tableLabel(table), cand, outcome, r.Err == "57014", r.N, r.DelMS, reasons)
 }
 
 func (fx *heFx) compressedRun(mode, cand string, ticks int, offFrac float64, wall time.Duration, required map[store.HistoryRetentionTable]int) {
@@ -1586,7 +1756,11 @@ func (fx *heFx) nearEmptyProbe(mode, cand string, table store.HistoryRetentionTa
 	} else {
 		p.Valid = true
 		kv["near_empty_valid"] = true
-		for a, b := range fx.explain(table, cut, heMaxBatch).kv() {
+		x, err := fx.explainE(table, cut, heMaxBatch)
+		if err != nil {
+			fx.t.Fatalf("near-empty probe explain %s: %v", table, err)
+		}
+		for a, b := range x.kv() {
 			kv[a] = b
 		}
 		var del []float64
@@ -1871,18 +2045,165 @@ func truncateTail(s string, n int) string {
 // ---------------------------------------------------------------------------------------------
 // cold phase
 
+// heBindingTable holds one row per table: the published, single-use binding between a cold setup and
+// the one measurement allowed to use it. It lives in hrev's uzi_test_harness schema, the schema the
+// evidence marker is in, and reseed deletes the table's row before it touches the fixture.
+const heBindingTable = "uzi_test_harness.cold_binding"
+
+func (fx *heFx) ensureBindingTable() {
+	fx.t.Helper()
+	fx.exec(`CREATE SCHEMA IF NOT EXISTS uzi_test_harness`)
+	fx.exec(`CREATE TABLE IF NOT EXISTS ` + heBindingTable + ` (
+	        table_name text PRIMARY KEY, setup_id uuid NOT NULL UNIQUE, candidate text NOT NULL,
+	        row_count integer NOT NULL, arrivals integer NOT NULL, codex_variant text NOT NULL,
+	        start_at timestamptz NOT NULL, cutoff_c timestamptz NOT NULL, cutoff_a timestamptz NOT NULL,
+	        cutoff_b timestamptz NOT NULL, created_at timestamptz NOT NULL DEFAULT now(), consumed_at timestamptz)`)
+}
+
+// heColdBinding is what a cold setup publishes: the fixture parameters a measurement must match and
+// the cutoffs of cases c, a and b computed from that fixture.
+type heColdBinding struct {
+	SetupID                   uuid.UUID
+	Table                     store.HistoryRetentionTable
+	Cand                      string
+	Rows, Arrivals            int
+	Codex                     string
+	Start                     time.Time
+	CutoffC, CutoffA, CutoffB time.Time
+}
+
+// heColdCheck compares the published binding with the parameters the measurement would use now: the
+// table, candidate, row count, arrivals, codex variant and fixture start must all match exactly. It is
+// pure and runs BEFORE the binding is consumed, so a mismatch burns nothing.
+func heColdCheck(got, want heColdBinding) error {
+	var bad []string
+	if got.Table != want.Table {
+		bad = append(bad, fmt.Sprintf("table %q, now %q", got.Table, want.Table))
+	}
+	if got.Cand != want.Cand {
+		bad = append(bad, fmt.Sprintf("candidate %q, now %q", got.Cand, want.Cand))
+	}
+	if got.Rows != want.Rows {
+		bad = append(bad, fmt.Sprintf("rows %d, now %d", got.Rows, want.Rows))
+	}
+	if got.Arrivals != want.Arrivals {
+		bad = append(bad, fmt.Sprintf("arrivals %d, now %d", got.Arrivals, want.Arrivals))
+	}
+	if got.Codex != want.Codex {
+		bad = append(bad, fmt.Sprintf("codex variant %q, now %q", got.Codex, want.Codex))
+	}
+	if !got.Start.Equal(want.Start) {
+		bad = append(bad, fmt.Sprintf("fixture start %s, now %s", got.Start.UTC().Format(time.RFC3339Nano), want.Start.UTC().Format(time.RFC3339Nano)))
+	}
+	if len(bad) > 0 {
+		return fmt.Errorf("the setup binding does not match this measurement: setup had %s", strings.Join(bad, "; "))
+	}
+	return nil
+}
+
+// cutoff returns the binding's cutoff of case c, a or b.
+func (b heColdBinding) cutoff(c string) (time.Time, error) {
+	switch c {
+	case "a":
+		return b.CutoffA, nil
+	case "b":
+		return b.CutoffB, nil
+	case "c":
+		return b.CutoffC, nil
+	}
+	return time.Time{}, fmt.Errorf("UZI_EVIDENCE_COLD_CASE must be a, b or c, got %q", c)
+}
+
+// requireBuiltIndex checks the post-build state of the table: the candidate's index exists and is
+// valid and ready, or, for none, none of the candidate indexes exists.
+func (fx *heFx) requireBuiltIndex(table store.HistoryRetentionTable, cand string) {
+	fx.t.Helper()
+	if cand == "none" {
+		for _, c := range heCands {
+			if c == "none" {
+				continue
+			}
+			var present bool
+			if err := fx.pool.QueryRow(fx.ctx, `SELECT to_regclass($1) IS NOT NULL`, heIdxName(table, c)).Scan(&present); err != nil {
+				fx.t.Fatalf("index check: %v", err)
+			}
+			if present {
+				fx.t.Fatalf("setup left index %s on %s for candidate none", heIdxName(table, c), table)
+			}
+		}
+		return
+	}
+	var ok bool
+	err := fx.pool.QueryRow(fx.ctx, `SELECT i.indisvalid AND i.indisready FROM pg_index i WHERE i.indexrelid = to_regclass($1)`,
+		heIdxName(table, cand)).Scan(&ok)
+	if err != nil || !ok {
+		fx.t.Fatalf("setup index %s on %s is not valid and ready (valid_and_ready=%v err=%v)", heIdxName(table, cand), table, ok, err)
+	}
+}
+
+// claimBinding reads the binding setup_id published for table over a pool of its own (so fx.pool's
+// first work stays the measured tick), refuses a missing, consumed or mismatching one, and only then
+// marks it consumed. The mark is a single conditional UPDATE: zero rows means someone else got there.
+func (fx *heFx) claimBinding(setupID uuid.UUID, table store.HistoryRetentionTable, want heColdBinding) heColdBinding {
+	fx.t.Helper()
+	p, err := pgxpool.New(fx.ctx, fx.dsn)
+	if err != nil {
+		fx.t.Fatalf("binding pool: %v", err)
+	}
+	defer p.Close()
+	fx.requireEvidenceDatabase(p)
+	b := heColdBinding{SetupID: setupID}
+	var name string
+	var consumed *time.Time
+	err = p.QueryRow(fx.ctx, `SELECT table_name, candidate, row_count, arrivals, codex_variant, start_at, cutoff_c, cutoff_a, cutoff_b, consumed_at
+	        FROM `+heBindingTable+` WHERE setup_id = $1 AND table_name = $2`, setupID, string(table)).
+		Scan(&name, &b.Cand, &b.Rows, &b.Arrivals, &b.Codex, &b.Start, &b.CutoffC, &b.CutoffA, &b.CutoffB, &consumed)
+	if errors.Is(err, pgx.ErrNoRows) {
+		fx.t.Fatalf("refusing: no binding for setup id %s on %s; it was never published or a reseed of the table removed it. Re-run the setup", setupID, table)
+	}
+	if err != nil {
+		fx.t.Fatalf("refusing: cannot read the binding of setup id %s (was a setup ever run?): %v", setupID, err)
+	}
+	b.Table = store.HistoryRetentionTable(name)
+	if consumed != nil {
+		fx.t.Fatalf("refusing: setup id %s was already consumed at %s. Re-run the setup", setupID, consumed.UTC().Format(time.RFC3339))
+	}
+	if err := heColdCheck(b, want); err != nil {
+		fx.t.Fatalf("refusing: %v. The binding is left unconsumed", err)
+	}
+	tag, err := p.Exec(fx.ctx, `UPDATE `+heBindingTable+` SET consumed_at = now() WHERE setup_id = $1 AND table_name = $2 AND consumed_at IS NULL`,
+		setupID, string(table))
+	if err != nil {
+		fx.t.Fatalf("refusing: claim of setup id %s failed: %v", setupID, err)
+	}
+	if tag.RowsAffected() != 1 {
+		fx.t.Fatalf("refusing: setup id %s was consumed or removed while it was being claimed. Re-run the setup", setupID)
+	}
+	return b
+}
+
 // TestHistoryRetentionColdEvidenceLiveDB has two modes selected by UZI_EVIDENCE_COLD_TABLE (pr,
-// anthropic, codex or worker) and UZI_EVIDENCE_COLD_SETUP:
+// anthropic, codex or worker) and UZI_EVIDENCE_COLD_SETUP. Both need exactly one candidate in
+// UZI_EVIDENCE_CANDS.
 //
-//	UZI_EVIDENCE_COLD_SETUP=1  reseed the table with the candidate UZI_EVIDENCE_CANDS (one value),
-//	                           VACUUM ANALYZE and CHECKPOINT, then stop
-//	otherwise                  run EXACTLY one tick of UZI_EVIDENCE_COLD_CASE (a, b or c), as the
-//	                           first work after the pool opens. A shell script restarts the
-//	                           container before each invocation. The cutoff is computed from the
-//	                           fixture spec, so no query touches the table first. The marker
-//	                           check (requireEvidenceMarker, which also reads server_version)
-//	                           opens a separate backend first on its own pool; the tick is the
-//	                           first work on fx.pool.
+//	UZI_EVIDENCE_COLD_SETUP=1  delete the table's binding (reseed does), reseed the table, build the
+//	                           candidate index, check it is valid and ready (or absent for none),
+//	                           CHECKPOINT, then publish one binding with a fresh random setup id in a
+//	                           single autocommitted INSERT and log that id
+//	otherwise                  needs UZI_EVIDENCE_COLD_SETUP_ID. Run EXACTLY one tick of
+//	                           UZI_EVIDENCE_COLD_CASE (a, b or c), as the first work on the
+//	                           measurement pool, after a shell script restarted the container. The
+//	                           binding is read first, compared with this invocation's table,
+//	                           candidate, rows, arrivals, codex variant and fixture start, and only a
+//	                           matching, unconsumed binding is claimed (consumed_at set) before the
+//	                           DELETE runs. The cutoff and candidate in the record come from the
+//	                           binding. The marker check and the binding read use backends of their
+//	                           own; UZI_EVIDENCE_COLD_LABEL is a free-text note carried into the record.
+//
+// A binding is single use and a reseed of its table (any harness phase) removes it. This is ordinary
+// PostgreSQL commit semantics and nothing stronger: an interruption leaves the binding absent,
+// consumed, or published and unclaimed. The first two refuse a measurement, so re-run the setup; the
+// third is the state the measurement expects.
 func TestHistoryRetentionColdEvidenceLiveDB(t *testing.T) {
 	heRequireOptIn(t)
 	table, err := heTableByShort(os.Getenv("UZI_EVIDENCE_COLD_TABLE"))
@@ -1891,32 +2212,126 @@ func TestHistoryRetentionColdEvidenceLiveDB(t *testing.T) {
 	}
 	if os.Getenv("UZI_EVIDENCE_COLD_SETUP") == "1" {
 		fx := newHeFx(t, true)
+		if len(fx.cands) != 1 {
+			t.Fatalf("cold setup needs exactly one candidate in UZI_EVIDENCE_CANDS, got %v", fx.cands)
+		}
 		cand := fx.cands[0]
 		spec := fx.stdSpec(table)
-		fx.reseed(spec)
+		fx.reseed(spec) // deletes the table's binding before the fixture changes
 		fx.setIndex(table, cand)
+		fx.requireBuiltIndex(table, cand)
 		fx.exec(`CHECKPOINT`)
 		kv := fx.sizes(table, cand).kv()
 		kv["table"], kv["cand"], kv["after"] = fx.tableLabel(table), cand, "cold_setup"
 		fx.log.rec("sizes", kv)
+		cutC, _ := heCaseCutoff(spec, 0)
+		cutA, _ := heCaseCutoff(spec, 0.0205)
+		cutB, _ := heCaseCutoff(spec, 0.90)
+		setupID := uuid.New()
+		fx.exec(`INSERT INTO `+heBindingTable+` (setup_id, table_name, candidate, row_count, arrivals, codex_variant, start_at, cutoff_c, cutoff_a, cutoff_b)
+		        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+			setupID, string(table), cand, spec.n, spec.arrivals, fx.codex, spec.start, cutC, cutA, cutB)
+		fx.log.rec("cold_setup", map[string]any{"table": fx.tableLabel(table), "cand": cand, "setup_id": setupID.String(),
+			"rows": spec.n, "arrivals": spec.arrivals, "codex": fx.codex, "start": spec.start.Format(time.RFC3339Nano)})
+		t.Logf("cold setup %s cand %s published: UZI_EVIDENCE_COLD_SETUP_ID=%s", table, cand, setupID)
 		return
 	}
-	fx := newHeFx(t, false)
-	spec := fx.stdSpec(table)
-	cutoff, _ := heCaseCutoff(spec, 0)
-	switch os.Getenv("UZI_EVIDENCE_COLD_CASE") {
-	case "a":
-		cutoff, _ = heCaseCutoff(spec, 0.0205)
-	case "b":
-		cutoff, _ = heCaseCutoff(spec, 0.90)
-	case "c":
-	default:
+	caseName := os.Getenv("UZI_EVIDENCE_COLD_CASE")
+	if caseName != "a" && caseName != "b" && caseName != "c" {
 		t.Fatal("UZI_EVIDENCE_COLD_CASE must be a, b or c")
+	}
+	rawID := os.Getenv("UZI_EVIDENCE_COLD_SETUP_ID")
+	if rawID == "" {
+		t.Fatal("UZI_EVIDENCE_COLD_SETUP_ID is required for a cold measurement: run the setup (UZI_EVIDENCE_COLD_SETUP=1) and pass the setup id it logged")
+	}
+	setupID, err := uuid.Parse(rawID)
+	if err != nil {
+		t.Fatalf("UZI_EVIDENCE_COLD_SETUP_ID %q: %v", rawID, err)
+	}
+	fx := newHeFx(t, false) // runs the marker checks (requireEvidenceMarker, requireEvidenceDatabase)
+	if len(fx.cands) != 1 {
+		t.Fatalf("a cold measurement needs exactly one candidate in UZI_EVIDENCE_CANDS, got %v", fx.cands)
+	}
+	spec := fx.stdSpec(table)
+	bind := fx.claimBinding(setupID, table, heColdBinding{Table: table, Cand: fx.cands[0], Rows: spec.n,
+		Arrivals: spec.arrivals, Codex: fx.codex, Start: spec.start})
+	cutoff, err := bind.cutoff(caseName)
+	if err != nil {
+		t.Fatal(err)
 	}
 	t0 := time.Now()
 	r := fx.oneTick(table, cutoff, heMaxBatch)
-	fx.log.rec("cold", map[string]any{"table": fx.tableLabel(table), "label": os.Getenv("UZI_EVIDENCE_COLD_LABEL"),
-		"case": os.Getenv("UZI_EVIDENCE_COLD_CASE"), "open_ms": r.OpenMS, "delete_ms": r.DelMS, "close_ms": r.CloseMS,
+	fx.log.rec("cold", map[string]any{"table": fx.tableLabel(table), "setup_id": setupID.String(), "cand": bind.Cand,
+		"cutoff": cutoff.UTC().Format(time.RFC3339Nano), "note": os.Getenv("UZI_EVIDENCE_COLD_LABEL"),
+		"case": caseName, "open_ms": r.OpenMS, "delete_ms": r.DelMS, "close_ms": r.CloseMS,
 		"total_ms": heMS(time.Since(t0)), "deleted": r.N, "err": r.Err})
-	t.Logf("cold %s case %s: open %.1f ms delete %.1f ms deleted %d err %q", table, os.Getenv("UZI_EVIDENCE_COLD_CASE"), r.OpenMS, r.DelMS, r.N, r.Err)
+	t.Logf("cold %s case %s setup %s: open %.1f ms delete %.1f ms deleted %d err %q", table, caseName, setupID, r.OpenMS, r.DelMS, r.N, r.Err)
+}
+
+// ---------------------------------------------------------------------------------------------
+// explain cleanup
+
+// TestHistoryRetentionExplainCleanupEvidenceLiveDB forces a failure inside explainE (a cutoff
+// outside the timestamptz range is rejected by EXECUTE after the transaction and the prepared
+// statement exist) on a dedicated one-connection pool, then proves on the same backend that explainE cleaned up: the
+// backend is idle outside any transaction, the harness statement is gone, and a query cached before
+// the failure still runs.
+func TestHistoryRetentionExplainCleanupEvidenceLiveDB(t *testing.T) {
+	fx := newHeFx(t, true)
+	cfg, err := pgxpool.ParseConfig(fx.dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.MaxConns = 1
+	one, err := pgxpool.NewWithConfig(fx.ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer one.Close()
+	const cached = `SELECT $1::int + 1`
+	backendPID := func() int {
+		var pid int
+		if err := one.QueryRow(fx.ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+			t.Fatalf("pg_backend_pid: %v", err)
+		}
+		return pid
+	}
+	pid := backendPID()
+	var got int
+	if err := one.QueryRow(fx.ctx, cached, 1).Scan(&got); err != nil || got != 2 {
+		t.Fatalf("cached query before the failure: %d %v", got, err)
+	}
+
+	failing := *fx
+	failing.pool = one
+	_, ferr := failing.explainE(store.HistoryRetentionPRHistoryEvents, time.Date(400000, 1, 1, 0, 0, 0, 0, time.UTC), heMaxBatch)
+	if ferr == nil {
+		t.Fatal("explainE with an out-of-range cutoff succeeded, want the forced failure")
+	}
+	t.Logf("forced failure: %v", ferr)
+
+	// From the other pool: the backend is idle, not in a transaction, and its harness statement is gone.
+	var state string
+	var inXact bool
+	if err := fx.pool.QueryRow(fx.ctx, `SELECT state, xact_start IS NOT NULL FROM pg_stat_activity WHERE pid = $1`, pid).Scan(&state, &inXact); err != nil {
+		t.Fatalf("pg_stat_activity of backend %d (destroyed or never reused?): %v", pid, err)
+	}
+	if state != "idle" || inXact {
+		t.Fatalf("backend %d state %q in_transaction %v after the failed explain, want idle outside a transaction", pid, state, inXact)
+	}
+	if after := backendPID(); after != pid {
+		t.Fatalf("the pool handed out backend %d after the failure, want the same backend %d", after, pid)
+	}
+	var txid *int64
+	var stmts int
+	if err := one.QueryRow(fx.ctx, `SELECT txid_current_if_assigned(), (SELECT count(*) FROM pg_prepared_statements WHERE name = $1)`, heExplainStmt).Scan(&txid, &stmts); err != nil {
+		t.Fatalf("session state query: %v", err)
+	}
+	if txid != nil || stmts != 0 {
+		t.Fatalf("txid_current_if_assigned=%v harness prepared statements=%d, want null and 0", txid, stmts)
+	}
+	if err := one.QueryRow(fx.ctx, cached, 2).Scan(&got); err != nil || got != 3 {
+		t.Fatalf("cached query after the failure: %d %v", got, err)
+	}
+	t.Logf("explainE cleanup verified on backend %d", pid)
 }
