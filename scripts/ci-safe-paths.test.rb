@@ -750,7 +750,7 @@ assert.call(auto_jobs.fetch('watch').fetch('if'), "${{ !cancelled() && needs.pus
 assert.call(auto_jobs.fetch('watch').fetch('steps').find { |step| step['id'] == 'admit' }.fetch('run'),
             'python3 -I scripts/release-auto.py watch-check', 'recovery checks actor and tag before actions writes')
 mint = auto_push.fetch('steps').find { |step| step['id'] == 'app' }
-assert.call(mint.fetch('uses'), 'actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510', 'reviewed token action')
+assert.call(mint.fetch('uses'), 'actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc', 'reviewed token action')
 assert.call(mint['if'], nil, 'mint keeps default success gating after validation')
 assert.call(mint.fetch('with'), {'client-id' => '${{ vars.RELEASE_APP_ID }}', 'private-key' => '${{ secrets.RELEASE_APP_KEY }}',
                                'owner' => 'vtmocanu', 'repositories' => 'uzi', 'permission-contents' => 'write'}, 'installation token scope')
@@ -799,7 +799,7 @@ assert.call(auto_push.fetch('steps').index(bundle_step) < auto_push.fetch('steps
 assert.call(auto_push.fetch('steps').index(mint) < auto_push.fetch('steps').index(publish_step), true, 'only final publisher receives installation token')
 assert.call(auto_push.fetch('steps').map { |step| step['uses'] }.compact, [
   'actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333',
-  'actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510'
+  'actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc'
 ], 'credential job runs only reviewed infrastructure actions')
 push_runs = auto_push.fetch('steps').map { |step| step.fetch('run', '') }.join("\n")
 assert.call(push_runs.match?(/\b(?:python3?|node|npm|npx|pip|curl|wget|eval|source|bash)\b|(?:^|[;|&]|\$\()\s*sh(?:\s|$)/), false, 'credential job does not execute repository runtimes or installers')
