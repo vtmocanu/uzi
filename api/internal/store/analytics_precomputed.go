@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -20,10 +21,11 @@ import (
 //     (GetAnalyticsPrecomputedDoc) sees one complete published generation: Publish replaces a
 //     section in one transaction, so a reader sees the old set or the new set, never a mix.
 //   - Failure handling covers an API-process failure (crash, kill, lost connection, cancelled
-//     context) while PostgreSQL survives. An observed disconnect releases the session lock;
-//     PostgreSQL ends the session on its own through client_connection_check_interval and the
-//     TCP keepalive settings below, so a vanished client does not hold the lock indefinitely.
-//     A half-open connection that neither side observes is NOT claimed to release promptly.
+//     context) while PostgreSQL survives. The guarantee covers an OBSERVED disconnect only: the
+//     idle timers apply only while the session is idle, the check during an active statement
+//     (client_connection_check_interval) depends on the server's kernel observing the
+//     disconnect, and the TCP keepalive settings below are best effort. A half-open connection
+//     that neither side observes is NOT claimed to release promptly.
 //   - A committed delete of a users or repos row (migration 00554's triggers) empties every
 //     stored set and moves the invalidation counter in its own transaction; Publish refuses to
 //     publish a build whose counter is stale.
@@ -102,16 +104,18 @@ func OpenAnalyticsPrecomputeSession(ctx context.Context, pool *pgxpool.Pool) (*A
 	if err := conn.QueryRow(ctx,
 		`SELECT set_config('statement_timeout', $1, false) || set_config('lock_timeout', $2, false)
 		     || set_config('idle_session_timeout', $3, false) || set_config('idle_in_transaction_session_timeout', $4, false)
-		     || set_config('client_connection_check_interval', $5, false)
-		     || set_config('tcp_keepalives_idle', $6, false) || set_config('tcp_keepalives_interval', $7, false)
-		     || set_config('tcp_keepalives_count', $8, false) || set_config('tcp_user_timeout', $9, false)`,
+		     || set_config('client_connection_check_interval', $5, false)`,
 		analyticsPrecomputeStatementTimeout, analyticsPrecomputeLockTimeout,
 		analyticsPrecomputeIdleSessionTimeout, analyticsPrecomputeIdleInTxTimeout,
-		analyticsPrecomputeConnCheckInterval,
-		analyticsPrecomputeTCPKeepalivesIdle, analyticsPrecomputeTCPKeepalivesInterval,
-		analyticsPrecomputeTCPKeepalivesCount, analyticsPrecomputeTCPUserTimeoutMS).Scan(&set); err != nil {
+		analyticsPrecomputeConnCheckInterval).Scan(&set); err != nil {
 		_ = conn.Close(ctx)
 		return nil, false, fmt.Errorf("analytics precompute: session setup: %w", err)
+	}
+	// The TCP settings are best effort: a server or platform that refuses one (for example a
+	// socket type without keepalives) must not stop the build. They run outside any transaction,
+	// so a failure leaves the connection usable.
+	if err := applyAnalyticsPrecomputeTCPSettings(ctx, conn); err != nil {
+		slog.Warn("analytics precompute: TCP session settings not applied", "err", err)
 	}
 	var got bool
 	if err := conn.QueryRow(ctx, "SELECT pg_try_advisory_lock($1, 0)", AnalyticsPrecomputeLockClass).Scan(&got); err != nil {
@@ -130,6 +134,24 @@ func OpenAnalyticsPrecomputeSession(ctx context.Context, pool *pgxpool.Pool) (*A
 		}
 	}
 	return &AnalyticsPrecomputeSession{conn: conn}, true, nil
+}
+
+// analyticsPrecomputeTCPSettingsFault is a test-only fault hook (nil in production): a non-nil
+// error replaces the TCP settings statement's result.
+var analyticsPrecomputeTCPSettingsFault func() error
+
+func applyAnalyticsPrecomputeTCPSettings(ctx context.Context, conn *pgx.Conn) error {
+	if hook := analyticsPrecomputeTCPSettingsFault; hook != nil {
+		if err := hook(); err != nil {
+			return err
+		}
+	}
+	var set string
+	return conn.QueryRow(ctx,
+		`SELECT set_config('tcp_keepalives_idle', $1, false) || set_config('tcp_keepalives_interval', $2, false)
+		     || set_config('tcp_keepalives_count', $3, false) || set_config('tcp_user_timeout', $4, false)`,
+		analyticsPrecomputeTCPKeepalivesIdle, analyticsPrecomputeTCPKeepalivesInterval,
+		analyticsPrecomputeTCPKeepalivesCount, analyticsPrecomputeTCPUserTimeoutMS).Scan(&set)
 }
 
 // idle reports whether the connection is open with no transaction open or failed.
@@ -158,12 +180,20 @@ func (s *AnalyticsPrecomputeSession) markBroken() {
 // other state unlocked is false and the lock ends with the connection. The connection is ALWAYS
 // closed (never returned to a pool). Callers should pass a ctx with a deadline, since the unlock
 // query and the connection teardown run under it. A false answer or an error is returned as an error. Close is
-// idempotent: later calls return (false, nil).
+// idempotent: later calls return (false, nil). A session left in a transaction (not broken) is rolled
+// back under ctx first, so the unlock can still be proven.
 func (s *AnalyticsPrecomputeSession) Close(ctx context.Context) (unlocked bool, err error) {
 	if s.conn == nil {
 		return false, nil
 	}
 	conn := s.conn
+	if !s.broken && !conn.IsClosed() && conn.PgConn().TxStatus() != 'I' {
+		// A transaction is still open (for example after a panic in a RunBuild fn): end it,
+		// bounded by ctx, so the unlock below can run on an idle connection.
+		if _, rerr := conn.Exec(ctx, "ROLLBACK"); rerr != nil {
+			slog.Debug("analytics precompute: close rollback failed", "err", rerr)
+		}
+	}
 	idle := s.Idle()
 	s.conn = nil
 	if idle {
@@ -218,36 +248,32 @@ func (s *AnalyticsPrecomputeSession) RunBuild(ctx context.Context, fn func(ctx c
 	if !s.Idle() {
 		return errors.New("analytics precompute: session is closed, broken or busy")
 	}
-	tx, err := s.conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
-	if err != nil {
+	// JIT off for the reason RunAnalyticsSnapshot records; force_custom_plan keeps a long-lived
+	// session from planning the build statements with a generic plan.
+	tx, snap, err := beginAnalyticsTx(ctx, s.conn, []string{"SET LOCAL jit = off", "SET LOCAL plan_cache_mode = force_custom_plan"})
+	if tx == nil {
 		s.markBroken()
 		return fmt.Errorf("analytics precompute: begin build: %w", err)
 	}
-	runErr := s.build(ctx, tx, fn)
+	runErr := err
+	if runErr == nil {
+		runErr = s.build(ctx, snap, fn)
+	}
 	if rerr := s.rollback(ctx, tx); rerr != nil {
 		return errors.Join(runErr, rerr)
 	}
 	return runErr
 }
 
-func (s *AnalyticsPrecomputeSession) build(ctx context.Context, tx pgx.Tx, fn func(ctx context.Context, s *AnalyticsSnapshot, counter int64) error) error {
-	// JIT off for the reason RunAnalyticsSnapshot records; force_custom_plan keeps a long-lived
-	// session from planning the build statements with a generic plan.
-	if _, err := tx.Exec(ctx, "SET LOCAL jit = off"); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(ctx, "SET LOCAL plan_cache_mode = force_custom_plan"); err != nil {
-		return err
-	}
-	q := New(tx)
-	counter, err := q.ReadAnalyticsPrecomputeCounter(ctx)
+func (s *AnalyticsPrecomputeSession) build(ctx context.Context, snap *AnalyticsSnapshot, fn func(ctx context.Context, s *AnalyticsSnapshot, counter int64) error) error {
+	counter, err := snap.Q.ReadAnalyticsPrecomputeCounter(ctx)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return errors.New("analytics precompute: analytics_precomputed_state row is missing")
 	}
 	if err != nil {
 		return fmt.Errorf("analytics precompute: read counter: %w", err)
 	}
-	return fn(ctx, &AnalyticsSnapshot{Q: q, tx: tx}, counter)
+	return fn(ctx, snap, counter)
 }
 
 // Publish replaces the stored set of section with docs in ONE READ COMMITTED transaction: the

@@ -165,12 +165,23 @@ func apAsync(fn func() error) <-chan error {
 	return ch
 }
 
-func apNotDone(t *testing.T, ch <-chan error, what string) {
+// waitLockWait polls until backend pid is waiting on a lock (the positive barrier that replaces
+// inferring "blocked" from elapsed time), bounded at 10 seconds.
+func (e apEnv) waitLockWait(t *testing.T, pid int32, what string) {
 	t.Helper()
-	select {
-	case err := <-ch:
-		t.Fatalf("%s finished early with %v", what, err)
-	case <-time.After(400 * time.Millisecond):
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var n int
+		if err := e.pool.QueryRow(e.ctx, `SELECT count(*) FROM pg_stat_activity WHERE pid = $1 AND wait_event_type = 'Lock'`, pid).Scan(&n); err != nil {
+			t.Fatalf("poll pg_stat_activity: %v", err)
+		}
+		if n == 1 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s (backend %d) never waited on a lock", what, pid)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
@@ -256,11 +267,11 @@ func TestAnalyticsPrecomputeCounterGuardLiveDB(t *testing.T) {
 	e.closeOK(t, s)
 }
 
-// Mutation it must catch: remove the trigger function's DELETE of the docs, the once-per-transaction
-// guard (the counter would move more than once), or the deferral (docs vanish before COMMIT).
+// Mutation it must catch: remove the trigger function's DELETE of the docs, the counter UPDATE (it
+// must move once per deleted row), or the deferral (docs vanish before COMMIT).
 func TestAnalyticsPrecomputeDeleteInvalidatesLiveDB(t *testing.T) {
 	e := apOpenEnv(t)
-	repoCase := func(name string, del func(user, conn uuid.UUID, repos []uuid.UUID) error) {
+	repoCase := func(name string, rows int64, del func(user, conn uuid.UUID, repos []uuid.UUID) error) {
 		t.Run(name, func(t *testing.T) {
 			user, conn, repos := e.seedRepos(t, 2)
 			at := apNow()
@@ -273,30 +284,30 @@ func TestAnalyticsPrecomputeDeleteInvalidatesLiveDB(t *testing.T) {
 			if n := e.docCount(t); n != 0 {
 				t.Fatalf("%d docs after the delete committed, want 0", n)
 			}
-			if got := e.counter(t); got != before+1 {
-				t.Fatalf("counter = %d, want %d (exactly one increment per transaction)", got, before+1)
+			if got := e.counter(t); got != before+rows {
+				t.Fatalf("counter = %d, want %d (one increment per deleted users or repos row)", got, before+rows)
 			}
 		})
 	}
-	repoCase("repo via DeleteRepoForUser", func(user, _ uuid.UUID, repos []uuid.UUID) error {
+	repoCase("repo via DeleteRepoForUser", 1, func(user, _ uuid.UUID, repos []uuid.UUID) error {
 		n, err := e.q.DeleteRepoForUser(e.ctx, DeleteRepoForUserParams{ID: repos[0], UserID: user})
 		if err == nil && n != 1 {
 			err = errors.New("repo not deleted")
 		}
 		return err
 	})
-	repoCase("connection cascading to two repos", func(user, conn uuid.UUID, _ []uuid.UUID) error {
+	repoCase("connection cascading to two repos", 2, func(user, conn uuid.UUID, _ []uuid.UUID) error {
 		n, err := e.q.DeleteForgeConnectionForUser(e.ctx, DeleteForgeConnectionForUserParams{ID: conn, UserID: user})
 		if err == nil && n != 1 {
 			err = errors.New("connection not deleted")
 		}
 		return err
 	})
-	repoCase("user cascading to connection and repos", func(user, _ uuid.UUID, _ []uuid.UUID) error {
+	repoCase("user cascading to connection and repos", 3, func(user, _ uuid.UUID, _ []uuid.UUID) error {
 		_, err := e.pool.Exec(e.ctx, `DELETE FROM users WHERE id = $1`, user)
 		return err
 	})
-	repoCase("two repos in one transaction", func(_, _ uuid.UUID, repos []uuid.UUID) error {
+	repoCase("two repos in one transaction", 2, func(_, _ uuid.UUID, repos []uuid.UUID) error {
 		_, err := e.pool.Exec(e.ctx, `DELETE FROM repos WHERE id = ANY($1)`, repos)
 		return err
 	})
@@ -339,6 +350,37 @@ func TestAnalyticsPrecomputeDeleteInvalidatesLiveDB(t *testing.T) {
 			t.Fatalf("after commit docs = %d, counter = %d", e.docCount(t), e.counter(t))
 		}
 	})
+}
+
+// Mutation it must catch: an invalidation guard keyed on the custom setting
+// uzi.analytics_precomputed_invalidated. A caller that sets it to its own txid must not be able to
+// suppress the invalidation.
+func TestAnalyticsPrecomputeInvalidationIgnoresCallerSettingLiveDB(t *testing.T) {
+	e := apOpenEnv(t)
+	_, _, repos := e.seedRepos(t, 1)
+	e.publish(t, apNow(), apDocs("A", "a", "b"))
+	before := e.counter(t)
+
+	tx, err := e.pool.Begin(e.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(context.Background()) }()
+	if _, err := tx.Exec(e.ctx, `SELECT set_config('uzi.analytics_precomputed_invalidated', txid_current()::text, true)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(e.ctx, `DELETE FROM repos WHERE id = $1`, repos[0]); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(e.ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n := e.docCount(t); n != 0 {
+		t.Fatalf("%d docs left after a delete whose caller preset the setting, want 0", n)
+	}
+	if got := e.counter(t); got != before+1 {
+		t.Fatalf("counter = %d, want %d", got, before+1)
+	}
 }
 
 // Mutation it must catch: a trigger that fires for a statement that deleted nothing (a statement
@@ -458,11 +500,25 @@ func TestAnalyticsPrecomputeReadCommittedInterleaveLiveDB(t *testing.T) {
 	}
 
 	// The publisher holds the state row. The deleter commits: its deferred trigger waits on it.
+	dc, err := e.pool.Acquire(e.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dc.Release()
+	var delPID int32
+	if err := dc.QueryRow(e.ctx, `SELECT pg_backend_pid()`).Scan(&delPID); err != nil {
+		t.Fatal(err)
+	}
 	del := apAsync(func() error {
-		_, err := e.pool.Exec(e.ctx, `DELETE FROM repos WHERE id = $1`, repos[0])
+		_, err := dc.Exec(e.ctx, `DELETE FROM repos WHERE id = $1`, repos[0])
 		return err
 	})
-	apNotDone(t, del, "the delete commit")
+	e.waitLockWait(t, delPID, "the delete commit")
+	select {
+	case derr := <-del:
+		t.Fatalf("the delete commit finished while the publisher held the state row: %v", derr)
+	default:
+	}
 	resume <- struct{}{}
 	if err := apWait(t, pub, "publish"); err != nil {
 		t.Fatalf("Publish: %v", err)
@@ -537,13 +593,19 @@ func TestAnalyticsPrecomputeNoDeadlockLiveDB(t *testing.T) {
 		defer mu.Unlock()
 		errs = append(errs, err)
 	}
+	var aPID int32
+	if err := a.QueryRow(e.ctx, `SELECT pg_backend_pid()`).Scan(&aPID); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := a.Exec(e.ctx, `DELETE FROM repos WHERE id = $1`, r1); err != nil {
 		t.Fatalf("A delete r1: %v", err)
 	}
 	bDel := apAsync(func() error { _, err := b.Exec(e.ctx, `DELETE FROM repos WHERE id = $1`, r2); return err })
-	time.Sleep(300 * time.Millisecond)
+	// B's delete takes only the r2 row lock (its trigger is deferred), so it returns on its own.
+	bDelErr := apWait(t, bDel, "B delete r2")
 	aDel := apAsync(func() error { _, err := a.Exec(e.ctx, `DELETE FROM repos WHERE id = $1`, r2); return err })
-	time.Sleep(300 * time.Millisecond)
+	// Barrier: A is waiting on B's r2 row lock before B commits.
+	e.waitLockWait(t, aPID, "A delete r2")
 	// B's delete must have returned before B's commit starts (a transaction is used by one
 	// goroutine at a time). Without the deferral it is stuck here until the deadlock resolves.
 	record := func(name string, err error) {
@@ -552,7 +614,7 @@ func TestAnalyticsPrecomputeNoDeadlockLiveDB(t *testing.T) {
 			t.Errorf("%s: %v (SQLSTATE %s)", name, err, apSQLState(err))
 		}
 	}
-	record("B delete r2", apWait(t, bDel, "B delete r2"))
+	record("B delete r2", bDelErr)
 	bCommit := apAsync(func() error { return b.Commit(e.ctx) })
 	record("B commit", apWait(t, bCommit, "B commit"))
 	record("A delete r2", apWait(t, aDel, "A delete r2"))
@@ -694,6 +756,47 @@ func TestAnalyticsPrecomputeTryLockAndEarlyExitsLiveDB(t *testing.T) {
 		}
 		e.closeOK(t, e.acquire(t, 5*time.Second))
 	})
+}
+
+// Mutation it must catch: TCP settings folded into the required statement (a refusal would then
+// fail the open), or a failure of them that is treated as fatal.
+func TestAnalyticsPrecomputeTCPSettingsBestEffortLiveDB(t *testing.T) {
+	e := apOpenEnv(t)
+	analyticsPrecomputeTCPSettingsFault = func() error { return errors.New("injected tcp failure") }
+	s, ok, err := OpenAnalyticsPrecomputeSession(e.ctx, e.pool)
+	analyticsPrecomputeTCPSettingsFault = nil
+	if err != nil || !ok {
+		t.Fatalf("open with a failing TCP statement = (%v, %v), want acquired", ok, err)
+	}
+	t.Cleanup(func() { _, _ = s.Close(context.Background()) })
+	var got string
+	if err := s.conn.QueryRow(e.ctx, "SHOW idle_session_timeout").Scan(&got); err != nil || got != "1min" {
+		t.Fatalf("required settings: idle_session_timeout = %q (%v)", got, err)
+	}
+	if s2, ok2, err2 := OpenAnalyticsPrecomputeSession(e.ctx, e.pool); s2 != nil || ok2 || err2 != nil {
+		t.Fatalf("second open = (%v, %v, %v): the first session must hold the lock", s2, ok2, err2)
+	}
+	e.closeOK(t, s)
+}
+
+// Mutation it must catch: Close that unlocks (or gives up) without ending an open transaction, as
+// after a panic in a RunBuild fn.
+func TestAnalyticsPrecomputeCloseRollsBackOpenTxLiveDB(t *testing.T) {
+	e := apOpenEnv(t)
+	s := e.open(t)
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("fn did not panic")
+			}
+		}()
+		_ = s.RunBuild(e.ctx, func(context.Context, *AnalyticsSnapshot, int64) error { panic("boom") })
+	}()
+	if s.Idle() {
+		t.Fatal("session must still hold the open build transaction after the panic")
+	}
+	e.closeOK(t, s)
+	e.closeOK(t, e.acquire(t, 5*time.Second))
 }
 
 // Mutation it must catch: session settings that are not applied (no client_connection_check_interval

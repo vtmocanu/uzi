@@ -812,7 +812,10 @@ It is controlled by `UZI_ANALYTICS_SNAPSHOT_INTERVAL` (a Go duration, default
   in flight may return the prior document. Only deletions invalidate: renaming a
   repo or changing a user's email shows in the snapshot from the next build.
 - **For maintainers.** The lock order is source rows, then the state row (at
-  commit), then the snapshot documents. A `REPEATABLE READ` or `SERIALIZABLE`
+  commit), then the snapshot documents. That order holds for row deletes through
+  the deferred triggers; it is not claimed for `TRUNCATE` (its trigger fires
+  immediately), for an explicit `SET CONSTRAINTS ... IMMEDIATE`, or for any
+  future deferred trigger that takes locks of its own. A `REPEATABLE READ` or `SERIALIZABLE`
   user or repo delete can fail with SQLSTATE `40001` if a publish or failure
   record committed meanwhile; it fails closed.
 

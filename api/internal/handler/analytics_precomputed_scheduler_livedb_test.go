@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
@@ -109,9 +110,9 @@ func TestAnalyticsSchedulerSharedStateLiveDB(t *testing.T) {
 }
 
 // The stored set follows a delete and the setting end to end, with the handler's own builder:
-// build and serve; a committed user delete empties the set (pending, never the old generation);
-// the setting off answers the old 400 and writes nothing; re-enabled it stays pending until the
-// scheduler builds again.
+// build and serve; with the setting off a committed user delete still empties the stored set and the
+// request answers the old 400 and writes nothing; re-enabled it is pending (never the old
+// generation) until the scheduler builds again.
 // The deleted user has no dependents, so the plain DELETE succeeds and fires the trigger.
 // Mutation caught: serving that ignores an emptied set (the old generation would be served after
 // the delete), or a request at setting 0 that publishes.
@@ -159,15 +160,15 @@ func TestAnalyticsSchedulerEndToEndLiveDB(t *testing.T) {
 	if got := apSchedPublications(t, f.pool); got != publications {
 		t.Fatalf("a fresh set was published again: publications %v -> %v", publications, got)
 	}
-	cliMustExec(t, f.pool, `DELETE FROM users WHERE id = $1`, doomed)
-	if rec := f.cookie(admin, path); rec.Code != http.StatusServiceUnavailable || rec.Result().Header.Get("Retry-After") != "60" {
-		t.Fatalf("after the delete: %d %v %s, want pending", rec.Code, rec.Result().Header, rec.Body.String())
-	}
-
-	// Setting off: the old 400, and a request writes nothing. No scheduler exists at 0.
+	// Disable the setting (no scheduler exists at 0), then commit the delete: the stored set must go
+	// even though nothing serves it, and the request answers the old 400 and writes nothing.
 	f.h.cfg.AnalyticsSnapshotInterval = 0
+	cliMustExec(t, f.pool, `DELETE FROM users WHERE id = $1`, doomed)
 	if rec := f.cookie(admin, path); rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), msgAnalyticsWindowAllAllUsers) {
 		t.Fatalf("setting off: %d %s", rec.Code, rec.Body.String())
+	}
+	if rows, err := store.New(f.pool).ListAnalyticsPrecomputedDocs(context.Background(), AllTimeSpendSection); err != nil || len(rows) != 0 {
+		t.Fatalf("stored set after the delete with the setting off: %d rows (%v), want 0", len(rows), err)
 	}
 	if got := apSchedPublications(t, f.pool); got != publications {
 		t.Fatalf("publications moved from %d to %d across a request with the setting off", publications, got)
@@ -176,7 +177,7 @@ func TestAnalyticsSchedulerEndToEndLiveDB(t *testing.T) {
 	// Re-enabled: pending until the scheduler builds, never the old generation.
 	f.h.cfg.AnalyticsSnapshotInterval = 4 * time.Hour
 	if rec := f.cookie(admin, path); rec.Code != http.StatusServiceUnavailable || rec.Result().Header.Get("Retry-After") != "60" {
-		t.Fatalf("re-enabled: %d %s, want pending", rec.Code, rec.Body.String())
+		t.Fatalf("re-enabled: %d %v %s, want pending", rec.Code, rec.Result().Header, rec.Body.String())
 	}
 	build()
 	if rec := f.cookie(admin, path); rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"snapshot":`) {
@@ -184,5 +185,68 @@ func TestAnalyticsSchedulerEndToEndLiveDB(t *testing.T) {
 	}
 	if got := apSchedPublications(t, f.pool); got != publications+1 {
 		t.Fatalf("publications = %d, want %d", got, publications+1)
+	}
+}
+
+// A build that fails at variant 13 through the real scheduler leaves the previously published set
+// byte-for-byte unchanged (same generated_at) and records the failure.
+// Mutation caught: a scheduler or publisher that replaces or empties the set on a failed build.
+func TestAnalyticsSchedulerVariantFailureKeepsSetLiveDB(t *testing.T) {
+	f := newAnFixture(t, apYear)
+	apSeed(f)
+	apSchedResetState(t, f.pool)
+	t.Cleanup(func() { apSchedResetState(t, f.pool) })
+
+	ctx := context.Background()
+	clock := f.now
+	sched := analyticsprecompute.NewWithClock(f.pool, 4*time.Hour, []analyticsprecompute.Section{{
+		Name: AllTimeSpendSection, Keys: AllTimeSpendKeys(), Build: BuildAllTimeSpendDocs,
+	}}, func() time.Time { return clock })
+	pass := func() {
+		t.Helper()
+		before := sched.Checks()
+		if n, err := sched.Pass(ctx); err != nil || n != 0 {
+			t.Fatalf("Pass = (%d, %v), want (0, nil)", n, err)
+		}
+		sched.Wait()
+		if got := sched.Checks(); got != before+1 {
+			t.Fatalf("Pass started %d checks, want 1", got-before)
+		}
+	}
+
+	pass()
+	known, err := store.New(f.pool).ListAnalyticsPrecomputedDocs(ctx, AllTimeSpendSection)
+	if err != nil || len(known) != len(AllTimeSpendKeys()) {
+		t.Fatalf("known set: %d rows (%v), want %d", len(known), err, len(AllTimeSpendKeys()))
+	}
+	pubs := apSchedPublications(t, f.pool)
+
+	// Due again, with the build failing at variant 13.
+	clock = f.now.Add(5 * time.Hour)
+	boom := errors.New("injected variant failure")
+	apSetHooks(t, func(i int, _ string) error {
+		if i == 13 {
+			return boom
+		}
+		return nil
+	}, nil)
+	pass()
+
+	after, err := store.New(f.pool).ListAnalyticsPrecomputedDocs(ctx, AllTimeSpendSection)
+	if err != nil || len(after) != len(known) {
+		t.Fatalf("set after the failed build: %d rows (%v), want %d", len(after), err, len(known))
+	}
+	for i := range known {
+		if after[i].VariantKey != known[i].VariantKey || !bytes.Equal(after[i].Document, known[i].Document) ||
+			!after[i].GeneratedAt.Time.Equal(known[i].GeneratedAt.Time) || after[i].Invalidation != known[i].Invalidation {
+			t.Fatalf("row %d (%s) changed by a failed build", i, known[i].VariantKey)
+		}
+	}
+	if got := apSchedPublications(t, f.pool); got != pubs {
+		t.Fatalf("publications %d -> %d across a failed build", pubs, got)
+	}
+	st, err := store.ReadAnalyticsPrecomputeStatus(ctx, f.pool, AllTimeSpendSection, AllTimeSpendKeys())
+	if err != nil || st.FailureCount != 1 || !st.LastFailureAt.Equal(clock) {
+		t.Fatalf("status = %+v (%v), want one failure recorded at %v", st, err, clock)
 	}
 }

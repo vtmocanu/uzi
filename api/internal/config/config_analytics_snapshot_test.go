@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/base64"
+	"os"
 	"testing"
 	"time"
 )
@@ -18,6 +19,11 @@ func TestAnalyticsSnapshotInterval(t *testing.T) {
 	}
 	t.Run("absent", func(t *testing.T) {
 		base(t)
+		// Register the restore with t.Setenv, then remove the variable so it is truly absent.
+		t.Setenv("UZI_ANALYTICS_SNAPSHOT_INTERVAL", "")
+		if err := os.Unsetenv("UZI_ANALYTICS_SNAPSHOT_INTERVAL"); err != nil {
+			t.Fatal(err)
+		}
 		cfg, err := Load()
 		if err != nil {
 			t.Fatal(err)

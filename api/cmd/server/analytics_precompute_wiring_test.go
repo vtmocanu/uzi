@@ -69,9 +69,16 @@ func TestMainWiresAnalyticsPrecomputeAndWait(t *testing.T) {
 	// precompute build (which holds a pooled connection) before the pool closes.
 	stopAt := strings.Index(text, "stop() // cancel ctx")
 	bgWait := strings.Index(text, "bgWG.Wait()")
-	preWait := strings.Index(text, "analyticsPrecompute.Wait()")
+	preWait := strings.LastIndex(text, "analyticsPrecompute.Wait()")
 	if stopAt < 0 || bgWait < 0 || preWait < 0 || stopAt >= bgWait || bgWait >= preWait {
 		t.Errorf("shutdown order must be stop(), bgWG.Wait(), analyticsPrecompute.Wait() (got %d, %d, %d)", stopAt, bgWait, preWait)
+	}
+	// Early error returns bypass the shutdown path: a defer registered after the pool's deferred
+	// Close (so it runs before it) must cancel and join the scheduler.
+	deferAt := strings.Index(text, "\t\tdefer func() {\n\t\t\tstop()\n\t\t\tanalyticsPrecompute.Wait()\n\t\t}()")
+	poolClose := strings.Index(text, "defer pool.Close()")
+	if deferAt < 0 || poolClose < 0 || deferAt < poolClose {
+		t.Errorf("a deferred stop()+analyticsPrecompute.Wait() must be registered after defer pool.Close() (defer %d, pool close %d)", deferAt, poolClose)
 	}
 	wire := strings.Index(text, "wireAnalyticsPrecompute(ctx")
 	newSweeper := strings.Index(text, "sweeper.New(wsvc, cfg.SweepInterval, sweepPasses...)")

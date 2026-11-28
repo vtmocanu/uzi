@@ -31,8 +31,8 @@ import (
 // (removed at the end; that delete empties the stored set through the users-delete invalidation
 // trigger, as intended). With UZI_PRECOMPUTE_EVIDENCE_FOLD=1 the production folder also writes
 // run_usage_fold_state and run_usage_model_folds permanently: measure the unfolded case first,
-// or reseed, because nothing restores those rows. The during-build window is confirmed active
-// at each sample's start only (one pg_stat_activity probe before the request). Run:
+// or reseed, because nothing restores those rows. A during-build request is issued only after
+// a pg_stat_activity probe finds the build backend active; skipped probes are counted apart. Run:
 //
 //	cd api && UZI_ANALYTICS_PRECOMPUTE_EVIDENCE=1 UZI_TEST_DATABASE_URL='postgres://...' \
 //	  go test -tags analyticsevidence -count=1 -v -p 1 -timeout 58m \
@@ -53,6 +53,8 @@ import (
 const (
 	pcNowRFC = "2026-11-20T12:00:00Z"
 	pcPrefix = "PRECOMPUTE-EVIDENCE "
+	// pcBuildBound mirrors the scheduler's unexported defaultBuildBound (10 minutes).
+	pcBuildBound = 10 * time.Minute
 	// pcEligible is what the usage folder folds: finished, non-chat runs flagged for refold.
 	pcEligible = `r.status IN ('completed', 'failed', 'cancelled') AND r.kind <> 'chat' AND r.usage_refolded`
 )
@@ -268,6 +270,12 @@ func TestAnalyticsPrecomputeEvidenceLiveDB(t *testing.T) {
 		cancel()
 		logf("FOLD-RESULT passes=%d folded=%d wall=%s longest_pass=%s deadline_hit=%v", passes, total, time.Since(start).Round(time.Second), longest.Round(time.Millisecond), deadlineHit)
 		report("after")
+		// A partial fold would measure a mixed state: require full coverage of the eligible runs.
+		if _, elig, none, stale, _, cerr := pcCoverage(ctx, prod); cerr != nil {
+			t.Fatalf("coverage: %v", cerr)
+		} else if none != 0 || stale != 0 {
+			t.Fatalf("BLOCKED: fold incomplete: eligible=%d no_state=%d stale=%d (deadline_hit=%v); measure nothing until every eligible run is folded", elig, none, stale, deadlineHit)
+		}
 	}
 
 	// buildOnce runs one full generation on a fresh session: open, RunBuild, Publish, Close.
@@ -311,8 +319,12 @@ func TestAnalyticsPrecomputeEvidenceLiveDB(t *testing.T) {
 			return nil
 		}
 		defer func() { allTimeSpendBeforeVariant, allTimeSpendAfterVariant = nil, nil }()
+		// Open, RunBuild and Publish share one 10 minute bound, matching the scheduler's
+		// defaultBuildBound (internal/analyticsprecompute, unexported, so mirrored here).
+		bctx0, bcancel := context.WithTimeout(ctx, pcBuildBound)
+		defer bcancel()
 		t0 := time.Now()
-		s, ok, oerr := store.OpenAnalyticsPrecomputeSession(ctx, prod)
+		s, ok, oerr := store.OpenAnalyticsPrecomputeSession(bctx0, prod)
 		res.open = time.Since(t0)
 		if oerr != nil || !ok {
 			res.err = fmt.Errorf("open session ok=%v err=%v", ok, oerr)
@@ -320,7 +332,7 @@ func TestAnalyticsPrecomputeEvidenceLiveDB(t *testing.T) {
 		}
 		var counter int64
 		t1 := time.Now()
-		res.err = s.RunBuild(ctx, func(bctx context.Context, snap *store.AnalyticsSnapshot, c int64) error {
+		res.err = s.RunBuild(bctx0, func(bctx context.Context, snap *store.AnalyticsSnapshot, c int64) error {
 			counter = c
 			var berr error
 			res.docs, berr = BuildAllTimeSpendDocs(bctx, snap, now)
@@ -329,7 +341,7 @@ func TestAnalyticsPrecomputeEvidenceLiveDB(t *testing.T) {
 		res.run = time.Since(t1)
 		if res.err == nil {
 			t2 := time.Now()
-			res.err = s.Publish(ctx, AllTimeSpendSection, counter, now, res.docs)
+			res.err = s.Publish(bctx0, AllTimeSpendSection, counter, now, res.docs)
 			res.publish = time.Since(t2)
 		}
 		cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
@@ -417,13 +429,13 @@ func TestAnalyticsPrecomputeEvidenceLiveDB(t *testing.T) {
 	}
 
 	// Step 5: live latency while a build runs. Sampling opens at beforeVariant(2) and closes at
-	// afterVariant(24); before each sample the build backend must be state='active' in
-	// pg_stat_activity, read from another pooled connection.
+	// afterVariant(24). Before each request the build backend is probed in pg_stat_activity (from
+	// another pooled connection) and the request is issued only when it is state='active'; a probe
+	// that finds it in any other state is counted as skipped and no request is made. Only issued
+	// requests are reported. The build can still end between the probe and the request.
 	type duringSample struct {
-		scope     string
-		r         pcReq
-		confirmed bool
-		state     string
+		scope string
+		r     pcReq
 	}
 	started, stop := make(chan struct{}), make(chan struct{})
 	var startedOnce, stopOnce atomic.Bool
@@ -442,6 +454,7 @@ func TestAnalyticsPrecomputeEvidenceLiveDB(t *testing.T) {
 	var samples []duringSample
 	var build buildResult
 	finished := false
+	skipped := map[string]int{}
 	// Wait for the window to open (or the build to end first).
 	select {
 	case <-started:
@@ -465,7 +478,12 @@ sampling:
 				state = "error"
 			}
 		}
-		samples = append(samples, duringSample{scope: sc.name, r: do(sc.path, sc.jwt), confirmed: state == "active", state: state})
+		if state != "active" {
+			skipped[state]++
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
+		samples = append(samples, duringSample{scope: sc.name, r: do(sc.path, sc.jwt)})
 	}
 	if !finished {
 		build = <-done
@@ -473,11 +491,15 @@ sampling:
 	if build.err != nil {
 		t.Errorf("during-build: build failed: %v", build.err)
 	}
-	logf("DURING-BUILD build total=%.2fs run_build=%.2fs backend_pid=%d samples=%d", build.total.Seconds(), build.run.Seconds(), build.pid, len(samples))
+	nSkipped := 0
+	for _, n := range skipped {
+		nSkipped += n
+	}
+	logf("DURING-BUILD build total=%.2fs run_build=%.2fs backend_pid=%d issued=%d skipped_non_active=%d skipped_states[%s]",
+		build.total.Seconds(), build.run.Seconds(), build.pid, len(samples), nSkipped, pcCounts(skipped))
 	for _, sc := range append(scopes, liveScope{name: "all-scopes"}) {
 		counts := map[string]int{}
-		var all, conf []time.Duration
-		confirmed := 0
+		var ok []time.Duration
 		n := 0
 		for _, s := range samples {
 			if sc.name != "all-scopes" && s.scope != sc.name {
@@ -485,22 +507,16 @@ sampling:
 			}
 			n++
 			counts[pcClass(s.r)]++
-			if s.confirmed {
-				confirmed++
-			}
 			if s.r.status == http.StatusOK {
-				all = append(all, s.r.dur)
-				if s.confirmed {
-					conf = append(conf, s.r.dur)
-				}
+				ok = append(ok, s.r.dur)
 			}
 		}
-		logf("DURING-BUILD scope=%s samples=%d confirmed_active=%d statuses[%s] ok: %s; confirmed-only ok: %s", sc.name, n, confirmed, pcCounts(counts), pcStats(all), pcStats(conf))
-		if n == 0 || confirmed == 0 {
-			t.Errorf("DURING-BUILD scope=%s: %d samples, %d confirmed active; the during-build window was not observed", sc.name, n, confirmed)
+		logf("DURING-BUILD scope=%s issued=%d statuses[%s] ok: %s", sc.name, n, pcCounts(counts), pcStats(ok))
+		if n == 0 {
+			t.Errorf("DURING-BUILD scope=%s: no request was issued against an active build backend; the during-build window was not observed", sc.name)
 		}
 	}
 	for i, s := range samples {
-		logf("DURING-BUILD sample=%d scope=%s class=%s ms=%.1f build_state=%s confirmed=%v", i+1, s.scope, pcClass(s.r), pcMs(s.r.dur), s.state, s.confirmed)
+		logf("DURING-BUILD sample=%d scope=%s class=%s ms=%.1f", i+1, s.scope, pcClass(s.r), pcMs(s.r.dur))
 	}
 }

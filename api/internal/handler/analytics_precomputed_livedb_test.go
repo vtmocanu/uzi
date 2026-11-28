@@ -112,34 +112,41 @@ func TestAllTimeSpendBuildOneSnapshotLiveDB(t *testing.T) {
 	apSeed(f)
 	keys := AllTimeSpendKeys()
 
+	// All 25 reference documents come from ONE reference snapshot (a RunBuild transaction: the
+	// request-path 8 second deadline of RunAnalyticsSnapshot cannot hold 25 variants under -race),
+	// so they agree with each other the way the built generation must.
 	pre := make([][]byte, len(keys))
-	for i, k := range keys {
-		split, breakdown := apSplitBreakdown(k)
-		err := store.RunAnalyticsSnapshot(context.Background(), f.pool, func(ctx context.Context, s *store.AnalyticsSnapshot) error {
+	refSess := apOpenSession(t, f)
+	err := refSess.RunBuild(context.Background(), func(ctx context.Context, s *store.AnalyticsSnapshot, _ int64) error {
+		for i, k := range keys {
+			split, breakdown := apSplitBreakdown(k)
 			pre[i] = apLive(t, ctx, s, split, breakdown, f.now)
-			return nil
-		})
-		if err != nil {
-			t.Fatalf("pre-write snapshot %s: %v", k, err)
 		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("pre-write reference snapshot: %v", err)
 	}
+	apCloseOK(t, refSess)
 
 	wrote := false
 	apSetHooks(t, nil, func(i int, _ string) error {
 		if i != 1 {
 			return nil
 		}
-		// A new user and repo with a costed run commit on a separate pool connection mid-build.
+		// A new user and repo with a costed run and a merged PR commit on a separate pool
+		// connection mid-build.
 		nu := f.user(false)
 		nr, _ := f.repoOwnedBy(nu, "late")
-		f.run(nu, nr, f.now.AddDate(0, 0, -2), "9.00")
+		late := f.run(nu, nr, f.now.AddDate(0, 0, -2), "9.00")
+		cliMustExec(t, f.pool, `UPDATE runs SET mr_iid = $2, mr_state = 'merged' WHERE id = $1`, late, 4_771_001)
 		wrote = true
 		return nil
 	})
 
 	sess := apOpenSession(t, f)
 	var docs []store.AnalyticsPrecomputedDoc
-	err := sess.RunBuild(context.Background(), func(ctx context.Context, snap *store.AnalyticsSnapshot, _ int64) error {
+	err = sess.RunBuild(context.Background(), func(ctx context.Context, snap *store.AnalyticsSnapshot, _ int64) error {
 		var berr error
 		docs, berr = BuildAllTimeSpendDocs(ctx, snap, f.now)
 		if berr != nil {

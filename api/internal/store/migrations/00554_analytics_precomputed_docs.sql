@@ -7,8 +7,8 @@ SET LOCAL lock_timeout = '5s';
 -- NOTE (goose numbering): drafted as 00554; renumber above the live head at landing via
 -- `task migration:renumber` if another migration lands first.
 --
--- analytics_precomputed_state is a single row (id is always true). invalidation counts the
--- committed transactions that deleted a users or repos row; a builder reads it first inside its
+-- analytics_precomputed_state is a single row (id is always true). invalidation moves on every
+-- deleted users or repos row (once per TRUNCATE) and is only compared for equality; a builder reads it first inside its
 -- snapshot and a publisher may publish only while it is unchanged. publications, failure_count
 -- and last_failure_at are the status the admin surface reads.
 --
@@ -44,21 +44,18 @@ CREATE TABLE analytics_precomputed_docs (
 -- on a publisher sees the set that publisher committed meanwhile and removes it. Reordering the
 -- DELETE before the UPDATE, or making the function STABLE, leaves a freshly published set behind.
 --
--- Once per transaction: the first firing records txid_current() in a transaction-local setting and
--- later firings in the same transaction return at once, so one deleting transaction increments the
--- counter exactly once however many rows it deletes.
+-- Every firing invalidates: UPDATE the counter, then DELETE the docs. There is deliberately no
+-- once-per-transaction shortcut, because any guard keyed on session state (a custom setting) could be
+-- set by a caller to suppress invalidation. The counter is only ever compared for equality, so a
+-- transaction that deletes N rows moves it by N (a TRUNCATE by one) and that is fine.
 -- +goose StatementBegin
 CREATE FUNCTION analytics_precomputed_invalidate() RETURNS trigger LANGUAGE plpgsql VOLATILE AS $$
 BEGIN
-    IF current_setting('uzi.analytics_precomputed_invalidated', true) = txid_current()::text THEN
-        RETURN NULL;
-    END IF;
     UPDATE analytics_precomputed_state SET invalidation = invalidation + 1 WHERE id;
     IF NOT FOUND THEN
         RAISE EXCEPTION 'analytics_precomputed_state row is missing';
     END IF;
     DELETE FROM analytics_precomputed_docs;
-    PERFORM set_config('uzi.analytics_precomputed_invalidated', txid_current()::text, true);
     RETURN NULL;
 END
 $$;

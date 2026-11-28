@@ -1124,6 +1124,16 @@ func run() error {
 	// it delays no other pass. Nothing is constructed or registered when the setting is 0.
 	var analyticsPrecompute *analyticsprecompute.Scheduler
 	sweepPasses, analyticsPrecompute = wireAnalyticsPrecompute(ctx, pool, cfg.AnalyticsSnapshotInterval, sweepPasses)
+	if analyticsPrecompute != nil {
+		// Registered after the deferred pool.Close, so it runs first (LIFO) on every return, the
+		// early startup-error returns (TLS setup, listener bind) included: cancel the process
+		// context so a running build ends, then join it before the pool closes. Both calls are
+		// idempotent; the normal shutdown path below repeats them in its own order.
+		defer func() {
+			stop()
+			analyticsPrecompute.Wait()
+		}()
+	}
 	sweep := sweeper.New(wsvc, cfg.SweepInterval, sweepPasses...)
 	// Admin-health loop-beat: the run-liveness sweeper is one of the four loops (PRD #1484
 	// M2). Registered before Boot so the loops check has its baseline from api start.
