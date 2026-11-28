@@ -47,7 +47,11 @@ export function ForgeTokenBanner({ userId }: { userId: string }) {
   // The data is stamped with the account it was read for, so a render for another account
   // never shows it, even before this effect has run for the new account.
   const [data, setData] = useState<{ userId: string; connections: ForgeConnection[] } | null>(null);
-  const [, setDismissTick] = useState(0);
+  // Dismissals made in this mount, kept in memory so Dismiss works even when sessionStorage
+  // rejects the write; sessionStorage carries them across remounts when it is available.
+  const [localDismissed, setLocalDismissed] = useState<{ userId: string; sigs: string[] }>({ userId, sigs: [] });
+  // Bumped on focus so the class is re-evaluated against the clock even if the read fails.
+  const [, setClockTick] = useState(0);
   const seqRef = useRef(0);
 
   useEffect(() => {
@@ -68,10 +72,14 @@ export function ForgeTokenBanner({ userId }: { userId: string }) {
           // Keep the last good data; a failed background read is not an error to show.
         });
     };
+    const onFocus = () => {
+      setClockTick((n) => n + 1);
+      load();
+    };
     load();
-    window.addEventListener("focus", load);
+    window.addEventListener("focus", onFocus);
     return () => {
-      window.removeEventListener("focus", load);
+      window.removeEventListener("focus", onFocus);
       live = false;
     };
   }, [userId]);
@@ -79,7 +87,10 @@ export function ForgeTokenBanner({ userId }: { userId: string }) {
   const dismiss = useCallback(
     (signature: string) => {
       addDismissed(userId, signature);
-      setDismissTick((n) => n + 1);
+      setLocalDismissed((prev) => ({
+        userId,
+        sigs: [...(prev.userId === userId ? prev.sigs : []), signature],
+      }));
     },
     [userId],
   );
@@ -90,7 +101,8 @@ export function ForgeTokenBanner({ userId }: { userId: string }) {
 
   const { cls, affected } = banner;
   const signature = `${cls}|${affected.map((a) => `${a.id}:${a.expiresAt ?? ""}`).sort().join(",")}`;
-  if (cls !== "expired" && readDismissed(userId).has(signature)) return null;
+  const dismissedHere = localDismissed.userId === userId && localDismissed.sigs.includes(signature);
+  if (cls !== "expired" && (dismissedHere || readDismissed(userId).has(signature))) return null;
 
   const tone =
     cls === "expired"

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { forgeTokenScenario, mockConnection } from "./data";
-import { classifyConnection } from "../lib/forgeTokenBanner";
+import { bannerFor, classifyConnection } from "../lib/forgeTokenBanner";
+import { forgeApi } from "./mockApi/forge";
 
 const now = Date.parse("2026-06-01T12:00:00Z");
 
@@ -22,5 +23,11 @@ describe("forgeTokenScenario", () => {
   it("returns null for the default and unknown scenarios", () => {
     expect(forgeTokenScenario("", now)).toBeNull();
     expect(forgeTokenScenario("no-such-scenario", now)).toBeNull();
+  });
+
+  it("the default demo's connection list produces no banner", async () => {
+    const { connections } = await forgeApi.listConnectionsBackground();
+    expect(connections.length).toBeGreaterThan(0);
+    expect(bannerFor(connections, Date.now())).toBeNull();
   });
 });

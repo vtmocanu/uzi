@@ -179,12 +179,21 @@ describe("ForgeTokenBanner", () => {
   });
 
   it("re-shows when a new connection becomes affected", async () => {
-    mockApi.listConnectionsBackground.mockResolvedValue({ connections: [conn("a", "expiring")] });
+    // Reuse A's fixture so only the added connection changes the signature.
+    const a = conn("a", "expiring");
+    mockApi.listConnectionsBackground.mockResolvedValue({ connections: [a] });
     await renderBanner();
     fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
     expect(screen.queryByRole("status")).toBeNull();
 
-    mockApi.listConnectionsBackground.mockResolvedValue({ connections: [conn("a", "expiring"), conn("b", "expiring")] });
+    mockApi.listConnectionsBackground.mockResolvedValue({ connections: [a] });
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+    });
+    await settle();
+    expect(screen.queryByRole("status")).toBeNull();
+
+    mockApi.listConnectionsBackground.mockResolvedValue({ connections: [a, conn("b", "expiring")] });
     await act(async () => {
       window.dispatchEvent(new Event("focus"));
     });
@@ -309,5 +318,48 @@ describe("ForgeTokenBanner", () => {
     expect(seen.filter((x) => x.userId === "B").map((x) => x.alert)).not.toContain(true);
     expect(seen.filter((x) => x.userId === "B").length).toBeGreaterThan(0);
     expect(screen.getByRole("status", { name: "Forge token expiring" })).toBeTruthy();
+  });
+  it("dismisses in memory when sessionStorage rejects the write", async () => {
+    const setItem = vi.fn(() => {
+      throw new Error("blocked");
+    });
+    vi.stubGlobal("sessionStorage", {
+      getItem: () => null,
+      setItem,
+      removeItem: () => {},
+      clear: () => {},
+      key: () => null,
+      length: 0,
+    });
+    try {
+      mockApi.listConnectionsBackground.mockResolvedValue({ connections: [conn("gh", "expiring")] });
+      await renderBanner();
+      fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+      expect(setItem).toHaveBeenCalled();
+      expect(screen.queryByRole("status", { name: "Forge token expiring" })).toBeNull();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("re-evaluates the last good data on focus even when the read fails", async () => {
+    const start = Date.now();
+    const c = conn("gh", "expiring", 1);
+    mockApi.listConnectionsBackground.mockResolvedValueOnce({ connections: [c] });
+    await renderBanner();
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    expect(screen.queryByRole("status")).toBeNull();
+
+    const clock = vi.spyOn(Date, "now").mockReturnValue(start + 2 * DAY);
+    try {
+      mockApi.listConnectionsBackground.mockRejectedValueOnce(new Error("offline"));
+      await act(async () => {
+        window.dispatchEvent(new Event("focus"));
+      });
+      await settle();
+      expect(screen.getByRole("alert", { name: "Forge token expired" })).toBeTruthy();
+    } finally {
+      clock.mockRestore();
+    }
   });
 });

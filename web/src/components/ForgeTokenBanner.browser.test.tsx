@@ -34,6 +34,13 @@ it("shows the forge-token-expiring banner from the mock forge connection", async
   const banner = await screen.findByRole("status", { name: "Forge token expiring" });
   expect((banner as HTMLElement).offsetHeight).toBeGreaterThan(0);
   expect(banner.textContent).toContain("token expires on");
+  // The date comes from the scenario's own expires_at, formatted as the banner formats it.
+  const { connections } = await forgeApi.listConnectionsBackground();
+  const iso = connections.find((c) => c.id === "conn-gh")?.privilege_report?.token.expires_at;
+  expect(iso).toBeTruthy();
+  const date = new Date(Date.parse(iso as string)).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+  expect(date.length).toBeGreaterThan(0);
+  expect(banner.textContent).toContain(`expires on ${date}.`);
   expect(banner.textContent).toContain("Update it in Settings → Forge before then.");
   await userEvent.click(within(banner).getByRole("button", { name: "Dismiss" }));
   await waitFor(() => expect(screen.queryByRole("status", { name: "Forge token expiring" })).toBeNull());
