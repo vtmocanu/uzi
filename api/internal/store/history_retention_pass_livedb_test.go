@@ -18,7 +18,8 @@ import (
 // UZI_TEST_DATABASE_URL points at a throwaway Postgres; run via ./e2e/run-store-it.sh.
 
 // hrSeedMixed gives every table 5 expired rows (48h old), 3 fresh rows (the current bucket) and,
-// for pr_history_events, 2 expired first_merge rows. It returns the current bucket and the
+// for pr_history_events, 2 expired first_merge rows, plus 3 expired pr_history_heads rows with every
+// column populated (which no pass may touch). It returns the current bucket and the
 // expired total a 24h pass deletes.
 func hrSeedMixed(f *hrFx) (fresh time.Time, expired int64) {
 	fresh = time.Now().UTC().Truncate(5 * time.Minute)
@@ -29,7 +30,17 @@ func hrSeedMixed(f *hrFx) (fresh time.Time, expired int64) {
 		expired += 5
 	}
 	f.seedFirstMerge(2, old)
+	// Expired heads (older than the 24h cutoff): the pass must leave them untouched.
+	f.seedHeads(3, old)
 	return fresh, expired
+}
+
+// hrWantHeadsUnchanged fails when pr_history_heads differs by value from the snapshot before.
+func hrWantHeadsUnchanged(t *testing.T, f *hrFx, before []string, when string) {
+	t.Helper()
+	if diff := hrHeadsEqual(before, f.heads()); diff != "" {
+		t.Errorf("pr_history_heads changed %s: %s", when, diff)
+	}
 }
 
 func hrWantAfterPass(t *testing.T, f *hrFx, fresh time.Time) {
@@ -59,6 +70,10 @@ func TestHistoryRetentionPassLiveDB(t *testing.T) {
 
 func hrPassOffThenOn(t *testing.T, f *hrFx) {
 	fresh, expired := hrSeedMixed(f)
+	heads := f.heads()
+	if len(heads) != 3 {
+		t.Fatalf("seeded %d heads, want 3", len(heads))
+	}
 	before := map[store.HistoryRetentionTable]int{}
 	for _, table := range hrTables {
 		before[table] = f.total(table)
@@ -74,6 +89,8 @@ func hrPassOffThenOn(t *testing.T, f *hrFx) {
 		}
 	}
 
+	hrWantHeadsUnchanged(t, f, heads, "with retention off")
+
 	// positive control: the same rows, enabled
 	on := historyretention.New(f.pool, 24*time.Hour)
 	n, err := on.Pass(f.ctx)
@@ -81,10 +98,15 @@ func hrPassOffThenOn(t *testing.T, f *hrFx) {
 		t.Fatalf("retention on: Pass = (%d, %v), want (%d, nil)", n, err, expired)
 	}
 	hrWantAfterPass(t, f, fresh)
+	hrWantHeadsUnchanged(t, f, heads, "by the pass")
 }
 
 func hrPassContended(t *testing.T, f *hrFx) {
 	fresh, expired := hrSeedMixed(f)
+	heads := f.heads()
+	if len(heads) != 3 {
+		t.Fatalf("seeded %d heads, want 3", len(heads))
+	}
 	pass := historyretention.New(f.pool, 24*time.Hour)
 
 	holder, got, err := store.OpenHistoryRetentionSession(f.ctx, f.ctx, f.pool, time.Second, time.Second)
@@ -114,6 +136,7 @@ func hrPassContended(t *testing.T, f *hrFx) {
 		t.Fatalf("after release: Pass = (%d, %v), want (%d, nil)", n, err, expired)
 	}
 	hrWantAfterPass(t, f, fresh)
+	hrWantHeadsUnchanged(t, f, heads, "by the pass")
 	if n := f.lockHolders(); n != 0 {
 		t.Fatalf("%d sessions hold the lock after the pass, want 0", n)
 	}

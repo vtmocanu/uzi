@@ -4,7 +4,11 @@
 //
 // One tick takes a cross-replica session advisory lock, reads one cutoff from the database
 // clock, deletes at most one adaptive batch (at most 1000 rows) per table, and releases the
-// lock. Every database call is bound to a 2 s client budget (the work context ends 250 ms before
+// lock. The batch of a table is a BatchController: a statement timeout halves it (floor 50) and
+// remembers the size that timed out; it then grows back below that size for 20 successful ticks
+// before it probes upward again, so a table that only fits 500 rows keeps deleting near 500 instead of
+// alternating between 0 and 500. Five consecutive timeouts, or twenty
+// consecutive full batches while below the maximum, each log a warning. Every database call is bound to a 2 s client budget (the work context ends 250 ms before
 // the cleanup context, which ends at the budget), but the pass's actual return time also depends
 // on the driver and on scheduling, so it is measured, not guaranteed.
 package historyretention
@@ -34,12 +38,6 @@ const (
 	// Server-side bounds per statement, on top of the client deadlines.
 	statementTimeout = 300 * time.Millisecond
 	lockTimeout      = 200 * time.Millisecond
-
-	maxBatch = 1000
-	minBatch = 50
-	// warnAfterTimeouts is the number of consecutive statement timeouts on one table after which
-	// a warning is logged (and again at every further multiple).
-	warnAfterTimeouts = 5
 )
 
 // session is the slice of store.HistoryRetentionSession the pass uses; tests fake it.
@@ -53,11 +51,6 @@ type session interface {
 // opener opens the pinned session; (nil, false, nil) means another replica holds the lock.
 type opener func(workCtx, cleanupCtx context.Context) (session, bool, error)
 
-type tableState struct {
-	batch    int32
-	timeouts int
-}
-
 // Retention runs the history_retention sweeper pass.
 type Retention struct {
 	retention time.Duration
@@ -66,7 +59,7 @@ type Retention struct {
 
 	mu      sync.Mutex
 	counter uint64
-	tables  map[store.HistoryRetentionTable]*tableState
+	tables  map[store.HistoryRetentionTable]*BatchController
 }
 
 // New builds the production pass over pool. A retention of 0 is off: Pass returns (0, nil)
@@ -86,10 +79,10 @@ func New(pool *pgxpool.Pool, retention time.Duration) *Retention {
 func newRetention(open opener, now func() time.Time, retention time.Duration, counter uint64) *Retention {
 	r := &Retention{
 		retention: retention, open: open, now: now, counter: counter,
-		tables: map[store.HistoryRetentionTable]*tableState{},
+		tables: map[store.HistoryRetentionTable]*BatchController{},
 	}
 	for _, t := range store.HistoryRetentionTables() {
-		r.tables[t] = &tableState{batch: maxBatch}
+		r.tables[t] = NewBatchController()
 	}
 	return r
 }
@@ -151,18 +144,19 @@ func (r *Retention) run(ctx context.Context, sess session, start uint64, canWork
 	tables := store.HistoryRetentionTables()
 	for i := 0; i < len(tables) && canWork(); i++ {
 		table := tables[(start+uint64(i))%uint64(len(tables))]
-		st := r.state(table)
-		n, derr := sess.DeleteBatch(ctx, table, cutoff, st.batch)
+		limit := r.limit(table)
+		n, derr := sess.DeleteBatch(ctx, table, cutoff, limit)
 		if derr == nil {
 			total += n
-			r.succeeded(table)
+			r.succeeded(table, limit, n)
 			continue
 		}
 		var rb *store.HistoryRetentionRollbackError
 		if errors.As(derr, &rb) {
-			// Known rollback: 0 rows. Only a statement timeout says the batch was too large.
+			// Known rollback: 0 rows. Only a statement timeout says the batch was too large; a lock
+			// timeout leaves the controller untouched.
 			if rb.StatementTimeout() {
-				r.timedOut(table)
+				r.timedOut(table, limit)
 			}
 			errs = append(errs, fmt.Errorf("history retention: %s: %w", table, derr))
 			continue
@@ -179,31 +173,32 @@ func (r *Retention) run(ctx context.Context, sess session, start uint64, canWork
 	return total, errs
 }
 
-func (r *Retention) state(table store.HistoryRetentionTable) tableState {
+func (r *Retention) limit(table store.HistoryRetentionTable) int32 {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return *r.tables[table]
+	return r.tables[table].Limit()
 }
 
-// succeeded resets the timeout streak and doubles the batch back toward maxBatch.
-func (r *Retention) succeeded(table store.HistoryRetentionTable) {
+// succeeded feeds a confirmed delete of n rows at batch size b to the table's controller (see
+// BatchController) and warns when the table keeps deleting full batches below maxBatch.
+func (r *Retention) succeeded(table store.HistoryRetentionTable, b int32, n int64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	st := r.tables[table]
-	st.timeouts = 0
-	st.batch = min(st.batch*2, maxBatch)
+	c := r.tables[table]
+	if c.Succeeded(b, n) {
+		slog.Warn("history retention: deleting below the maximum batch after statement timeouts; a backlog may be growing",
+			"table", table, "batch", b, "full_batches_below_max", c.Behind())
+	}
 }
 
-// timedOut halves the batch (floor minBatch) and warns on every warnAfterTimeouts-th consecutive
-// timeout of the table.
-func (r *Retention) timedOut(table store.HistoryRetentionTable) {
+// timedOut feeds a statement timeout at batch size b to the table's controller (see
+// BatchController) and warns on every warnAfterTimeouts-th consecutive timeout of the table.
+func (r *Retention) timedOut(table store.HistoryRetentionTable, b int32) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	st := r.tables[table]
-	st.timeouts++
-	st.batch = max(st.batch/2, minBatch)
-	if st.timeouts%warnAfterTimeouts == 0 {
+	c := r.tables[table]
+	if c.TimedOut(b) {
 		slog.Warn("history retention: repeated statement timeouts; the table is not being trimmed",
-			"table", table, "consecutive_timeouts", st.timeouts, "batch", st.batch)
+			"table", table, "consecutive_timeouts", c.Timeouts(), "batch", c.Limit())
 	}
 }

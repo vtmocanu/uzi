@@ -236,6 +236,10 @@ func TestPassKnownRollbackLetsOtherTablesRun(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), string(tAnth)) {
 		t.Fatalf("err=%v, want it to name %s", err, tAnth)
 	}
+	var rb *store.HistoryRetentionRollbackError
+	if !errors.As(err, &rb) || rb.Table != tAnth {
+		t.Fatalf("err=%v, want it to wrap the %s rollback error", err, tAnth)
+	}
 	if len(f.calls) != 4 || f.closed != 1 {
 		t.Fatalf("calls=%d closed=%d, want 4 and 1", len(f.calls), f.closed)
 	}
@@ -346,7 +350,7 @@ func TestPassNoWorkAfterWorkDeadlineButCloseRuns(t *testing.T) {
 	}
 }
 
-func TestPassReturnsWithinBudgetWithBlockingSession(t *testing.T) {
+func TestPassBlockingSessionCancelsAndCloses(t *testing.T) {
 	f := newFake()
 	f.script[tPR] = func(_ int, _ int32, ctx context.Context) (int64, error) {
 		<-ctx.Done()
@@ -355,14 +359,25 @@ func TestPassReturnsWithinBudgetWithBlockingSession(t *testing.T) {
 	}
 	open, _ := openerOf(f)
 	r := newRetention(open, time.Now, 24*time.Hour, 0)
-	begin := time.Now()
-	n, err := r.Pass(context.Background())
-	elapsed := time.Since(begin)
-	if n != 0 || err == nil || f.closed != 1 {
-		t.Fatalf("n=%d err=%v closed=%d, want 0, an error and Close", n, err, f.closed)
+	type result struct {
+		n   int64
+		err error
 	}
-	if elapsed > 2*time.Second {
-		t.Fatalf("blocked pass returned after %v, want within the 2s client budget", elapsed)
+	done := make(chan result, 1)
+	begin := time.Now()
+	go func() {
+		n, err := r.Pass(context.Background())
+		done <- result{n, err}
+	}()
+	var res result
+	select {
+	case res = <-done:
+	case <-time.After(30 * time.Second): // hang detector only, not a timing assertion
+		t.Fatal("Pass did not return: the blocked delete was never cancelled")
+	}
+	elapsed := time.Since(begin)
+	if res.n != 0 || !errors.Is(res.err, context.DeadlineExceeded) || f.closed != 1 {
+		t.Fatalf("n=%d err=%v closed=%d, want 0, a deadline error and Close", res.n, res.err, f.closed)
 	}
 	if elapsed < 1500*time.Millisecond {
 		t.Fatalf("blocked pass returned after %v, before the work deadline: the block was not exercised", elapsed)
@@ -536,17 +551,131 @@ func TestPassAdaptiveBatchProgressAndRegrowth(t *testing.T) {
 		n, _ := r.Pass(context.Background())
 		deleted = append(deleted, n-21)
 	}
-	wantLimits := []int32{1000, 500, 250, 500, 1000}
+	// 1000 and 500 time out; the table then grows back halfway toward 500 but stays below it.
+	wantLimits := []int32{1000, 500, 250, 375, 437}
 	for i := range wantLimits {
 		if limits[i] != wantLimits[i] {
 			t.Fatalf("limits = %v, want %v", limits, wantLimits)
 		}
 	}
-	if deleted[0] != 0 || deleted[1] != 0 || deleted[2] != 250 {
-		t.Fatalf("deleted per tick = %v, want 0 0 250 on the third attempt", deleted)
+	if deleted[0] != 0 || deleted[1] != 0 || deleted[2] != 250 || deleted[3] != 375 {
+		t.Fatalf("deleted per tick = %v, want 0 0 250 375", deleted)
+	}
+	// Run past the hold: the batch stays below the timed-out 500 for 20 successful ticks, then
+	// probes upward and is back at 1000.
+	for i := 0; i < 30; i++ {
+		r.counter = 0
+		_, _ = r.Pass(context.Background())
+	}
+	back := -1
+	for i, l := range limits {
+		if i >= 2 && i < 22 && l >= 500 {
+			t.Fatalf("limit %d at tick %d during the hold, want below the timed-out 500: %v", l, i+1, limits)
+		}
+		if i >= 2 && l == 1000 && back < 0 {
+			back = i
+		}
+	}
+	if back < 22 || back > 30 {
+		t.Fatalf("batch returned to 1000 at index %d, want right after the 20-tick hold: %v", back, limits)
 	}
 	if strings.Contains(buf.String(), "repeated statement timeouts") {
 		t.Fatalf("a warning was logged although the table made progress:\n%s", buf.String())
+	}
+}
+
+// backlogSim drives tPR through Pass: each tick adds arrivals to the backlog, then the fake times
+// out when the limit is at or above timeoutAt and otherwise deletes min(limit, backlog).
+type backlogSim struct {
+	backlog, arrived, deleted int64
+	minBacklog                int64
+}
+
+func (s *backlogSim) run(t *testing.T, timeoutAt int32, start, arrivals int64, ticks int) {
+	t.Helper()
+	s.backlog, s.minBacklog = start, start
+	f := newFake()
+	f.script[tPR] = func(_ int, limit int32, _ context.Context) (int64, error) {
+		if limit >= timeoutAt {
+			return 0, timeoutErr(tPR)
+		}
+		n := min(int64(limit), s.backlog)
+		s.backlog -= n
+		s.deleted += n
+		return n, nil
+	}
+	open, _ := openerOf(f)
+	r := newRetention(open, time.Now, 24*time.Hour, 0)
+	for i := 0; i < ticks; i++ {
+		s.backlog += arrivals
+		s.arrived += arrivals
+		r.counter = 0
+		_, _ = r.Pass(context.Background())
+		s.minBacklog = min(s.minBacklog, s.backlog)
+	}
+}
+
+func TestPassAdaptiveRecoverableBacklogDrains(t *testing.T) {
+	// 1000 rows time out, anything smaller works: the pass must keep deleting near the limit
+	// instead of alternating between 0 and 500 (about 250 rows per tick, no faster than arrivals).
+	var s backlogSim
+	s.run(t, 1000, 20000, 250, 200)
+	if s.minBacklog != 0 {
+		t.Fatalf("backlog never drained: min %d, end %d", s.minBacklog, s.backlog)
+	}
+	if s.deleted <= s.arrived {
+		t.Fatalf("deleted %d <= arrived %d", s.deleted, s.arrived)
+	}
+}
+
+func TestPassAdaptiveMixedTimeoutsDrain(t *testing.T) {
+	var s backlogSim
+	s.run(t, 500, 20000, 250, 200)
+	if s.minBacklog != 0 {
+		t.Fatalf("backlog never drained: min %d, end %d", s.minBacklog, s.backlog)
+	}
+	if s.deleted <= s.arrived {
+		t.Fatalf("deleted %d <= arrived %d", s.deleted, s.arrived)
+	}
+}
+
+func TestPassAdaptiveCannotDrainWarns(t *testing.T) {
+	var buf bytes.Buffer
+	old := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(old) })
+
+	// Anything from 100 rows up times out and the backlog never empties, so every success is a
+	// full batch below the maximum.
+	var s backlogSim
+	s.run(t, 100, 1_000_000, 250, 100)
+	if !strings.Contains(buf.String(), "deleting below the maximum batch") {
+		t.Fatalf("no behind warning after 100 ticks of full batches below the maximum:\n%s", buf.String())
+	}
+}
+
+func TestPassAdaptiveFloorEpisodeRecovers(t *testing.T) {
+	f := newFake()
+	var limits []int32
+	f.script[tPR] = func(attempt int, limit int32, _ context.Context) (int64, error) {
+		limits = append(limits, limit)
+		if attempt <= 8 { // down to the floor and a few timeouts at it
+			return 0, timeoutErr(tPR)
+		}
+		return int64(limit), nil
+	}
+	open, _ := openerOf(f)
+	r := newRetention(open, time.Now, 24*time.Hour, 0)
+	for i := 0; i < 13; i++ {
+		r.counter = 0
+		_, _ = r.Pass(context.Background())
+	}
+	if limits[7] != 50 {
+		t.Fatalf("limits = %v, want the floor 50 at the last timeout", limits)
+	}
+	// the first success is at the floor; within five successes the batch is well above it
+	if limits[12] <= 400 {
+		t.Fatalf("limit after five successes = %d, want above 400: %v", limits[12], limits)
 	}
 }
 
