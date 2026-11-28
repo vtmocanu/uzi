@@ -79,9 +79,12 @@ publication is independent. Implementation and validation leave
   Revalidate the digest and its allowlist entry before releasing a bundle.
 - Add repo-ful, issue-less `eval_holdout` to the run-kind registry, DB constraint,
   and agent/web mirrors. A run verifies one pinned base or tests one frozen
-  trial artifact. It is supporting, hidden from general Runs, has its own
-  bounded deadline, and is ineligible for model work, normal claim routes,
-  publication, archive recovery, Judge and cross-check. Allow one outstanding
+  trial artifact. Every predicate is stated (A's rule): `Supporting` true, `Listed` false,
+  `PlanningCapable` false, `WallTimed` false (its own bounded deadline),
+  `JudgeEligible`, `CodeCrossCheckable` and `PlanCrossCheckable` false; it is
+  ineligible for model work, normal claim routes, publication and archive
+  recovery. The worker role `eval_holdout_v1` is assigned server-side at
+  provisioning and is never accepted from a worker's own capability list. Allow one outstanding
   holdout run per eval and one sandbox per pod.
 - Provision an ephemeral hosted pod via the controller, following
   `EphemeralProvisioner.provisionOne` and the run binding in
@@ -153,7 +156,8 @@ Test the API with forged capability advertisements, wrong run, worker, attempt
 and pod identities, and a stale result after fencing. Assert that the holdout
 sentinel is absent from normal API DTOs, grader/trial inputs, logs and archives.
 
-The hosted capability ships default off. The owner tracks #4815, the linked
+The holdout feature ships default off behind the admin-only instance setting
+`eval_holdouts_enabled`, the one switch in this effort (umbrella #4808). The owner tracks #4815, the linked
 `acceptance` issue for the real hosted proof. Before enabling, measure CPU,
 memory and PID enforcement and scratch bounds, verify network and mount
 isolation, and prove pod, volume and join-material teardown after normal

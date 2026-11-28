@@ -32,10 +32,10 @@ owner API contracts shipped by its prerequisites. Cross-owner sharing stays out.
 ## Modules and seams
 
 - Add protected `/evals` and `/evals/:id` routes through the same route table as Runs
-  (`web/src/App.tsx:135`) and add Evals in Work (`web/src/components/navItems.tsx:70`).
+  (the route table in `web/src/App.tsx`) and add Evals in Work (`web/src/components/navItems.tsx`).
   The list and details use the existing owner-scoped endpoints, never a second state machine. Map the CLI's draft and confirmation flow to a review
   screen that uses the server's canonical admission summary.
-- Use the session and CSRF client (`web/src/lib/api.ts:452`). The API remains the
+- Use the session and CSRF client (`web/src/lib/api.ts`). The API remains the
   authority for ownership, open issue eligibility, exact base, capability, candidate
   limits, and provider and credential ownership. Show owner-visible IDs and labels
   only. Keep raw credentials out of form payloads and browser persistence.
@@ -52,7 +52,7 @@ owner API contracts shipped by its prerequisites. Cross-owner sharing stays out.
   at the six trial rows specified by A. Fetch summary fields only. Render issue
   text, model labels and reviewer evidence as escaped text, with long fields behind
   details. Omit patch bytes and any large nested response from the default view.
-- Use the run cost formatter (`web/src/lib/costStatus.ts:39`). Preserve recorded,
+- Use the run cost formatter (`web/src/lib/costStatus.ts`). Preserve recorded,
   API-equivalent, and unavailable values. Separate implementation from grading cost
   and active, elapsed, and queue durations. Show the limit-wait count and mark
   active time as including limit waits when the report says so. Label endpoint timing as
@@ -107,7 +107,7 @@ grouping and reading order.
 ## Testing decisions
 
 Use the existing route and app-shell fixture style
-(`web/src/components/AppShell.test.tsx:814`) and mocked API responses. Cover deep-link
+(`web/src/components/AppShell.test.tsx`) and mocked API responses. Cover deep-link
 loading, signed-out access, generic unavailable handling for missing or foreign IDs,
 duplicate submit, 409 eligibility changes, cancel conflict, polling through terminal
 status, and estimated versus missing cost. Seed a lead pass with a cross-review
@@ -159,6 +159,10 @@ for the complete web flow. Run
 Acceptance: example 3. Compare two compatible eval sets and show exclusions returned
 by F. Switching weights displays the updated composite and the weight labels.
 The existing in-app Evals guide describes the web flow after sync.
+
+## Landing obligations
+
+- Full `test:web`, `test:web-browser`, `check-docs:web` pending exact-head PR CI.
 
 ## Decision Log
 

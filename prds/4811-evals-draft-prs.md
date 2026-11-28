@@ -174,7 +174,7 @@ reconciliation. Extend `docs/evals.md` and run `task docs:sync`.
   review surface, while the admission summary, caps and opt-out address the
   additional CI and bot load. Unsupported capability resolves to local.
 - Publication uses one neutral commit so reviewer-facing history cannot echo SDK
-  trailers (`agent/src/protocol.ts:1385`). Graders consume the original anonymous
+  trailers (the SDK attribution settings in `agent/src/protocol.ts`). Graders consume the original anonymous
   patch and never need PR access.
 - Store publication and CI evidence independently of the trial's settlement.
   Neither CI nor cleanup gets authority to change a frozen artifact.
