@@ -301,6 +301,9 @@ function readCookie(name: string): string | null {
 // still trips it. Clearing the session (not an imperative redirect) is what
 // composes safely. The session probe (api.me) opts out and reports its own 401 to
 // AuthContext, which applies it only if no login, register or logout happened since.
+// The forge-token banner's background read (api.listConnectionsBackground) opts out
+// too: its 401 may belong to a previous account's session and must not sign out a
+// newer one; a real expiry is still caught by every other request.
 type UnauthorizedHandler = () => void;
 let unauthorizedHandler: UnauthorizedHandler | null = null;
 export function setUnauthorizedHandler(
@@ -437,9 +440,11 @@ async function request<T>(
   path: string,
   body?: unknown,
   extraHeaders?: Record<string, string>,
-  // false keeps a 401 out of the global unauthorized handler. Only the session probe
-  // passes it: AuthContext handles the probe's own 401 behind its generation check,
-  // so a probe that started before a login cannot sign that login out (#1991).
+  // false keeps a 401 out of the global unauthorized handler. Two callers pass it: the
+  // session probe (AuthContext handles its own 401 behind a generation check, so a probe
+  // that started before a login cannot sign that login out, #1991) and the forge-token
+  // banner's background read (a background read's 401 must not sign out a possibly
+  // different, newer session; any other request still catches a real expiry, #4817).
   notifyUnauthorized = true,
 ): Promise<T> {
   const headers: Record<string, string> = {};
@@ -1112,6 +1117,10 @@ const realApi = {
   forgeConfig: () => request<ForgeConfig>("GET", "/forge/config"),
   listConnections: () =>
     request<{ connections: ForgeConnection[] }>("GET", "/forge/connections"),
+  // The forge-token banner's background read: same data, but a 401 stays out of the
+  // global unauthorized handler (see request's notifyUnauthorized).
+  listConnectionsBackground: () =>
+    request<{ connections: ForgeConnection[] }>("GET", "/forge/connections", undefined, undefined, false),
   // replace=true is the explicit opt-in to rotate an EXISTING connection's
   // credential. Without it the API refuses a create that targets an already
   // connected user + forge type + base URL with 409 forge_connection_exists, so a

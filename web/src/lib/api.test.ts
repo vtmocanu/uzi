@@ -648,3 +648,26 @@ describe("harness overflow HTTP contract", () => {
     }]]);
   });
 });
+
+describe("forge connection reads and the unauthorized handler (#4817)", () => {
+  function stub401() {
+    vi.stubGlobal("fetch", vi.fn(async () => fakeResponse(401, { error: "unauthorized" })));
+    vi.stubGlobal("document", { cookie: "" });
+  }
+
+  it("a 401 from listConnectionsBackground rejects with ApiError and does not trip the handler", async () => {
+    const handler = vi.fn();
+    setUnauthorizedHandler(handler);
+    stub401();
+    await expect(api.listConnectionsBackground()).rejects.toBeInstanceOf(ApiError);
+    expect(handler).not.toHaveBeenCalled();
+  });
+
+  it("control: a 401 from listConnections does trip the handler", async () => {
+    const handler = vi.fn();
+    setUnauthorizedHandler(handler);
+    stub401();
+    await expect(api.listConnections()).rejects.toBeInstanceOf(ApiError);
+    expect(handler).toHaveBeenCalledTimes(1);
+  });
+});

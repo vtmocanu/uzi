@@ -42,6 +42,7 @@ vi.mock("../lib/api", () => ({
     }),
     // AppShell chrome
     listConnections: vi.fn().mockResolvedValue({ connections: [] }),
+    listConnectionsBackground: vi.fn().mockResolvedValue({ connections: [] }),
     getJudgeStats: vi.fn(),
     // PRD #113 M6. Zero, so these tests keep measuring the JUDGE badge: a non-zero
     // workers count would put a second badge in the same nav and any loose

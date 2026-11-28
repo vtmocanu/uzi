@@ -245,6 +245,7 @@ export const forgeApi = {
   // ── Forge ───────────────────────────────────────────────────────────────────
   forgeConfig: async () => delay({ ...mockForgeConfig, allowed_base_urls: [...mockForgeConfig.allowed_base_urls] }),
   listConnections: async () => delay({ connections: connections.map((c) => ({ ...c })) }),
+  listConnectionsBackground: async () => delay({ connections: connections.map((c) => ({ ...c })) }),
   // Mirrors the real create path: a create that targets an already-connected
   // (forge type, base URL) is refused with 409 forge_connection_exists unless the
   // caller passes replace=true, which rotates that connection's credential in

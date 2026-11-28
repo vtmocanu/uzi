@@ -32,6 +32,7 @@ vi.mock("../lib/api", () => ({
   api: {
     listRepos: vi.fn().mockResolvedValue({ repos: [] }),
     listConnections: vi.fn().mockResolvedValue({ connections: [] }),
+    listConnectionsBackground: vi.fn().mockResolvedValue({ connections: [] }),
     unreadNotificationCount: unreadSpy,
     workerUpgradeSummary: vi.fn().mockResolvedValue({ attention: 0, target_release: "0.6.0" }),
     getJudgeStats: vi

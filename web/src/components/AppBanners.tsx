@@ -8,6 +8,7 @@ import { UpdateEscalationBanner } from "./UpdateEscalationBanner";
 import { HealthDangerBanner } from "./HealthDangerBanner";
 import { HealthAttentionBanner } from "./HealthAttentionBanner";
 import { MaintenanceBanner } from "./MaintenanceBanner";
+import { ForgeTokenBanner } from "./ForgeTokenBanner";
 
 export function AppBanners() {
   const { user } = useAuth();
@@ -29,6 +30,9 @@ export function AppBanners() {
           so a non-admin never fetches the admin endpoint. */}
       <HealthDangerBanner />
       {user?.is_admin === true && <HealthAttentionBanner key={user.id} />}
+      {/* Forge token expired / expiring / unverified (#4817): every signed-in user, admins
+          included. Keyed on the user so a different account never shows the last one's data. */}
+      {user && <ForgeTokenBanner key={user.id} userId={user.id} />}
     </>
   );
 }
