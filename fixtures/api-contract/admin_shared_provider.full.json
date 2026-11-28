@@ -60,6 +60,8 @@
   "credential_mode": "x",
   "selected_user_count": 1,
   "attached_key_count": 1,
+  "operator_all_users": true,
+  "named_grant_count": 1,
   "operator_key": {
     "present": true,
     "enabled": true,

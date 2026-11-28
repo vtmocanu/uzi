@@ -315,6 +315,12 @@ var wantRouteMounts = []routeMount{
 	// Admin-shared provider definitions (PRD #4324): local DB reads and writes, no egress.
 	{"GET", "/api/admin/providers", noLimiter},
 	{"GET", "/api/admin/providers/{id}", noLimiter},
+	// PRD #4540 M2: the recipient grants of an organization-funded definition, local DB reads and writes.
+	{"GET", "/api/admin/providers/{id}/grants", noLimiter},
+	{"PUT", "/api/admin/providers/{id}/grants/{user_id}", noLimiter},
+	{"DELETE", "/api/admin/providers/{id}/grants/{user_id}", noLimiter},
+	{"PUT", "/api/admin/providers/{id}/all-users", noLimiter},
+	{"POST", "/api/admin/providers/{id}/revoke-recipients", noLimiter},
 	{"POST", "/api/admin/providers", noLimiter},
 	{"PATCH", "/api/admin/providers/{id}", noLimiter},
 	{"POST", "/api/admin/providers/{id}/retire", noLimiter},

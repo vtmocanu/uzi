@@ -778,15 +778,21 @@ type MemoryParkRelease struct {
 }
 
 type ModelProvider struct {
-	ID              uuid.UUID          `json:"id"`
-	OwnerUserID     pgtype.UUID        `json:"owner_user_id"`
-	Name            string             `json:"name"`
-	Engine          string             `json:"engine"`
-	CurrentRevision int32              `json:"current_revision"`
-	RetiredAt       pgtype.Timestamptz `json:"retired_at"`
-	CreatedAt       pgtype.Timestamptz `json:"created_at"`
-	CredentialMode  pgtype.Text        `json:"credential_mode"`
-	ScopeOwnerID    uuid.UUID          `json:"scope_owner_id"`
+	ID               uuid.UUID          `json:"id"`
+	OwnerUserID      pgtype.UUID        `json:"owner_user_id"`
+	Name             string             `json:"name"`
+	Engine           string             `json:"engine"`
+	CurrentRevision  int32              `json:"current_revision"`
+	RetiredAt        pgtype.Timestamptz `json:"retired_at"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	CredentialMode   pgtype.Text        `json:"credential_mode"`
+	ScopeOwnerID     uuid.UUID          `json:"scope_owner_id"`
+	OperatorAllUsers bool               `json:"operator_all_users"`
+}
+
+type ModelProviderGrant struct {
+	ProviderID uuid.UUID `json:"provider_id"`
+	UserID     uuid.UUID `json:"user_id"`
 }
 
 type ModelProviderKeyTestResult struct {

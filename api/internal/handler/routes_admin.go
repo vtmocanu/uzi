@@ -172,6 +172,10 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			// personal provider id is a 404.
 			r.Get("/providers", h.AdminListSharedProviders)
 			r.Get("/providers/{id}", h.AdminGetSharedProvider)
+			// The recipients of an organization-funded definition (PRD #4540 M2): one keyset page of
+			// named grants with the all-users flag and the count, so `uzi admin provider get` can show
+			// it. User ids only; the writes are cookie-only, in the group below.
+			r.Get("/providers/{id}/grants", h.AdminListProviderGrants)
 		})
 		// Hosted worker sizes (PRD #4213 M2): the editor's read. Browser-session only (PRD: no
 		// new CLI-readable route), so any Bearer, uza_ included, 401s before the handler.
@@ -334,6 +338,13 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			r.Patch("/providers/{id}/key/enabled", h.AdminPatchOperatorKeyEnabled)
 			r.Delete("/providers/{id}/key", h.AdminDeleteOperatorKey)
 			r.Post("/providers/{id}/test", h.AdminTestSharedProvider)
+			// Recipients of an organization-funded definition (PRD #4540 M2): name or remove one grant,
+			// switch all-users, or revoke every recipient at once. Cookie + CSRF admin writes like the
+			// rest of this group; each takes the definition row lock first.
+			r.Put("/providers/{id}/grants/{user_id}", h.AdminPutProviderGrant)
+			r.Delete("/providers/{id}/grants/{user_id}", h.AdminDeleteProviderGrant)
+			r.Put("/providers/{id}/all-users", h.AdminPutProviderAllUsers)
+			r.Post("/providers/{id}/revoke-recipients", h.AdminRevokeProviderRecipients)
 		})
 	})
 }

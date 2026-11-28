@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -67,6 +68,8 @@ func adminSharedProviderDTO(row sharedProviderAdminRow) apitypes.AdminSharedProv
 		CredentialMode:    row.CredentialMode.String,
 		SelectedUserCount: row.SelectedUserCount,
 		AttachedKeyCount:  row.AttachedKeyCount,
+		OperatorAllUsers:  row.OperatorAllUsers,
+		NamedGrantCount:   row.NamedGrantCount,
 	}
 	if row.CredentialMode.String == sharedProviderModeOperatorKey {
 		key := &apitypes.AdminOperatorKeyDTO{
@@ -267,22 +270,27 @@ func (h *Handler) AdminCreateSharedProvider(w http.ResponseWriter, r *http.Reque
 		if n >= maxSharedProviders {
 			return errSharedProviderCap
 		}
-		var p store.ModelProvider
+		var providerID uuid.UUID
 		if req.CredentialMode == sharedProviderModeOperatorKey {
-			p, err = q.InsertSharedOperatorModelProvider(r.Context(), name)
+			p, err := q.InsertSharedOperatorModelProvider(r.Context(), name)
+			if err != nil {
+				return err
+			}
+			providerID = p.ID
 		} else {
-			p, err = q.InsertSharedModelProvider(r.Context(), store.InsertSharedModelProviderParams{Name: name, Engine: req.Engine})
-		}
-		if err != nil {
-			return err
+			p, err := q.InsertSharedModelProvider(r.Context(), store.InsertSharedModelProviderParams{Name: name, Engine: req.Engine})
+			if err != nil {
+				return err
+			}
+			providerID = p.ID
 		}
 		if err := q.InsertModelProviderRevision(r.Context(), store.InsertModelProviderRevisionParams{
-			ProviderID: p.ID, Revision: 1, Protocol: req.Protocol,
+			ProviderID: providerID, Revision: 1, Protocol: req.Protocol,
 			BaseUrl: baseURL, AuthStyle: req.AuthStyle, ModelMap: mm,
 		}); err != nil {
 			return err
 		}
-		row, err = q.GetSharedModelProviderAdmin(r.Context(), p.ID)
+		row, err = q.GetSharedModelProviderAdmin(r.Context(), providerID)
 		return err
 	})
 	if err != nil {

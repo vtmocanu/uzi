@@ -289,9 +289,11 @@ func scopeSnapshot(ctx context.Context, t *testing.T, pool *pgxpool.Pool, s scop
 	oid := scalar[string](ctx, t, pool, `SELECT to_regclass('model_providers_scope_owner_id_key')::oid::text`)
 	qualified := scalar[string](ctx, t, pool, `SELECT to_regclass($1 || '.model_providers_scope_owner_id_key')::oid::text`, schemaOfModelProviders(ctx, t, pool))
 	// Whole rows (to_jsonb): no migration from the predecessor to head adds, drops or retypes a column of
-	// model_providers, model_provider_revisions or user_secrets (00538 alters users; 00539, 00540 and 00541 only
-	// validate constraints).
-	providers := scalar[string](ctx, t, pool, `SELECT COALESCE(string_agg(to_jsonb(p)::text, E'\n' ORDER BY p.id), '') FROM model_providers p WHERE p.id IN ($1, $2)`, s.shared, s.personal)
+	// model_provider_revisions or user_secrets (00538 alters users; 00539, 00540 and 00541 only validate
+	// constraints). The one exception is model_providers.operator_all_users (PRD #4540 M2, 00560), a column
+	// this scope work knows nothing about: it is removed from the provider row so the snapshot compares
+	// exactly the columns that existed at the predecessor.
+	providers := scalar[string](ctx, t, pool, `SELECT COALESCE(string_agg((to_jsonb(p) - 'operator_all_users')::text, E'\n' ORDER BY p.id), '') FROM model_providers p WHERE p.id IN ($1, $2)`, s.shared, s.personal)
 	revisions := scalar[string](ctx, t, pool, `SELECT COALESCE(string_agg(to_jsonb(r)::text, E'\n' ORDER BY r.provider_id, r.revision), '') FROM model_provider_revisions r WHERE r.provider_id IN ($1, $2)`, s.shared, s.personal)
 	secrets := scalar[string](ctx, t, pool, `SELECT COALESCE(string_agg(to_jsonb(u)::text, E'\n' ORDER BY u.id), '') FROM user_secrets u WHERE u.user_id IN ($1, $2)`, s.sharedUser, s.personalUser)
 	users := scalar[string](ctx, t, pool, `SELECT COALESCE(string_agg(concat_ws('|', id::text, claude_provider_id::text, claude_provider_scope_id::text), E'\n' ORDER BY id), '')

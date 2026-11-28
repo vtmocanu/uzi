@@ -23,7 +23,7 @@ import (
 // over them. Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres; run via
 // e2e/run-store-it.sh.
 
-func newProvider(ctx context.Context, t *testing.T, q *store.Queries, owner uuid.UUID, name string) store.ModelProvider {
+func newProvider(ctx context.Context, t *testing.T, q *store.Queries, owner uuid.UUID, name string) store.InsertModelProviderRow {
 	t.Helper()
 	p, err := q.InsertModelProvider(ctx, store.InsertModelProviderParams{OwnerUserID: owner, Name: name, Engine: "claude"})
 	if err != nil {

@@ -68,10 +68,37 @@ type AdminSharedProviderDTO struct {
 	CredentialMode    string      `json:"credential_mode"`
 	SelectedUserCount int64       `json:"selected_user_count"`
 	AttachedKeyCount  int64       `json:"attached_key_count"`
+	// OperatorAllUsers and NamedGrantCount are the recipients of an organization-funded definition
+	// (PRD #4540 M2): every user when the switch is on, plus the number of individually named grants.
+	// Always present (false and 0 for a per-user-key definition). Never a user id: the grant reader
+	// (GET /api/admin/providers/{id}/grants) pages those.
+	OperatorAllUsers bool  `json:"operator_all_users"`
+	NamedGrantCount  int64 `json:"named_grant_count"`
 	// OperatorKey is present only for an organization-funded definition (credential_mode
 	// "operator_key", PRD #4540): the state of its one organization key. Never the key, its
 	// ciphertext or its revision counter.
 	OperatorKey *AdminOperatorKeyDTO `json:"operator_key,omitempty"`
+}
+
+// AdminProviderGrantsDTO is one page of GET /api/admin/providers/{id}/grants (PRD #4540 M2). Grant
+// items carry only the user id; the admin UI joins them to the admin user list. NextCursor is null on the
+// last page.
+type AdminProviderGrantsDTO struct {
+	OperatorAllUsers bool                    `json:"operator_all_users"`
+	NamedGrantCount  int64                   `json:"named_grant_count"`
+	Grants           []AdminProviderGrantDTO `json:"grants"`
+	NextCursor       *string                 `json:"next_cursor"`
+}
+
+// AdminProviderGrantDTO is one named recipient of an organization-funded definition.
+type AdminProviderGrantDTO struct {
+	UserID string `json:"user_id"`
+}
+
+// AdminRevokeRecipientsDTO is the POST /api/admin/providers/{id}/revoke-recipients response: how many
+// named grants the revoke removed (the all-users switch is turned off as well).
+type AdminRevokeRecipientsDTO struct {
+	NamedGrantsRemoved int64 `json:"named_grants_removed"`
 }
 
 // AdminOperatorKeyDTO is the state of an organization key as an admin reads it: whether one is set,

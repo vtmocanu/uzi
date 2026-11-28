@@ -80,7 +80,7 @@ func wantViolation(t *testing.T, what string, err error, code string, names ...s
 	t.Errorf("%s: violated %q, want one of %v (%v)", what, gotName, names, err)
 }
 
-func newSharedProvider(ctx context.Context, t *testing.T, q *store.Queries, name string) store.ModelProvider {
+func newSharedProvider(ctx context.Context, t *testing.T, q *store.Queries, name string) store.InsertSharedModelProviderRow {
 	t.Helper()
 	p, err := q.InsertSharedModelProvider(ctx, store.InsertSharedModelProviderParams{Name: name, Engine: "claude"})
 	if err != nil {
@@ -1056,16 +1056,21 @@ func TestSharedCatalogueRacesLiveDB(t *testing.T) {
 		if n >= cap {
 			return false, nil
 		}
-		var p store.ModelProvider
+		var providerID uuid.UUID
 		if operator {
-			p, err = q.InsertSharedOperatorModelProvider(ctx, name)
+			p, err := q.InsertSharedOperatorModelProvider(ctx, name)
+			if err != nil {
+				return false, err
+			}
+			providerID = p.ID
 		} else {
-			p, err = q.InsertSharedModelProvider(ctx, store.InsertSharedModelProviderParams{Name: name, Engine: "claude"})
+			p, err := q.InsertSharedModelProvider(ctx, store.InsertSharedModelProviderParams{Name: name, Engine: "claude"})
+			if err != nil {
+				return false, err
+			}
+			providerID = p.ID
 		}
-		if err != nil {
-			return false, err
-		}
-		if err := q.InsertModelProviderRevision(ctx, store.InsertModelProviderRevisionParams{ProviderID: p.ID, Revision: 1, Protocol: "anthropic_messages", BaseUrl: "https://gw.example.com/a", AuthStyle: "bearer", ModelMap: []byte(`{"haiku":{"model":"h"}}`)}); err != nil {
+		if err := q.InsertModelProviderRevision(ctx, store.InsertModelProviderRevisionParams{ProviderID: providerID, Revision: 1, Protocol: "anthropic_messages", BaseUrl: "https://gw.example.com/a", AuthStyle: "bearer", ModelMap: []byte(`{"haiku":{"model":"h"}}`)}); err != nil {
 			return false, err
 		}
 		return true, tx.Commit(ctx)

@@ -565,8 +565,8 @@ func TestSharedProviderCodexTestEvidenceIsPerUserLiveDB(t *testing.T) {
 		t.Errorf("C's result changed: %+v", got.Probe)
 	}
 
-	// The admin reads carry the definition and two counts, nothing per user.
-	want := []string{"attached_key_count", "auth_style", "base_url", "credential_mode", "current_revision", "engine", "id", "model_map", "name", "protocol", "retired", "selected_user_count"}
+	// The admin reads carry the definition, two counts and the recipient fields, nothing per user.
+	want := []string{"attached_key_count", "auth_style", "base_url", "credential_mode", "current_revision", "engine", "id", "model_map", "name", "named_grant_count", "operator_all_users", "protocol", "retired", "selected_user_count"}
 	keysOf := func(raw json.RawMessage) []string {
 		t.Helper()
 		var m map[string]json.RawMessage

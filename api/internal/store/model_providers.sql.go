@@ -54,6 +54,19 @@ func (q *Queries) BumpSharedModelProviderRevision(ctx context.Context, id uuid.U
 	return current_revision, err
 }
 
+const countModelProviderGrants = `-- name: CountModelProviderGrants :one
+SELECT count(*)::bigint AS named_grant_count FROM model_provider_grants WHERE provider_id = $1
+`
+
+// The named-grant count of one definition, for the 10,000 cap. Authorized caller: admin grant add, after
+// LockSharedModelProviderForEdit.
+func (q *Queries) CountModelProviderGrants(ctx context.Context, providerID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countModelProviderGrants, providerID)
+	var named_grant_count int64
+	err := row.Scan(&named_grant_count)
+	return named_grant_count, err
+}
+
 const countModelProvidersForOwner = `-- name: CountModelProvidersForOwner :one
 SELECT count(*) FROM model_providers WHERE owner_user_id = $1::uuid
 `
@@ -98,6 +111,19 @@ func (q *Queries) CountSharedProviderSelections(ctx context.Context, id uuid.UUI
 	return count, err
 }
 
+const deleteAllModelProviderGrants = `-- name: DeleteAllModelProviderGrants :execrows
+DELETE FROM model_provider_grants WHERE provider_id = $1
+`
+
+// Removes every named recipient of one definition and returns how many. Authorized caller: admin revoke.
+func (q *Queries) DeleteAllModelProviderGrants(ctx context.Context, providerID uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteAllModelProviderGrants, providerID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const deleteModelProvider = `-- name: DeleteModelProvider :execrows
 DELETE FROM model_providers WHERE id = $1 AND owner_user_id = $2::uuid
 `
@@ -112,6 +138,24 @@ type DeleteModelProviderParams struct {
 // while any user has the provider selected as their source; the handler maps that to provider_in_use_as_source.
 func (q *Queries) DeleteModelProvider(ctx context.Context, arg DeleteModelProviderParams) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteModelProvider, arg.ID, arg.OwnerUserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const deleteModelProviderGrant = `-- name: DeleteModelProviderGrant :execrows
+DELETE FROM model_provider_grants WHERE provider_id = $1 AND user_id = $2
+`
+
+type DeleteModelProviderGrantParams struct {
+	ProviderID uuid.UUID `json:"provider_id"`
+	UserID     uuid.UUID `json:"user_id"`
+}
+
+// Removes one named recipient; an absent grant is 0 rows. Authorized caller: admin grant remove.
+func (q *Queries) DeleteModelProviderGrant(ctx context.Context, arg DeleteModelProviderGrantParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteModelProviderGrant, arg.ProviderID, arg.UserID)
 	if err != nil {
 		return 0, err
 	}
@@ -507,7 +551,8 @@ func (q *Queries) GetProviderKeyForUpdate(ctx context.Context, arg GetProviderKe
 
 const getSharedModelProviderAdmin = `-- name: GetSharedModelProviderAdmin :one
 SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at, p.created_at,
-       p.credential_mode,
+       p.credential_mode, p.operator_all_users,
+       (SELECT count(*) FROM model_provider_grants g WHERE g.provider_id = p.id)::bigint AS named_grant_count,
        r.protocol, r.base_url, r.auth_style, r.model_map,
        COALESCE(su.n, 0)::bigint AS selected_user_count,
        COALESCE(ak.n, 0)::bigint AS attached_key_count,
@@ -541,6 +586,8 @@ type GetSharedModelProviderAdminRow struct {
 	RetiredAt             pgtype.Timestamptz `json:"retired_at"`
 	CreatedAt             pgtype.Timestamptz `json:"created_at"`
 	CredentialMode        pgtype.Text        `json:"credential_mode"`
+	OperatorAllUsers      bool               `json:"operator_all_users"`
+	NamedGrantCount       int64              `json:"named_grant_count"`
 	Protocol              string             `json:"protocol"`
 	BaseUrl               string             `json:"base_url"`
 	AuthStyle             string             `json:"auth_style"`
@@ -567,6 +614,8 @@ func (q *Queries) GetSharedModelProviderAdmin(ctx context.Context, id uuid.UUID)
 		&i.RetiredAt,
 		&i.CreatedAt,
 		&i.CredentialMode,
+		&i.OperatorAllUsers,
+		&i.NamedGrantCount,
 		&i.Protocol,
 		&i.BaseUrl,
 		&i.AuthStyle,
@@ -770,6 +819,24 @@ func (q *Queries) GetVisibleProviderForUse(ctx context.Context, arg GetVisiblePr
 	return i, err
 }
 
+const hasModelProviderGrant = `-- name: HasModelProviderGrant :one
+SELECT EXISTS (SELECT 1 FROM model_provider_grants WHERE provider_id = $1 AND user_id = $2)::boolean AS granted
+`
+
+type HasModelProviderGrantParams struct {
+	ProviderID uuid.UUID `json:"provider_id"`
+	UserID     uuid.UUID `json:"user_id"`
+}
+
+// Whether one named grant exists, so a repeat PUT at the cap is a 204 and not a cap refusal. Authorized
+// caller: admin grant add, after LockSharedModelProviderForEdit.
+func (q *Queries) HasModelProviderGrant(ctx context.Context, arg HasModelProviderGrantParams) (bool, error) {
+	row := q.db.QueryRow(ctx, hasModelProviderGrant, arg.ProviderID, arg.UserID)
+	var granted bool
+	err := row.Scan(&granted)
+	return granted, err
+}
+
 const insertModelProvider = `-- name: InsertModelProvider :one
 INSERT INTO model_providers (owner_user_id, name, engine, current_revision, scope_owner_id)
 VALUES ($1::uuid, $2, $3, 1, $1::uuid)
@@ -782,11 +849,23 @@ type InsertModelProviderParams struct {
 	Engine      string    `json:"engine"`
 }
 
+type InsertModelProviderRow struct {
+	ID              uuid.UUID          `json:"id"`
+	OwnerUserID     pgtype.UUID        `json:"owner_user_id"`
+	Name            string             `json:"name"`
+	Engine          string             `json:"engine"`
+	CurrentRevision int32              `json:"current_revision"`
+	RetiredAt       pgtype.Timestamptz `json:"retired_at"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	CredentialMode  pgtype.Text        `json:"credential_mode"`
+	ScopeOwnerID    uuid.UUID          `json:"scope_owner_id"`
+}
+
 // A personal definition: scope_owner_id is the owner (the shared scope is the nil UUID, written only
 // by InsertSharedModelProvider). credential_mode stays NULL: it is set exactly on shared rows.
-func (q *Queries) InsertModelProvider(ctx context.Context, arg InsertModelProviderParams) (ModelProvider, error) {
+func (q *Queries) InsertModelProvider(ctx context.Context, arg InsertModelProviderParams) (InsertModelProviderRow, error) {
 	row := q.db.QueryRow(ctx, insertModelProvider, arg.OwnerUserID, arg.Name, arg.Engine)
-	var i ModelProvider
+	var i InsertModelProviderRow
 	err := row.Scan(
 		&i.ID,
 		&i.OwnerUserID,
@@ -799,6 +878,27 @@ func (q *Queries) InsertModelProvider(ctx context.Context, arg InsertModelProvid
 		&i.ScopeOwnerID,
 	)
 	return i, err
+}
+
+const insertModelProviderGrant = `-- name: InsertModelProviderGrant :execrows
+INSERT INTO model_provider_grants (provider_id, user_id)
+VALUES ($1, $2)
+ON CONFLICT DO NOTHING
+`
+
+type InsertModelProviderGrantParams struct {
+	ProviderID uuid.UUID `json:"provider_id"`
+	UserID     uuid.UUID `json:"user_id"`
+}
+
+// Adds one named recipient; an existing grant matches nothing (0 rows), so a repeat is idempotent.
+// Authorized caller: admin grant add, after LockSharedModelProviderForEdit and LockUserForGrant.
+func (q *Queries) InsertModelProviderGrant(ctx context.Context, arg InsertModelProviderGrantParams) (int64, error) {
+	result, err := q.db.Exec(ctx, insertModelProviderGrant, arg.ProviderID, arg.UserID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const insertModelProviderRevision = `-- name: InsertModelProviderRevision :exec
@@ -937,13 +1037,25 @@ type InsertSharedModelProviderParams struct {
 	Engine string `json:"engine"`
 }
 
+type InsertSharedModelProviderRow struct {
+	ID              uuid.UUID          `json:"id"`
+	OwnerUserID     pgtype.UUID        `json:"owner_user_id"`
+	Name            string             `json:"name"`
+	Engine          string             `json:"engine"`
+	CurrentRevision int32              `json:"current_revision"`
+	RetiredAt       pgtype.Timestamptz `json:"retired_at"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	CredentialMode  pgtype.Text        `json:"credential_mode"`
+	ScopeOwnerID    uuid.UUID          `json:"scope_owner_id"`
+}
+
 // A shared definition of the named engine (claude or codex): NULL owner, per-user-key mode, the nil
 // shared scope. The handler validates the engine; the CHECKs
 // (model_providers_shared_mode_check, _shared_engine_check, _scope_owner_check) enforce the same shape.
 // Authorized caller: the admin create path.
-func (q *Queries) InsertSharedModelProvider(ctx context.Context, arg InsertSharedModelProviderParams) (ModelProvider, error) {
+func (q *Queries) InsertSharedModelProvider(ctx context.Context, arg InsertSharedModelProviderParams) (InsertSharedModelProviderRow, error) {
 	row := q.db.QueryRow(ctx, insertSharedModelProvider, arg.Name, arg.Engine)
-	var i ModelProvider
+	var i InsertSharedModelProviderRow
 	err := row.Scan(
 		&i.ID,
 		&i.OwnerUserID,
@@ -964,12 +1076,24 @@ VALUES (NULL, $1, 'claude', 1, 'operator_key', '00000000-0000-0000-0000-00000000
 RETURNING id, owner_user_id, name, engine, current_revision, retired_at, created_at, credential_mode, scope_owner_id
 `
 
+type InsertSharedOperatorModelProviderRow struct {
+	ID              uuid.UUID          `json:"id"`
+	OwnerUserID     pgtype.UUID        `json:"owner_user_id"`
+	Name            string             `json:"name"`
+	Engine          string             `json:"engine"`
+	CurrentRevision int32              `json:"current_revision"`
+	RetiredAt       pgtype.Timestamptz `json:"retired_at"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	CredentialMode  pgtype.Text        `json:"credential_mode"`
+	ScopeOwnerID    uuid.UUID          `json:"scope_owner_id"`
+}
+
 // An organization-funded shared definition: NULL owner, operator-key mode, Claude only (the engine is a
 // literal here and model_providers_operator_engine_check enforces it), the nil shared scope. Its key is
 // held in model_provider_operator_keys. Authorized caller: the admin create path.
-func (q *Queries) InsertSharedOperatorModelProvider(ctx context.Context, name string) (ModelProvider, error) {
+func (q *Queries) InsertSharedOperatorModelProvider(ctx context.Context, name string) (InsertSharedOperatorModelProviderRow, error) {
 	row := q.db.QueryRow(ctx, insertSharedOperatorModelProvider, name)
-	var i ModelProvider
+	var i InsertSharedOperatorModelProviderRow
 	err := row.Scan(
 		&i.ID,
 		&i.OwnerUserID,
@@ -982,6 +1106,41 @@ func (q *Queries) InsertSharedOperatorModelProvider(ctx context.Context, name st
 		&i.ScopeOwnerID,
 	)
 	return i, err
+}
+
+const listModelProviderGrantsPage = `-- name: ListModelProviderGrantsPage :many
+SELECT user_id FROM model_provider_grants
+WHERE provider_id = $1 AND user_id > $2::uuid
+ORDER BY user_id
+LIMIT $3::int
+`
+
+type ListModelProviderGrantsPageParams struct {
+	ProviderID  uuid.UUID `json:"provider_id"`
+	AfterUserID uuid.UUID `json:"after_user_id"`
+	PageLimit   int32     `json:"page_limit"`
+}
+
+// One keyset page of a definition's named recipients, ordered by user_id after the cursor. The caller asks
+// for limit+1 rows to know whether another page exists. Authorized caller: admin grant reader.
+func (q *Queries) ListModelProviderGrantsPage(ctx context.Context, arg ListModelProviderGrantsPageParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, listModelProviderGrantsPage, arg.ProviderID, arg.AfterUserID, arg.PageLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var user_id uuid.UUID
+		if err := rows.Scan(&user_id); err != nil {
+			return nil, err
+		}
+		items = append(items, user_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listModelProvidersForOwner = `-- name: ListModelProvidersForOwner :many
@@ -1097,7 +1256,8 @@ func (q *Queries) ListRunProviderNames(ctx context.Context, runIds []uuid.UUID) 
 
 const listSharedModelProvidersAdmin = `-- name: ListSharedModelProvidersAdmin :many
 SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at, p.created_at,
-       p.credential_mode,
+       p.credential_mode, p.operator_all_users,
+       (SELECT count(*) FROM model_provider_grants g WHERE g.provider_id = p.id)::bigint AS named_grant_count,
        r.protocol, r.base_url, r.auth_style, r.model_map,
        COALESCE(su.n, 0)::bigint AS selected_user_count,
        COALESCE(ak.n, 0)::bigint AS attached_key_count,
@@ -1132,6 +1292,8 @@ type ListSharedModelProvidersAdminRow struct {
 	RetiredAt             pgtype.Timestamptz `json:"retired_at"`
 	CreatedAt             pgtype.Timestamptz `json:"created_at"`
 	CredentialMode        pgtype.Text        `json:"credential_mode"`
+	OperatorAllUsers      bool               `json:"operator_all_users"`
+	NamedGrantCount       int64              `json:"named_grant_count"`
 	Protocol              string             `json:"protocol"`
 	BaseUrl               string             `json:"base_url"`
 	AuthStyle             string             `json:"auth_style"`
@@ -1148,7 +1310,7 @@ type ListSharedModelProvidersAdminRow struct {
 
 // The shared catalogue as an admin sees it: the current revision's fields and two counts, and for an
 // organization-funded definition whether its key is set, enabled and when, plus the Test evidence for
-// that exact key. Never a key, its ciphertext, its revision or a per-user result. Authorized caller: admin list (cookie, or the admin-read token).
+// that exact key, the all-users switch and the named-grant count (no user ids). Never a key, its ciphertext, its revision or a per-user result. Authorized caller: admin list (cookie, or the admin-read token).
 func (q *Queries) ListSharedModelProvidersAdmin(ctx context.Context) ([]ListSharedModelProvidersAdminRow, error) {
 	rows, err := q.db.Query(ctx, listSharedModelProvidersAdmin)
 	if err != nil {
@@ -1166,6 +1328,8 @@ func (q *Queries) ListSharedModelProvidersAdmin(ctx context.Context) ([]ListShar
 			&i.RetiredAt,
 			&i.CreatedAt,
 			&i.CredentialMode,
+			&i.OperatorAllUsers,
+			&i.NamedGrantCount,
 			&i.Protocol,
 			&i.BaseUrl,
 			&i.AuthStyle,
@@ -1576,24 +1740,26 @@ func (q *Queries) LockSharedModelProviderForDelete(ctx context.Context, id uuid.
 }
 
 const lockSharedModelProviderForEdit = `-- name: LockSharedModelProviderForEdit :one
-SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at, p.credential_mode FROM model_providers p
+SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at, p.credential_mode, p.operator_all_users FROM model_providers p
 WHERE p.id = $1 AND p.owner_user_id IS NULL AND p.credential_mode IN ('per_user_key', 'operator_key')
 FOR NO KEY UPDATE OF p
 `
 
 type LockSharedModelProviderForEditRow struct {
-	ID              uuid.UUID          `json:"id"`
-	Name            string             `json:"name"`
-	Engine          string             `json:"engine"`
-	CurrentRevision int32              `json:"current_revision"`
-	RetiredAt       pgtype.Timestamptz `json:"retired_at"`
-	CredentialMode  pgtype.Text        `json:"credential_mode"`
+	ID               uuid.UUID          `json:"id"`
+	Name             string             `json:"name"`
+	Engine           string             `json:"engine"`
+	CurrentRevision  int32              `json:"current_revision"`
+	RetiredAt        pgtype.Timestamptz `json:"retired_at"`
+	CredentialMode   pgtype.Text        `json:"credential_mode"`
+	OperatorAllUsers bool               `json:"operator_all_users"`
 }
 
 // The edit transaction's first statement for a shared definition: FOR NO KEY UPDATE takes the same lock
 // the bump and the rename would, so the order is fixed up front and a concurrent run-create share lock
 // (LockModelProviderForShare) waits for the edit. No per-user lock is involved. A retired definition is
-// returned so the handler can refuse it with the right error. Authorized caller: admin edit.
+// returned so the handler can refuse it with the right error. operator_all_users is the previous value the
+// grant writes report, read under this lock. Authorized callers: admin edit, key writes, grant writes.
 func (q *Queries) LockSharedModelProviderForEdit(ctx context.Context, id uuid.UUID) (LockSharedModelProviderForEditRow, error) {
 	row := q.db.QueryRow(ctx, lockSharedModelProviderForEdit, id)
 	var i LockSharedModelProviderForEditRow
@@ -1604,8 +1770,23 @@ func (q *Queries) LockSharedModelProviderForEdit(ctx context.Context, id uuid.UU
 		&i.CurrentRevision,
 		&i.RetiredAt,
 		&i.CredentialMode,
+		&i.OperatorAllUsers,
 	)
 	return i, err
+}
+
+const lockUserForGrant = `-- name: LockUserForGrant :one
+SELECT 1::int AS one FROM users WHERE id = $1 FOR KEY SHARE
+`
+
+// Locks the grantee's user row FOR KEY SHARE, so a concurrent user delete waits and a deleted user reads
+// as no row (pgx.ErrNoRows, mapped to 404 user_not_found). Taken after LockSharedModelProviderForEdit.
+// Authorized caller: admin grant add.
+func (q *Queries) LockUserForGrant(ctx context.Context, userID uuid.UUID) (int32, error) {
+	row := q.db.QueryRow(ctx, lockUserForGrant, userID)
+	var one int32
+	err := row.Scan(&one)
+	return one, err
 }
 
 const lockVisibleProviderForEvidence = `-- name: LockVisibleProviderForEvidence :one
@@ -1832,6 +2013,27 @@ WHERE id = $1 AND owner_user_id IS NULL AND credential_mode IN ('per_user_key', 
 // Idempotent: the first retirement time is kept. Authorized caller: admin retire.
 func (q *Queries) RetireSharedModelProvider(ctx context.Context, id uuid.UUID) (int64, error) {
 	result, err := q.db.Exec(ctx, retireSharedModelProvider, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const setOperatorAllUsers = `-- name: SetOperatorAllUsers :execrows
+UPDATE model_providers SET operator_all_users = $1
+WHERE id = $2 AND owner_user_id IS NULL AND credential_mode = 'operator_key'
+`
+
+type SetOperatorAllUsersParams struct {
+	Enabled bool      `json:"enabled"`
+	ID      uuid.UUID `json:"id"`
+}
+
+// Sets the all-users switch of an organization-funded shared definition; the CHECK
+// model_providers_operator_all_users_check is the structural backstop. Authorized callers: admin
+// all-users and admin revoke, after LockSharedModelProviderForEdit.
+func (q *Queries) SetOperatorAllUsers(ctx context.Context, arg SetOperatorAllUsersParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setOperatorAllUsers, arg.Enabled, arg.ID)
 	if err != nil {
 		return 0, err
 	}

@@ -426,8 +426,9 @@ RETURNING id, owner_user_id, name, engine, current_revision, retired_at, created
 -- The edit transaction's first statement for a shared definition: FOR NO KEY UPDATE takes the same lock
 -- the bump and the rename would, so the order is fixed up front and a concurrent run-create share lock
 -- (LockModelProviderForShare) waits for the edit. No per-user lock is involved. A retired definition is
--- returned so the handler can refuse it with the right error. Authorized caller: admin edit.
-SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at, p.credential_mode FROM model_providers p
+-- returned so the handler can refuse it with the right error. operator_all_users is the previous value the
+-- grant writes report, read under this lock. Authorized callers: admin edit, key writes, grant writes.
+SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at, p.credential_mode, p.operator_all_users FROM model_providers p
 WHERE p.id = @id AND p.owner_user_id IS NULL AND p.credential_mode IN ('per_user_key', 'operator_key')
 FOR NO KEY UPDATE OF p;
 
@@ -500,9 +501,10 @@ DELETE FROM model_providers WHERE id = @id AND owner_user_id IS NULL AND credent
 -- name: ListSharedModelProvidersAdmin :many
 -- The shared catalogue as an admin sees it: the current revision's fields and two counts, and for an
 -- organization-funded definition whether its key is set, enabled and when, plus the Test evidence for
--- that exact key. Never a key, its ciphertext, its revision or a per-user result. Authorized caller: admin list (cookie, or the admin-read token).
+-- that exact key, the all-users switch and the named-grant count (no user ids). Never a key, its ciphertext, its revision or a per-user result. Authorized caller: admin list (cookie, or the admin-read token).
 SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at, p.created_at,
-       p.credential_mode,
+       p.credential_mode, p.operator_all_users,
+       (SELECT count(*) FROM model_provider_grants g WHERE g.provider_id = p.id)::bigint AS named_grant_count,
        r.protocol, r.base_url, r.auth_style, r.model_map,
        COALESCE(su.n, 0)::bigint AS selected_user_count,
        COALESCE(ak.n, 0)::bigint AS attached_key_count,
@@ -531,7 +533,8 @@ ORDER BY lower(p.name), p.id;
 -- name: GetSharedModelProviderAdmin :one
 -- One shared definition as ListSharedModelProvidersAdmin returns it. Authorized caller: admin get.
 SELECT p.id, p.name, p.engine, p.current_revision, p.retired_at, p.created_at,
-       p.credential_mode,
+       p.credential_mode, p.operator_all_users,
+       (SELECT count(*) FROM model_provider_grants g WHERE g.provider_id = p.id)::bigint AS named_grant_count,
        r.protocol, r.base_url, r.auth_style, r.model_map,
        COALESCE(su.n, 0)::bigint AS selected_user_count,
        COALESCE(ak.n, 0)::bigint AS attached_key_count,
@@ -652,3 +655,49 @@ ON CONFLICT (provider_id) DO UPDATE
 SET revision = EXCLUDED.revision, key_id = EXCLUDED.key_id, key_rev = EXCLUDED.key_rev,
     auth_result = EXCLUDED.auth_result, tool_result = EXCLUDED.tool_result,
     probed_at = EXCLUDED.probed_at, probed_by = EXCLUDED.probed_by;
+
+-- name: LockUserForGrant :one
+-- Locks the grantee's user row FOR KEY SHARE, so a concurrent user delete waits and a deleted user reads
+-- as no row (pgx.ErrNoRows, mapped to 404 user_not_found). Taken after LockSharedModelProviderForEdit.
+-- Authorized caller: admin grant add.
+SELECT 1::int AS one FROM users WHERE id = @user_id FOR KEY SHARE;
+
+-- name: CountModelProviderGrants :one
+-- The named-grant count of one definition, for the 10,000 cap. Authorized caller: admin grant add, after
+-- LockSharedModelProviderForEdit.
+SELECT count(*)::bigint AS named_grant_count FROM model_provider_grants WHERE provider_id = @provider_id;
+
+-- name: HasModelProviderGrant :one
+-- Whether one named grant exists, so a repeat PUT at the cap is a 204 and not a cap refusal. Authorized
+-- caller: admin grant add, after LockSharedModelProviderForEdit.
+SELECT EXISTS (SELECT 1 FROM model_provider_grants WHERE provider_id = @provider_id AND user_id = @user_id)::boolean AS granted;
+
+-- name: InsertModelProviderGrant :execrows
+-- Adds one named recipient; an existing grant matches nothing (0 rows), so a repeat is idempotent.
+-- Authorized caller: admin grant add, after LockSharedModelProviderForEdit and LockUserForGrant.
+INSERT INTO model_provider_grants (provider_id, user_id)
+VALUES (@provider_id, @user_id)
+ON CONFLICT DO NOTHING;
+
+-- name: DeleteModelProviderGrant :execrows
+-- Removes one named recipient; an absent grant is 0 rows. Authorized caller: admin grant remove.
+DELETE FROM model_provider_grants WHERE provider_id = @provider_id AND user_id = @user_id;
+
+-- name: DeleteAllModelProviderGrants :execrows
+-- Removes every named recipient of one definition and returns how many. Authorized caller: admin revoke.
+DELETE FROM model_provider_grants WHERE provider_id = @provider_id;
+
+-- name: ListModelProviderGrantsPage :many
+-- One keyset page of a definition's named recipients, ordered by user_id after the cursor. The caller asks
+-- for limit+1 rows to know whether another page exists. Authorized caller: admin grant reader.
+SELECT user_id FROM model_provider_grants
+WHERE provider_id = @provider_id AND user_id > @after_user_id::uuid
+ORDER BY user_id
+LIMIT @page_limit::int;
+
+-- name: SetOperatorAllUsers :execrows
+-- Sets the all-users switch of an organization-funded shared definition; the CHECK
+-- model_providers_operator_all_users_check is the structural backstop. Authorized callers: admin
+-- all-users and admin revoke, after LockSharedModelProviderForEdit.
+UPDATE model_providers SET operator_all_users = @enabled
+WHERE id = @id AND owner_user_id IS NULL AND credential_mode = 'operator_key';

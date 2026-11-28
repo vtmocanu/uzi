@@ -33,6 +33,11 @@ const (
 	// the sealed key. A statement that names a custody table in any other class is refused (see
 	// custodyTableMarker), except the two admin reads in adminCustodyJoinReaders.
 	classOperatorCustody
+	// classOperatorGrant is a recipient-grant statement (PRD #4540 M2): it names model_provider_grants,
+	// is scoped by the definition id its handler has already locked, and is pinned to the admin grant
+	// handler. Only these statements (and the count subquery of the admin list and get) may name the
+	// grants table (grantsTableMarker, rule (e) of R5).
+	classOperatorGrant
 )
 
 type visEntry struct {
@@ -75,12 +80,15 @@ const (
 	adminDelete = "admin delete (cookie + CSRF)"
 	adminRead   = "admin list/get (cookie, or the admin-read token)"
 	adminKey    = "admin key write or Test (cookie + CSRF)"
+	adminGrant  = "admin grant write or read (cookie + CSRF; the read is admin-read)"
 
 	// The production files that may call a shared-admin or custody statement (PRD #4540 M2): the admin
 	// definition routes, the organization key routes and the admin Test.
 	handlerAdmin = "handler/providers_admin.go"
 	handlerKey   = "handler/providers_admin_key.go"
 	handlerProbe = "handler/providers_admin_probe.go"
+	// handlerGrants is the admin grant writers and the paged grant reader (PRD #4540 M2).
+	handlerGrants = "handler/providers_admin_grants.go"
 
 	// sharedBothModes is the credential-mode predicate of every admin statement: a shared definition is
 	// per-user-key or organization-funded, and the admin catalogue, cap and edits cover both.
@@ -89,6 +97,12 @@ const (
 	custodyKeyRevNextval = "key_rev = nextval('model_provider_operator_key_rev_seq')"
 	// operatorScopeSQL is the scope of every statement that reads an organization-funded definition.
 	operatorScopeSQL = "p.owner_user_id IS NULL AND p.credential_mode = 'operator_key'"
+	// grantsTableMarker is the grants table's name: only classOperatorGrant statements and the count
+	// subquery of the admin list and get may name it.
+	grantsTableMarker = "model_provider_grants"
+	// grantCountSubquery is the one place the admin list and get name the grants table: a count, never a
+	// user id.
+	grantCountSubquery = "(SELECT count(*) FROM model_provider_grants g WHERE g.provider_id = p.id)::bigint AS named_grant_count"
 )
 
 // bothSelectionArms pins that a shared definition's selection count covers both engines' nil-scope
@@ -105,6 +119,10 @@ var adminCountMust = append([]string{"p.owner_user_id IS NULL AND p." + sharedBo
 // table: the admin list and get join the key and its evidence for their projection, which
 // adminProjectionLeaks pins and the classShared rule keeps free of ciphertext.
 var adminCustodyJoinReaders = []string{"ListSharedModelProvidersAdmin", "GetSharedModelProviderAdmin"}
+
+// grantsCountReaders are the only statements outside classOperatorGrant that may name the grants table,
+// and only through grantCountSubquery. They are the same two admin reads.
+var grantsCountReaders = adminCustodyJoinReaders
 
 // visibilityTable is the classification. Keep it sorted by class, then name.
 var visibilityTable = map[string]visEntry{
@@ -153,7 +171,7 @@ var visibilityTable = map[string]visEntry{
 	"InsertSharedOperatorModelProvider": {class: classShared, caller: adminCreate, exact: exactSQL["InsertSharedOperatorModelProvider"], must: []string{
 		"VALUES (NULL, @name, 'claude', 1, 'operator_key', " + nilScopeSQL + ")"}, callers: []string{handlerAdmin}},
 	// The edit lock is the first statement of every definition write: the edit, retire and key routes.
-	"LockSharedModelProviderForEdit":    {class: classShared, caller: adminEdit, exact: exactSQL["LockSharedModelProviderForEdit"], callers: []string{handlerAdmin, handlerKey}},
+	"LockSharedModelProviderForEdit":    {class: classShared, caller: adminEdit, exact: exactSQL["LockSharedModelProviderForEdit"], callers: []string{handlerAdmin, handlerKey, handlerGrants}},
 	"BumpSharedModelProviderRevision":   {class: classShared, caller: adminEdit, exact: exactSQL["BumpSharedModelProviderRevision"], callers: []string{"handler/providers_admin.go"}},
 	"RenameSharedModelProvider":         {class: classShared, caller: adminEdit, exact: exactSQL["RenameSharedModelProvider"], callers: []string{"handler/providers_admin.go"}},
 	"RetireSharedModelProvider":         {class: classShared, caller: adminEdit, exact: exactSQL["RetireSharedModelProvider"], callers: []string{"handler/providers_admin.go"}},
@@ -169,7 +187,26 @@ var visibilityTable = map[string]visEntry{
 	// The read-back of every definition write: the admin routes and the key routes return the admin view.
 	// The admin Test answers from its own probe result and does not read it back.
 	"GetSharedModelProviderAdmin": {class: classShared, caller: adminRead, exact: exactSQL["GetSharedModelProviderAdmin"],
-		must: adminCountMust, callers: []string{handlerAdmin, handlerKey}},
+		must: adminCountMust, callers: []string{handlerAdmin, handlerKey, handlerGrants}},
+	// The all-users switch: an organization-funded shared definition only (the CHECK is the backstop).
+	"SetOperatorAllUsers": {class: classShared, caller: adminGrant, exact: exactSQL["SetOperatorAllUsers"],
+		must: []string{"owner_user_id IS NULL AND credential_mode = 'operator_key'"}, callers: []string{handlerGrants}},
+
+	// recipient grants (PRD #4540 M2). Each is scoped by the definition id the handler locked first
+	// (LockSharedModelProviderForEdit, pinned by grantCallOrderPins), and only these statements and the
+	// admin list/get count subquery name the grants table.
+	"CountModelProviderGrants": {class: classOperatorGrant, caller: adminGrant, exact: exactSQL["CountModelProviderGrants"],
+		must: []string{"WHERE provider_id = @provider_id"}, callers: []string{handlerGrants}},
+	"HasModelProviderGrant": {class: classOperatorGrant, caller: adminGrant, exact: exactSQL["HasModelProviderGrant"],
+		must: []string{"WHERE provider_id = @provider_id AND user_id = @user_id"}, callers: []string{handlerGrants}},
+	"InsertModelProviderGrant": {class: classOperatorGrant, caller: adminGrant, exact: exactSQL["InsertModelProviderGrant"],
+		must: []string{"VALUES (@provider_id, @user_id) ON CONFLICT DO NOTHING"}, callers: []string{handlerGrants}},
+	"DeleteModelProviderGrant": {class: classOperatorGrant, caller: adminGrant, exact: exactSQL["DeleteModelProviderGrant"],
+		must: []string{"WHERE provider_id = @provider_id AND user_id = @user_id"}, callers: []string{handlerGrants}},
+	"DeleteAllModelProviderGrants": {class: classOperatorGrant, caller: adminGrant, exact: exactSQL["DeleteAllModelProviderGrants"],
+		must: []string{"WHERE provider_id = @provider_id"}, callers: []string{handlerGrants}},
+	"ListModelProviderGrantsPage": {class: classOperatorGrant, caller: adminGrant, exact: exactSQL["ListModelProviderGrantsPage"],
+		must: []string{"WHERE provider_id = @provider_id AND user_id > @after_user_id::uuid ORDER BY user_id"}, callers: []string{handlerGrants}},
 
 	// organization key custody and the admin Test evidence (PRD #4540). The key routes (handlerKey) write
 	// custody, the admin Test (handlerProbe) reads the sink and records evidence, and the admin delete
@@ -224,6 +261,9 @@ var visibilityTable = map[string]visEntry{
 		callers: []string{"workersvc/cross_check_gate_reason.go", "workersvc/harness_resolver.go"}},
 	"GetUserJudgeLanePolicy": {class: classIdentity, must: []string{"WHERE id = $1"},
 		callers: []string{"workersvc/harness_resolver.go"}},
+	// The grantee's user row, locked after the definition (grantCallOrderPins): no row is 404 user_not_found.
+	"LockUserForGrant": {class: classIdentity, must: []string{"FROM users WHERE id = @user_id FOR KEY SHARE"},
+		callers: []string{handlerGrants}},
 }
 
 var (
@@ -343,6 +383,8 @@ func visibilityViolations(sqlText string, table map[string]visEntry) []string {
 			}
 		case classOperatorCustody:
 			out = append(out, custodyViolations(name, stmt, e)...)
+		case classOperatorGrant:
+			out = append(out, grantViolations(name, stmt, e)...)
 		case classIdentity:
 			if len(e.must) == 0 {
 				out = append(out, name+": identity-only query has no pinned key predicate")
@@ -355,6 +397,17 @@ func visibilityViolations(sqlText string, table map[string]visEntry) []string {
 		if e.class != classOperatorCustody && !slices.Contains(adminCustodyJoinReaders, name) &&
 			strings.Contains(strings.ToLower(stmt), custodyTableMarker) {
 			out = append(out, name+": names an organization key table outside classOperatorCustody")
+		}
+		// R5 (e): the grants table is named only by classOperatorGrant statements and, through its one
+		// count subquery, the admin list and get.
+		if e.class != classOperatorGrant && strings.Contains(strings.ToLower(stmt), grantsTableMarker) {
+			rest := strings.ReplaceAll(stmt, grantCountSubquery, "")
+			switch {
+			case !slices.Contains(grantsCountReaders, name):
+				out = append(out, name+": names the grants table outside classOperatorGrant")
+			case strings.Contains(strings.ToLower(rest), grantsTableMarker) || strings.Contains(rest, "g.user_id"):
+				out = append(out, name+": names the grants table beyond the named_grant_count subquery (no user ids)")
+			}
 		}
 	}
 	for name := range table {
@@ -400,11 +453,29 @@ func custodyViolations(name, stmt string, e visEntry) []string {
 	return out
 }
 
+// grantViolations are the text rules of a recipient-grant statement: a caller, a pinned predicate, no
+// sealed key material and no custody table.
+func grantViolations(name, stmt string, e visEntry) []string {
+	var out []string
+	if e.caller == "" {
+		out = append(out, name+": grant statement has no authorized caller recorded")
+	}
+	if len(e.must) == 0 {
+		out = append(out, name+": grant statement has no pinned predicate")
+	}
+	if strings.Contains(stmt, "ciphertext") || strings.Contains(strings.ToLower(stmt), custodyTableMarker) {
+		out = append(out, name+": grant statement names sealed key material or a custody table")
+	}
+	return out
+}
+
 // adminProjectionLeaks returns the custody internals an admin read's SELECT list projects: the key
 // revision, the key's row id, the setter, any ciphertext, or a whole-row expansion. The joins may name
 // them (the evidence join compares key id and revision); the projection may not.
 func adminProjectionLeaks(stmt string) []string {
-	proj := stmt
+	// The one count subquery has a FROM of its own; it is checked by the grants marker rule, so the
+	// projection is read with it removed.
+	proj := strings.ReplaceAll(stmt, grantCountSubquery, "")
 	if i := strings.Index(proj, " FROM "); i >= 0 {
 		proj = proj[:i]
 	}
@@ -532,6 +603,14 @@ func TestModelProviderVisibilityPinFiresOnItsCanaries(t *testing.T) {
 			map[string]visEntry{"I": {class: classIdentity, must: []string{"provider_id"}, callers: []string{"x.go"}}}, "I: names an organization key table outside classOperatorCustody"},
 		{"custody read in upper case classified identity-only", "-- name: I :one\nSELECT CIPHERTEXT FROM MODEL_PROVIDER_OPERATOR_KEYS WHERE provider_id = $1;",
 			map[string]visEntry{"I": {class: classIdentity, must: []string{"provider_id"}, callers: []string{"x.go"}}}, "I: names an organization key table outside classOperatorCustody"},
+		{"grants table named by an unlisted identity statement", "-- name: I :one\nSELECT user_id FROM model_provider_grants WHERE provider_id = $1;",
+			map[string]visEntry{"I": {class: classIdentity, must: []string{"provider_id"}, callers: []string{"x.go"}}}, "I: names the grants table outside classOperatorGrant"},
+		{"grants table named in upper case by an unlisted shared-admin statement", "-- name: S :one\nSELECT 1 FROM model_providers p WHERE p.owner_user_id IS NULL AND p.credential_mode IN ('per_user_key', 'operator_key') AND EXISTS (SELECT 1 FROM MODEL_PROVIDER_GRANTS g WHERE g.provider_id = p.id);",
+			map[string]visEntry{"S": {class: classShared, caller: "x"}}, "S: names the grants table outside classOperatorGrant"},
+		{"grant statement without a caller", "-- name: G :one\nDELETE FROM model_provider_grants WHERE provider_id = $1;",
+			map[string]visEntry{"G": {class: classOperatorGrant, must: []string{"provider_id"}}}, "G: grant statement has no authorized caller recorded"},
+		{"grant statement without a pinned predicate", "-- name: G :one\nDELETE FROM model_provider_grants WHERE provider_id = $1;",
+			map[string]visEntry{"G": {class: classOperatorGrant, caller: "x"}}, "G: grant statement has no pinned predicate"},
 		{"stale entry", "-- name: A :one\nSELECT 1;", map[string]visEntry{"A": {class: classIdentity, must: []string{"1"}, callers: []string{"x.go"}}, "Gone": {class: classOwner}}, "Gone: in visibilityTable but not in the query file"},
 	}
 	for _, c := range cases {
@@ -558,7 +637,7 @@ func TestIdentityQueryCallersArePinned(t *testing.T) {
 		// Identity-only, shared-admin and custody statements carry no ownership predicate of the
 		// caller's own (or, for the shared and custody ones, one only the admin route makes safe), so
 		// the exact set of production files that call each is pinned; an empty set means no caller.
-		if e.class != classIdentity && e.class != classShared && e.class != classOperatorCustody {
+		if e.class != classIdentity && e.class != classShared && e.class != classOperatorCustody && e.class != classOperatorGrant {
 			continue
 		}
 		got := methodRefsOf(files, name)
@@ -577,6 +656,9 @@ func TestIdentityQueryCallersArePinned(t *testing.T) {
 	}
 	checkProviderEvidenceCalls(t, files["handler/providers_probe.go"], true)
 	for _, pin := range custodyCallOrderPins {
+		checkCallOrder(t, files[pin.file], pin, true)
+	}
+	for _, pin := range grantCallOrderPins {
 		checkCallOrder(t, files[pin.file], pin, true)
 	}
 	if got := operatorKeyAliasViolations(files); len(got) != 0 {
@@ -832,6 +914,64 @@ var custodyCallOrderPins = []callOrderPin{
 		[]string{"UpsertOperatorProviderKeyTestResult"}},
 }
 
+// grantCallOrderPins are the grant writers' lock orders (PRD #4540 M2, R6 writer invariant): every
+// grant, all-users and revoke write takes the definition row (LockSharedModelProviderForEdit) first, and
+// the grant add then locks the grantee's user row, before any grant statement writes. The grant reader is
+// a read-only transaction and takes no lock.
+//
+// Two writers of the grants table are exempt, named here so a reviewer sees them: the user-delete cascade
+// (the users foreign key's ON DELETE CASCADE, which also cascades that user's runs) and
+// PruneSharedModelProviderRevisions (a revision prune after the edit commit, which never touches the
+// grants table and takes no definition lock). TestGrantWritersAreOrderPinnedOrExempt enforces that no
+// other statement writes the grants table.
+var grantCallOrderPins = []callOrderPin{
+	{handlerGrants, "AdminPutProviderGrant", []string{"LockSharedModelProviderForEdit", "LockUserForGrant"},
+		[]string{"InsertModelProviderGrant"}},
+	{handlerGrants, "AdminDeleteProviderGrant", []string{"LockSharedModelProviderForEdit"},
+		[]string{"DeleteModelProviderGrant"}},
+	{handlerGrants, "AdminPutProviderAllUsers", []string{"LockSharedModelProviderForEdit"},
+		[]string{"SetOperatorAllUsers"}},
+	{handlerGrants, "AdminRevokeProviderRecipients", []string{"LockSharedModelProviderForEdit"},
+		[]string{"SetOperatorAllUsers", "DeleteAllModelProviderGrants"}},
+}
+
+// grantWriterExemptions are the two writers of the grants table that take no definition lock.
+var grantWriterExemptions = []string{"users foreign key ON DELETE CASCADE (user delete)", "PruneSharedModelProviderRevisions"}
+
+var grantWriteRE = regexp.MustCompile(`(?i)\b(?:INSERT\s+INTO|DELETE\s+FROM|UPDATE(?:\s+ONLY)?)\s+model_provider_grants\b`)
+
+// TestGrantWritersAreOrderPinnedOrExempt: every statement that writes the grants table is the write of
+// a grantCallOrderPins entry, and neither exempt writer names the grants table in SQL.
+func TestGrantWritersAreOrderPinnedOrExempt(t *testing.T) {
+	pinned := map[string]bool{}
+	for _, pin := range grantCallOrderPins {
+		for _, w := range pin.writes {
+			pinned[w] = true
+		}
+	}
+	stmts := statementsOfFile(t)
+	for name, stmt := range stmts {
+		if grantWriteRE.MatchString(stmt) && !pinned[name] {
+			t.Errorf("%s writes the grants table but is not the write of a grantCallOrderPins entry", name)
+		}
+	}
+	for name := range pinned {
+		if name == "SetOperatorAllUsers" {
+			continue
+		}
+		if !grantWriteRE.MatchString(stmts[name]) {
+			t.Errorf("%s is pinned as a grant writer but does not write the grants table", name)
+		}
+	}
+	if !slices.Contains(grantWriterExemptions, "PruneSharedModelProviderRevisions") ||
+		strings.Contains(strings.ToLower(stmts["PruneSharedModelProviderRevisions"]), grantsTableMarker) {
+		t.Errorf("PruneSharedModelProviderRevisions must stay an exempt writer that never names the grants table")
+	}
+	if !grantWriteRE.MatchString("DELETE FROM model_provider_grants WHERE true") || grantWriteRE.MatchString("SELECT 1 FROM model_provider_grants") {
+		t.Error("grantWriteRE is not the writer detector it claims to be")
+	}
+}
+
 // callOrderViolations reads the executable selector calls of pin.fn (comments cannot satisfy it).
 func callOrderViolations(source string, pin callOrderPin) []string {
 	file, err := parser.ParseFile(token.NewFileSet(), pin.file, source, 0)
@@ -927,7 +1067,7 @@ func TestPinnedClassesCarryExactText(t *testing.T) {
 	stmts := statementsOfFile(t)
 	for name, e := range visibilityTable {
 		switch e.class {
-		case classVIS, classShared, classOperatorCustody:
+		case classVIS, classShared, classOperatorCustody, classOperatorGrant:
 			if e.exact == "" {
 				t.Errorf("%s: no exact text pinned", name)
 			} else if e.exact != stmts[name] {
@@ -1012,6 +1152,14 @@ func TestOperatorCustodyPinFiresOnItsCanaries(t *testing.T) {
 		{"admin get narrowed to the single-mode scope", "GetSharedModelProviderAdmin", func(s string) string {
 			return strings.ReplaceAll(s, "p.credential_mode IN ('per_user_key', 'operator_key')", "p.credential_mode = 'per_user_key'")
 		}, "lacks required text p.owner_user_id IS NULL AND p.credential_mode IN ('per_user_key', 'operator_key')"},
+		{"admin get projects the grantees", "GetSharedModelProviderAdmin", repl(grantCountSubquery, grantCountSubquery+", (SELECT array_agg(g.user_id) FROM model_provider_grants g WHERE g.provider_id = p.id) AS grantees"), "names the grants table beyond the named_grant_count subquery"},
+		{"admin list counts grants without the provider bind", "ListSharedModelProvidersAdmin", repl("g.provider_id = p.id)::bigint AS named_grant_count", "g.user_id IS NOT NULL)::bigint AS named_grant_count"), "names the grants table beyond the named_grant_count subquery"},
+		{"the select lock peeks at grants", "LockUserForGrant", repl("FOR KEY SHARE", "AND EXISTS (SELECT 1 FROM model_provider_grants) FOR KEY SHARE"), "names the grants table outside classOperatorGrant"},
+		{"a recipient reader peeks at grants", "LockVisibleProviderForEvidence", repl("FOR SHARE OF p", "AND EXISTS (SELECT 1 FROM model_provider_grants g WHERE g.provider_id = p.id) FOR SHARE OF p"), "names the grants table outside classOperatorGrant"},
+		{"the revision prune writes grants", "PruneSharedModelProviderRevisions", repl("AND NOT EXISTS (", "AND NOT EXISTS (SELECT 1 FROM model_provider_grants WHERE provider_id = rev.provider_id) AND NOT EXISTS ("), "names the grants table outside classOperatorGrant"},
+		{"grant delete loses its provider bind", "DeleteModelProviderGrant", repl("provider_id = @provider_id AND ", ""), "lacks required text"},
+		{"grant insert upserts instead of doing nothing", "InsertModelProviderGrant", repl("ON CONFLICT DO NOTHING", "ON CONFLICT (provider_id, user_id) DO UPDATE SET user_id = EXCLUDED.user_id"), "lacks required text"},
+		{"all-users switch widened to a personal definition", "SetOperatorAllUsers", repl("credential_mode = 'operator_key'", "credential_mode IN ('per_user_key', 'operator_key')"), exact},
 		{"a recipient reader widened to both modes", "LockVisibleProviderForEvidence", repl("p.credential_mode = 'per_user_key'", "p.credential_mode IN ('per_user_key', 'operator_key')"), exact},
 	}
 	for _, c := range cases {
@@ -1096,5 +1244,56 @@ func TestCustodyOutOfFileScanFiresAndIgnoresTestsAndGeneratedFiles(t *testing.T)
 		if isProductionGoFile(name) != want {
 			t.Errorf("isProductionGoFile(%q) = %t, want %t", name, !want, want)
 		}
+	}
+}
+
+// grantsOutOfFileViolations returns each file that names the grants table: the production Go files
+// (except the grant handler, see below) and every query file other than model_providers.sql. Its test
+// feeds it a synthetic offender.
+func grantsOutOfFileViolations(goFiles, otherQueries map[string]string) []string {
+	var out []string
+	for path, src := range goFiles {
+		// The grant handler names the table once, in the foreign-key constraint it maps to
+		// user_not_found; it holds no SQL (its statements are the classOperatorGrant ones).
+		if path == handlerGrants {
+			continue
+		}
+		if strings.Contains(strings.ToLower(src), grantsTableMarker) {
+			out = append(out, path+": production Go names the grants table")
+		}
+	}
+	for path, src := range otherQueries {
+		if strings.Contains(strings.ToLower(src), grantsTableMarker) {
+			out = append(out, path+": a query file other than model_providers.sql names the grants table")
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func TestGrantsTableIsNamedOnlyInItsQueryFile(t *testing.T) {
+	other := map[string]string{}
+	paths, err := filepath.Glob("queries/*.sql")
+	if err != nil || len(paths) == 0 {
+		t.Fatalf("glob queries: %v (%d files)", err, len(paths))
+	}
+	for _, f := range paths {
+		if filepath.Base(f) == "model_providers.sql" {
+			continue
+		}
+		raw, err := os.ReadFile(f) //nolint:gosec // G304: f comes from a Glob over this package's own queries dir, not from input.
+		if err != nil {
+			t.Fatal(err)
+		}
+		other[f] = string(raw)
+	}
+	if got := grantsOutOfFileViolations(productionGoFiles(t), other); len(got) != 0 {
+		t.Fatalf("the grants table is named outside queries/model_providers.sql:\n  %s", strings.Join(got, "\n  "))
+	}
+	got := grantsOutOfFileViolations(
+		map[string]string{"handler/leak.go": `q := "SELECT user_id FROM Model_Provider_Grants"`, "handler/ok.go": "package handler"},
+		map[string]string{"queries/other.sql": "SELECT 1 FROM model_provider_grants;", "queries/fine.sql": "SELECT 1;"})
+	if len(got) != 2 || !strings.HasPrefix(got[0], "handler/leak.go: ") || !strings.HasPrefix(got[1], "queries/other.sql: ") {
+		t.Fatalf("synthetic offenders: violations = %q, want the two offenders only", got)
 	}
 }

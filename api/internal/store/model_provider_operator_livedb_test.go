@@ -83,7 +83,7 @@ func opHeadDB(t *testing.T, prefix string) (context.Context, string, *pgxpool.Po
 }
 
 // newOperatorProvider creates an organization-funded definition with revision 1, and returns it.
-func newOperatorProvider(ctx context.Context, t *testing.T, q *store.Queries, name string) store.ModelProvider {
+func newOperatorProvider(ctx context.Context, t *testing.T, q *store.Queries, name string) store.InsertSharedOperatorModelProviderRow {
 	t.Helper()
 	p, err := q.InsertSharedOperatorModelProvider(ctx, name)
 	if err != nil {

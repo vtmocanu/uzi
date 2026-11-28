@@ -60,6 +60,11 @@ var (
 	custodyDoUpdateRE  = regexp.MustCompile(`(?is)\bDO\s+UPDATE\s+SET\b(.*)$`)
 	keyRevAssignRE     = regexp.MustCompile(`(?is)\bkey_rev\s*=\s*([^,]+)`)
 	keyRevColumnRE     = regexp.MustCompile(`(?i)\bkey_rev\b`)
+
+	// A recipient grant (PRD #4540 M2) is a pair (provider_id, user_id) and nothing else: it is inserted
+	// or deleted, never updated, so no UPDATE of the grants table and no upsert that updates it.
+	updateGrantsRE = regexp.MustCompile(`(?is)\bUPDATE\s+(?:ONLY\s+)?model_provider_grants\b`)
+	grantsUpsertRE = regexp.MustCompile(`(?is)\bINSERT\s+INTO\s+model_provider_grants\b.*?\bDO\s+UPDATE\b`)
 )
 
 const custodyKeyRevOnlyValue = "nextval('model_provider_operator_key_rev_seq')"
@@ -82,6 +87,12 @@ func providerImmutabilityViolations(sqlText string) []string {
 	var out []string
 	for _, stmt := range strings.Split(sqlLineComment.ReplaceAllString(sqlText, ""), ";") {
 		stmt = strings.Join(strings.Fields(stmt), " ")
+		if updateGrantsRE.MatchString(stmt) {
+			out = append(out, "UPDATE model_provider_grants (a grant's provider_id and user_id are never reassigned): "+stmt)
+		}
+		if grantsUpsertRE.MatchString(stmt) {
+			out = append(out, "upsert model_provider_grants DO UPDATE (a grant's provider_id and user_id are never reassigned): "+stmt)
+		}
 		if updateRevisionsRE.MatchString(stmt) {
 			out = append(out, "UPDATE model_provider_revisions: "+stmt)
 		}
@@ -139,6 +150,10 @@ func TestNoModelProviderRevisionOrKeyAssociationUpdate(t *testing.T) {
 		"UPDATE model_provider_operator_keys SET key_rev = nextval('some_other_seq') WHERE provider_id = $1;",
 		"INSERT INTO model_provider_operator_keys (provider_id, ciphertext, set_by, key_rev) VALUES ($1, $2, $3, 1);",
 		"INSERT INTO model_provider_operator_keys (provider_id, ciphertext, set_by) VALUES ($1, $2, $3) ON CONFLICT (provider_id) DO UPDATE SET key_rev = EXCLUDED.key_rev;",
+		// A grant's pair is never reassigned (PRD #4540 M2).
+		"UPDATE model_provider_grants SET user_id = $1 WHERE provider_id = $2;",
+		"UPDATE model_provider_grants g SET provider_id = $1 WHERE g.user_id = $2;",
+		"INSERT INTO model_provider_grants (provider_id, user_id) VALUES ($1, $2) ON CONFLICT (provider_id, user_id) DO UPDATE SET user_id = EXCLUDED.user_id;",
 	}
 	for _, c := range canaries {
 		if len(providerImmutabilityViolations(c)) == 0 {
@@ -161,7 +176,8 @@ func TestNoModelProviderRevisionOrKeyAssociationUpdate(t *testing.T) {
 	if v := providerImmutabilityViolations(custodyClean); len(v) != 0 {
 		t.Fatalf("the scanner flagged a shipped custody statement: %v", v)
 	}
-	clean := "UPDATE user_secrets SET label = $1 WHERE user_id = $2 AND provider_id IS NULL RETURNING id;\n-- UPDATE model_provider_revisions SET x = 1;\n" +
+	clean := "INSERT INTO model_provider_grants (provider_id, user_id) VALUES ($1, $2) ON CONFLICT DO NOTHING;\nDELETE FROM model_provider_grants WHERE provider_id = $1;\n" +
+		"UPDATE user_secrets SET label = $1 WHERE user_id = $2 AND provider_id IS NULL RETURNING id;\n-- UPDATE model_provider_revisions SET x = 1;\n" +
 		"UPDATE users u SET claude_provider_id = $1, claude_provider_scope_id = (SELECT sp.scope_owner_id FROM model_providers sp WHERE sp.id = $1) WHERE u.id = $2 AND u.id = $3;"
 	if v := providerImmutabilityViolations(clean); len(v) != 0 {
 		t.Fatalf("the scanner flagged a clean statement: %v", v)
