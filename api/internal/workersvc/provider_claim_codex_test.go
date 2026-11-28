@@ -19,7 +19,7 @@ import (
 // box or vault, any context/credential access panics; no payload can authorize spend.
 func TestCodexProviderUnsupportedActualClaimBeforeReads(t *testing.T) {
 	// The Codex judge is a supported lane since PRD #4574 M1; this worker lacks
-	// codex_provider_judge_v1, so it is refused by the capability backstop, not by its kind.
+	// codex_provider_judge_v1 / codex_provider_checker_v1, so it is refused by the capability backstop, not by its kind.
 	for _, kind := range []string{runkind.Judge, runkind.Job, runkind.CrossCheck, runkind.Chat} {
 		t.Run(kind, func(t *testing.T) {
 			run := providerBoundRow(kind)

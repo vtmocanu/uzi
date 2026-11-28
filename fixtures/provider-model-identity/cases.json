@@ -1,0 +1,114 @@
+[
+  {
+    "name": "claude alias present",
+    "engine": "claude",
+    "map": {"haiku": {"model": "gw-haiku"}, "opus": {"model": "gw-opus"}, "sonnet": {"model": "gw-sonnet"}},
+    "requested": "opus",
+    "explicit": false,
+    "resolved": "gw-opus"
+  },
+  {
+    "name": "claude alias absent",
+    "engine": "claude",
+    "map": {"haiku": {"model": "gw-haiku"}, "sonnet": {"model": "gw-sonnet"}},
+    "requested": "opus",
+    "explicit": false,
+    "resolved": null
+  },
+  {
+    "name": "claude target value maps to itself",
+    "engine": "claude",
+    "map": {"haiku": {"model": "gw-haiku"}, "opus": {"model": "gw-opus"}, "sonnet": {"model": "gw-sonnet"}},
+    "requested": "gw-opus",
+    "explicit": false,
+    "resolved": "gw-opus"
+  },
+  {
+    "name": "claude non-alias value matching no target",
+    "engine": "claude",
+    "map": {"haiku": {"model": "gw-haiku"}, "opus": {"model": "gw-opus"}, "sonnet": {"model": "gw-sonnet"}},
+    "requested": "claude-3-unknown",
+    "explicit": false,
+    "resolved": null
+  },
+  {
+    "name": "claude blank goes through sonnet",
+    "engine": "claude",
+    "map": {"haiku": {"model": "gw-haiku"}, "opus": {"model": "gw-opus"}, "sonnet": {"model": "gw-sonnet"}},
+    "requested": "",
+    "explicit": false,
+    "resolved": "gw-sonnet"
+  },
+  {
+    "name": "claude inherit goes through sonnet",
+    "engine": "claude",
+    "map": {"haiku": {"model": "gw-haiku"}, "opus": {"model": "gw-opus"}, "sonnet": {"model": "gw-sonnet"}},
+    "requested": "inherit",
+    "explicit": false,
+    "resolved": "gw-sonnet"
+  },
+  {
+    "name": "claude whitespace-only goes through sonnet",
+    "engine": "claude",
+    "map": {"haiku": {"model": "gw-haiku"}, "opus": {"model": "gw-opus"}, "sonnet": {"model": "gw-sonnet"}},
+    "requested": "  ",
+    "explicit": false,
+    "resolved": "gw-sonnet"
+  },
+  {
+    "name": "codex key with a differing target",
+    "engine": "codex",
+    "map": {"default": {"model": "gw-default"}, "gpt-6-sol": {"model": "gw-sol"}},
+    "requested": "gpt-6-sol",
+    "explicit": true,
+    "resolved": "gw-sol"
+  },
+  {
+    "name": "codex key absent and not explicit gives default",
+    "engine": "codex",
+    "map": {"default": {"model": "gw-default"}, "gpt-6-sol": {"model": "gw-sol"}},
+    "requested": "gpt-6-luna",
+    "explicit": false,
+    "resolved": "gw-default"
+  },
+  {
+    "name": "codex key absent and explicit is unresolved",
+    "engine": "codex",
+    "map": {"default": {"model": "gw-default"}, "gpt-6-sol": {"model": "gw-sol"}},
+    "requested": "gpt-6-luna",
+    "explicit": true,
+    "resolved": null
+  },
+  {
+    "name": "codex blank gives default",
+    "engine": "codex",
+    "map": {"default": {"model": "gw-default"}, "gpt-6-sol": {"model": "gw-sol"}},
+    "requested": "",
+    "explicit": false,
+    "resolved": "gw-default"
+  },
+  {
+    "name": "codex explicit blank is unresolved",
+    "engine": "codex",
+    "map": {"default": {"model": "gw-default"}, "gpt-6-sol": {"model": "gw-sol"}},
+    "requested": "",
+    "explicit": true,
+    "resolved": null
+  },
+  {
+    "name": "codex requested default literal without explicit",
+    "engine": "codex",
+    "map": {"default": {"model": "gw-default"}, "gpt-6-sol": {"model": "gw-sol"}},
+    "requested": "default",
+    "explicit": false,
+    "resolved": "gw-default"
+  },
+  {
+    "name": "codex requested default literal with explicit",
+    "engine": "codex",
+    "map": {"default": {"model": "gw-default"}, "gpt-6-sol": {"model": "gw-sol"}},
+    "requested": "default",
+    "explicit": true,
+    "resolved": "gw-default"
+  }
+]

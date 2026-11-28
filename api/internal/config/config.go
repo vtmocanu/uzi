@@ -864,6 +864,13 @@ type Config struct {
 	// to boot rather than silently running with a different lease.
 	EphemeralLease time.Duration
 
+	// HistoryRetention (UZI_HISTORY_RETENTION, issue #4695) is the opt-in age after which the
+	// history_retention sweeper pass deletes recorded history (pr_history_events except
+	// first_merge rows, and the usage and capacity sample tables). 0 (the default) is off; any
+	// other value must be at least MinHistoryRetention. Load refuses a malformed, negative or
+	// too-short value so the api never boots with a retention the operator did not mean.
+	HistoryRetention time.Duration
+
 	// Durable-recovery archive limits (PRD #1296 M2, D4/D6). Every knob is
 	// operator-configurable via env with the PRD default; byte ceilings are int64 so
 	// a 4 GiB instance quota is representable on every platform. They bound the
@@ -1578,6 +1585,11 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg.EphemeralLease = lease
+	historyRetention, err := parseHistoryRetention(os.Getenv("UZI_HISTORY_RETENTION"))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.HistoryRetention = historyRetention
 	// The default size must be a preset the controller can resolve — an unknown value
 	// would provision a worker that never renders and sits pending until its token
 	// expires (workersize's own doc). Reject a bad value at load rather than at use, and
@@ -2603,6 +2615,33 @@ func parseEphemeralLease(raw string) (time.Duration, error) {
 	}
 	if d > MaxEphemeralLease {
 		return 0, fmt.Errorf("UZI_EPHEMERAL_LEASE: %q exceeds the maximum of %s", raw, MaxEphemeralLease)
+	}
+	return d, nil
+}
+
+// MinHistoryRetention is the shortest UZI_HISTORY_RETENTION Load accepts besides 0 (off).
+const MinHistoryRetention = 24 * time.Hour
+
+// parseHistoryRetention is the strict parser of UZI_HISTORY_RETENTION: unset, empty or a zero
+// duration is off (0); anything malformed, negative or shorter than MinHistoryRetention is an
+// error naming the key. There is no maximum.
+func parseHistoryRetention(raw string) (time.Duration, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("UZI_HISTORY_RETENTION: %q is not a valid duration (use e.g. 720h, or 0 to disable): %w", raw, err)
+	}
+	if d == 0 {
+		return 0, nil
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("UZI_HISTORY_RETENTION: %q is negative (use 0 to disable)", raw)
+	}
+	if d < MinHistoryRetention {
+		return 0, fmt.Errorf("UZI_HISTORY_RETENTION: %q is shorter than the minimum of %s (use 0 to disable)", raw, MinHistoryRetention)
 	}
 	return d, nil
 }

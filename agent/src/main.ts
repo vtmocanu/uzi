@@ -1015,6 +1015,8 @@ async function mainBody(): Promise<void> {
     // PRD #2460: the Claude checker's path guard denies the same worker-credential set as the other
     // read-only Claude lanes. Under UZI_EXECUTOR=stub its model call is a canned APPROVE (no network).
     secretPaths: [...SECRET_PATH_PREFIXES, ...workerSecretDenyPaths(config.workerTokenFile)],
+    // Issue #4574 M2: the private-CA bundle a provider-bound Codex checker's launch carries (as advice does).
+    codexExtraCa: config.codexExtraCa,
     ...(config.executor === "stub" ? { claudeQueryFn: stubClaudeCrossCheckQueryFn } : {}),
   });
 

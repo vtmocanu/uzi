@@ -148,8 +148,8 @@ func TestCodexProviderPlacementMatrixLiveDB(t *testing.T) {
 func TestCodexProviderPlacementRollbackLiveDB(t *testing.T) {
 	ctx, dsn := standIsolatedDB(t, "codex_placement_")
 	// The fixtures need the head schema (model_providers columns added after 00523), so the database
-	// is migrated to the head; the test then steps the placement function back: the 00545 Down
-	// lands on 00544's definition, the 00544 Down on 00534's, then the 00523 Down lands on 00521's
+	// is migrated to the head; the test then steps the placement function back: the checker Down
+	// lands on 00545's definition, the 00545 Down on 00544's, the 00544 Down on 00534's, then the 00523 Down lands on 00521's
 	// definition (00534's own Down is not exercised here).
 	if err := store.Migrate(ctx, dsn); err != nil {
 		t.Fatal(err)
@@ -175,10 +175,30 @@ func TestCodexProviderPlacementRollbackLiveDB(t *testing.T) {
 	if err := tx.QueryRow(ctx, definition).Scan(&head); err != nil {
 		t.Fatal(err)
 	}
-	// runEnvHead is the 00544 definition: the head minus 00545's Codex judge clause.
+	// judgeHead is the 00545 definition: the head minus the Codex checker clause (looked up by name, so
+	// a renumber on landing does not break the test).
+	const codexCheckerClause = " AND (r.kind <> 'cross_check' OR 'codex_provider_checker_v1' = ANY(w.protocol_capabilities))"
+	judgeHead := strings.Replace(head, codexCheckerClause, "", 1)
+	if judgeHead == head {
+		t.Fatal("head definition carries no codex_provider_checker_v1 clause")
+	}
+	checkerMigration := migrationFileBySuffix(t, "_placement_codex_provider_checker_capability.sql")
+	for _, stmt := range migrationDownStatements(t, checkerMigration) {
+		if _, err := tx.Exec(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var afterCheckerDown string
+	if err := tx.QueryRow(ctx, definition).Scan(&afterCheckerDown); err != nil {
+		t.Fatal(err)
+	}
+	if afterCheckerDown != judgeHead {
+		t.Fatal("checker Down did not restore exactly the 00545 definition")
+	}
+	// runEnvHead is the 00544 definition: the 00545 definition minus its Codex judge clause.
 	const codexJudgeClause = " AND (r.kind <> 'judge' OR 'codex_provider_judge_v1' = ANY(w.protocol_capabilities))"
-	runEnvHead := strings.Replace(head, codexJudgeClause, "", 1)
-	if runEnvHead == head {
+	runEnvHead := strings.Replace(judgeHead, codexJudgeClause, "", 1)
+	if runEnvHead == judgeHead {
 		t.Fatal("head definition carries no codex_provider_judge_v1 clause")
 	}
 	for _, stmt := range migrationDownStatements(t, "00545_placement_codex_provider_judge_capability.sql") {
@@ -315,8 +335,19 @@ func TestCodexProviderPlacementRollbackLiveDB(t *testing.T) {
 	if err := tx.QueryRow(ctx, definition).Scan(&restored); err != nil {
 		t.Fatal(err)
 	}
+	if restored != judgeHead {
+		t.Fatal("00545 Up did not restore the exact 00545 definition")
+	}
+	for _, stmt := range migrationUpStatements(t, checkerMigration) {
+		if _, err := tx.Exec(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tx.QueryRow(ctx, definition).Scan(&restored); err != nil {
+		t.Fatal(err)
+	}
 	if restored != head {
-		t.Fatal("00545 Up did not restore the exact live head definition")
+		t.Fatal("checker Up did not restore the exact live head definition")
 	}
 }
 
@@ -336,4 +367,27 @@ func stripRunEnvBlock(def string) (string, bool) {
 		out = append(out, line)
 	}
 	return strings.Join(out, "\n"), changed
+}
+
+// migrationFileBySuffix returns the one migration file whose name ends in suffix, so a test follows
+// the migration across a renumber.
+func migrationFileBySuffix(t *testing.T, suffix string) string {
+	t.Helper()
+	entries, err := os.ReadDir("migrations")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := ""
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), suffix) {
+			if found != "" {
+				t.Fatalf("two migrations end in %s", suffix)
+			}
+			found = e.Name()
+		}
+	}
+	if found == "" {
+		t.Fatalf("no migration ends in %s", suffix)
+	}
+	return found
 }

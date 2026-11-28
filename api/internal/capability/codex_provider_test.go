@@ -17,3 +17,16 @@ func TestCodexProviderProtocolVocabulary(t *testing.T) {
 		t.Fatal("provider protocol leaked into scheduler vocabulary")
 	}
 }
+
+func TestCodexProviderCheckerProtocolVocabulary(t *testing.T) {
+	if CodexProviderCheckerV1 != "codex_provider_checker_v1" {
+		t.Fatal("wire name drift")
+	}
+	got := FilterProtocol([]string{CodexProviderCheckerV1, CodexProviderJudgeV1, CodexProviderCheckerV1})
+	if !reflect.DeepEqual(got, []string{CodexProviderJudgeV1, CodexProviderCheckerV1}) {
+		t.Fatalf("protocol order = %v", got)
+	}
+	if len(Filter([]string{CodexProviderCheckerV1})) != 0 || len(SelfReportable([]string{CodexProviderCheckerV1})) != 0 {
+		t.Fatal("checker protocol leaked into scheduler vocabulary")
+	}
+}

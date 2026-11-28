@@ -167,3 +167,33 @@ func TestHealthClaudeCheckerChildCodexLeadCapability(t *testing.T) {
 		})
 	}
 }
+
+// PRD #4574 M2: a Codex child may hold its Codex credential as a provider binding instead of the
+// vendor Codex block, but exactly one of the two, never with an Anthropic token, and never a
+// provider binding of the other engine.
+func TestSingleFamilyCheckerCustodyCodexProvider(t *testing.T) {
+	codex := &ClaimCodexSecrets{Capability: "cap"}
+	for _, tc := range []struct {
+		name      string
+		anthropic string
+		codex     *ClaimCodexSecrets
+		provider  *ClaimProviderBinding
+		want      bool
+	}{
+		{"codex block only", "", codex, nil, true},
+		{"codex-engine provider only", "", nil, &ClaimProviderBinding{Engine: "codex"}, true},
+		{"both blocks", "", codex, &ClaimProviderBinding{Engine: "codex"}, false},
+		{"neither", "", nil, nil, false},
+		{"claude-engine provider only", "", nil, &ClaimProviderBinding{Engine: "claude"}, false},
+		{"claude-engine provider beside the codex block", "", codex, &ClaimProviderBinding{Engine: "claude"}, false},
+		{"codex-engine provider with an Anthropic token", "tok", nil, &ClaimProviderBinding{Engine: "codex"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := &ClaimPayload{}
+			payload.Secrets.AnthropicOAuthToken, payload.Secrets.Codex, payload.Secrets.Provider = tc.anthropic, tc.codex, tc.provider
+			if got := singleFamilyCheckerCustody("codex", payload); got != tc.want {
+				t.Fatalf("singleFamilyCheckerCustody(codex, %s) = %v, want %v", tc.name, got, tc.want)
+			}
+		})
+	}
+}

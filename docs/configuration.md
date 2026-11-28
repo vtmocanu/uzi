@@ -307,6 +307,14 @@ wake and the old-image reap of an ephemeral worker. Consequences to plan for:
   workers that run the Codex harness. Without one the judge stays queued and health reads "no worker that
   supports Codex provider judges (codex_provider_judge_v1) is online"; the same gates (claim, placement, wake, reap) and rollout notes apply, and
   [A Codex judge on a model provider](./judge.md#a-codex-judge-on-a-model-provider) covers the rolling-deploy caveat.
+- **Codex provider cross-check checkers (#4574).** A plan or code cross-check whose Codex checker runs on the
+  owner's Codex source needs the worker capability `codex_provider_checker_v1` on top of the Codex provider
+  capabilities, advertised by workers that run the Codex harness with cross-check slots. It gates claim and
+  placement (migration 00554 replaces `fn_placement_admitting_workers`).
+  Roll the api first: an older worker lacks the capability, so at the code stage (where the checker runs on
+  the lead's worker) the check fails fast as `checker_unavailable`, and at the plan stage the checker waits up
+  to its deadline for a capable worker, then the plan takes the human gate. Workers rolled first leave the
+  capability unused. See [Cross-check on a Codex provider](./providers.md#cross-check-on-a-codex-provider).
 - **Weekly reserve exempt.** Provider-bound runs, provider judges included, are exempt from the vendor
   [weekly usage reserve](./rate-limits.md#weekly-usage-reserve): it protects vendor allowances only, and
   these runs spend their own gateway key. A run explicitly bound to a vendor credential stays subject to it.
@@ -456,7 +464,7 @@ Matching is exact and case-sensitive after trimming whitespace from the config v
 
 ## Cross-check settings
 
-**Plan cross-check** is a per-user opt-in under **Settings → Run defaults → Cross-check**, not a deployment environment variable. Enabling it requires usable credentials for both Claude and Codex. The requirement is copied onto each new eligible auto-approved run (a run that is not auto-approved snapshots the check-before-review mode instead, below), so toggling the setting does not change a run already created. A Claude lead's plan is checked on Codex and a Codex lead's on Claude, never the same family; round-capable workers automatically revise eligible REVISE outcomes within the server-counted budget. Exhaustion, BLOCK, timeout and other check failures retain the human fallback, with terminal exceptions for irrecoverable delivery losses. A Codex lead needs a worker advertising `cross_check_codex_lead_v1`, and a Claude checker child requires it too; without it the lead parks for a human. A Claude checker whose credential is unavailable or disabled, or whose automatic pool is empty, at claim time fails `checker_unavailable` and the lead parks for a human. See [Cross-check](./cross-check.md) for coverage and evidence display.
+**Plan cross-check** is a per-user opt-in under **Settings → Run defaults → Cross-check**, not a deployment environment variable. Enabling it requires a usable credential for each of Claude and Codex; a selected, usable [model provider](./providers.md#cross-check-on-a-codex-provider) source counts for its engine, and a selected but unusable one refuses it even with that engine's vendor credential. The requirement is copied onto each new eligible auto-approved run (a run that is not auto-approved snapshots the check-before-review mode instead, below), so toggling the setting does not change a run already created. A Claude lead's plan is checked on Codex and a Codex lead's on Claude, never the same family; round-capable workers automatically revise eligible REVISE outcomes within the server-counted budget. Exhaustion, BLOCK, timeout and other check failures retain the human fallback, with terminal exceptions for irrecoverable delivery losses. A Codex lead needs a worker advertising `cross_check_codex_lead_v1`, and a Claude checker child requires it too; without it the lead parks for a human. A Claude checker whose credential is unavailable or disabled, or whose automatic pool is empty, at claim time fails `checker_unavailable` and the lead parks for a human. A Codex checker on a Codex model provider requires a worker advertising `codex_provider_checker_v1` (with the Codex provider capabilities), and a check where either side is provider-bound also goes through the same-model guard, which can end it `checker_unavailable`; see [Cross-check on a Codex model provider](./cross-check.md#checks-on-a-codex-model-provider). See [Cross-check](./cross-check.md) for coverage and evidence display.
 
 | Var | Default | Notes |
 |---|---|---|
@@ -1301,6 +1309,69 @@ CI-watch artifact inputs reuse sealed job-file storage, the per-owner and instan
 | `DB_STORAGE_CAPACITY_BYTES` | *(unset)* | The database-size budget, in bytes, that the [admin health](admin-health.md#database-storage-signals) `db.size` check measures `pg_database_size(current_database())` against: `warn` at 75%, `danger` at 85%. A positive base-10 integer of at most 1 EiB (1152921504606846976). Unset is ignored; a nonpositive, unparseable or over-the-bound value is ignored with one warning at boot. Either way `db.size` reads `na`. It is a budget you declare, not a measurement of the volume, and excludes WAL; see [Database storage signals](admin-health.md#database-storage-signals) for its blind spots and the recommended infrastructure free-space alert. |
 
 **Helm.** The chart renders `DB_STORAGE_CAPACITY_BYTES` itself from `database.simple.storage.size` (simple mode) or `postgres.cluster.storage.size` (`database.mode: cnpg`), converting the Kubernetes quantity (`8Gi`, `500M`, `8e9`, a plain byte count) to bytes, rounded up. The render fails for an invalid quantity, a nonpositive one, one above 1 EiB, or when `api.config` also sets the key (a duplicate ConfigMap key). With `database.mode: external` the chart cannot know the size: set `api.config.DB_STORAGE_CAPACITY_BYTES` as a quoted string (`DB_STORAGE_CAPACITY_BYTES: "107374182400"`); an unquoted number is parsed by Helm as a float and renders as `1.073741824e+11`, which the api rejects (`db.size` reads `na`, with only a boot warning). In simple mode the PVC comes from a StatefulSet volume claim template, so the rendered capacity is the size at creation; after expanding the PVC by hand follow the steps in the comment above `database.simple.storage.size` in `deploy/chart/values.yaml`. `task render:db-capacity-check` asserts the rendering offline (needs `helm` and `yq`; CI runs it through `task render:openshift-check`). Docker Compose: `docker-compose.yml` does not pass the variable through, so `db.size` reads `na` until you add `DB_STORAGE_CAPACITY_BYTES` to the api service's `environment`, set to the size you want to budget for the `pgdata` volume.
+
+## History retention (issue #4695)
+
+uzi records three kinds of analytics history that nothing deletes by age by default: [PR merge and close history](pr-history.md), [provider usage history](provider-usage-history.md) (Anthropic and Codex) and [worker capacity samples](worker-capacity-samples.md). Age-based expiry is opt-in.
+
+| Var | Default | Notes |
+|---|---|---|
+| `UZI_HISTORY_RETENTION` | *(unset, off)* | A Go duration (`720h`; there is no `d` unit, so 30 days is `720h`). Unset, empty, `0` and `0s` all mean off: nothing is deleted and the pass does no database work. The minimum is `24h`; there is no maximum. A negative, shorter-than-`24h` or malformed value **aborts boot** with an error naming the setting (`parseHistoryRetention` in `api/internal/config/config.go`). uzi suggests no age: choose one that matches how long you need the history. |
+
+**Helm.** There is no first-class chart value. Set it in the freeform `api.config` map, as for the other settings in this file, for example `api.config.UZI_HISTORY_RETENTION: "720h"`.
+
+### What is deleted
+
+The `history_retention` sweeper pass (`api/internal/historyretention/retention.go`) deletes ordinary history older than `statement_timestamp() - UZI_HISTORY_RETENTION`, a cutoff read from the database clock:
+
+| Table | Expiry column | Rows never deleted |
+|---|---|---|
+| `pr_history_events` | `observed_at` | `first_merge` events |
+| `anthropic_usage_samples` | `bucket_start` | none |
+| `codex_usage_samples` | `bucket_start` | none |
+| `worker_capacity_samples` | `bucket_start` | none |
+
+`pr_history_heads` is never touched. The protected records (`pr_history_heads` and `first_merge` events) keep the existing repository cascade, and the owner and repository cascades are unchanged by this setting.
+
+**Deletes are irreversible.** A database backup taken before you enable it is the only recovery.
+
+### Growth, to size an age
+
+Measured on PostgreSQL 17 with synthetic data; they are figures to size from, not predictions for your workload.
+
+- PR history: about 223 B per `pr_history_events` row and about 206 B per `pr_history_heads` row (10,000 PRs, 3 events each). Heads grow by one per PR uzi records (any state); kept `first_merge` events grow by one per merged PR.
+- Anthropic usage: about 22.9 MB per identity-year.
+- Codex usage: about 70 MB per typical identity-year and 224 MB for the largest measured; a less compressible admissible sample takes more still.
+- Worker capacity: about 22 MiB per worker-year (218 B per row).
+
+The per-profile tables are in [provider usage history](provider-usage-history.md#growth) and [worker capacity samples](worker-capacity-samples.md#growth).
+
+### Cost per tick and how a backlog drains
+
+- Each sweeper tick spends at most a 2 s client budget. A cross-replica session advisory try-lock lets a second replica skip the tick.
+- Each tick deletes at most 1000 rows per table, oldest first, and the starting table rotates between ticks.
+- Each batch runs with a 300 ms statement timeout and a 200 ms lock timeout. On a statement timeout the table's batch halves (floor 50 rows) and grows back after a success. After 5 consecutive timeouts on a table, a warning names it.
+- A table whose 50-row batch still exceeds 300 ms makes no progress, and the warning names it.
+- The first enable drains at most 1000 rows per table per tick. With full batches, that outpaces the stated sample workload of about 1000 rows per minute per table only while `SWEEP_INTERVAL` (default `15s`) is under 60 s. That is a theoretical ceiling: actual drain depends on the cadence, the committed batch sizes and failed ticks.
+
+Measured (PostgreSQL 17, 1M-row synthetic fixtures, compressed time; one workload, so indications only): with the shipped indexes there were no statement timeouts in a backlog drain or a churn run on any of the four tables. In a 5-minute real-engine smoke (about 30,000 to 35,000 expired rows per table on the 1M-row fixtures, no writer) the slowest tick took 35 ms and 20,000 rows were deleted per table in 20 ticks. A cold first batch on one table took under 16 ms including open and close (the delete statement under 14 ms); "cold" there means emptied PostgreSQL buffers, not an emptied host cache. PostgreSQL 16 was not measured.
+
+### Indexes and the boot-time build
+
+Migrations 00555 to 00558 add four btree indexes: `pr_history_events (observed_at) WHERE NOT first_merge`, and one on `bucket_start` for each of the three sample tables. They are built with `CREATE INDEX CONCURRENTLY` at boot, one non-transactional migration each, and they are built and maintained **even while retention is off**. The migration comments carry the measurements behind the choice of btree over BRIN.
+
+- **Do not drop them.** Without a valid index each batch sorts every expired row and will likely hit the statement timeout.
+- **The build can be slow.** `CREATE INDEX CONCURRENTLY` waits for transactions that modified the table before each of its two scans, then for every transaction holding an older snapshot, and the four builds run back to back. While one runs it blocks VACUUM and autovacuum on that table, and the index's write-ahead log is shipped to replicas.
+- **The API is down during the build anyway** (the chart's api Deployment uses `Recreate`), so the upgrade is not zero-downtime.
+- **A slow or blocked build can crash-loop the API.** The chart's `startupProbe` allows 300 s (`periodSeconds: 5` times `failureThreshold: 60` in `deploy/chart/values.yaml`); the kubelet kills a pod that is still migrating after that. On large tables, or with long-running database clients, raise `api.startupProbe.failureThreshold` for the upgrade.
+- **Building the index by hand first does not help.** The migration drops and rebuilds a same-named index that no migration recorded.
+- **Recovery** from an interrupted build is to restart the API: the migration is re-run from its `DROP INDEX`.
+- **Exactly one migrating API process per database**, on every deployment path. The migration relies on a single migrator, and two at once can drop each other's build. For the chart that means `api.replicaCount: 1` during the upgrade, which the chart does not enforce; for Docker Compose, one stack per database.
+- **Direct database connection.** The retention pass holds one pinned connection for its session advisory lock, so a direct connection to PostgreSQL is assumed, with no transaction-mode pooler between the API and the database.
+
+### Long-held snapshots slow retention
+
+Long-running or idle-in-transaction sessions, `pg_dump`, and lagging replicas with `hot_standby_feedback` on hold back vacuum and slow every batch, and can make it time out until they end. Retention then resumes by itself.
 
 ## Run-usage history refold (PRD #1079)
 

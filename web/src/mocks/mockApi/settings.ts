@@ -28,7 +28,7 @@ import { daysAgo, mockBuildInfo, MOCK_WEEKLY_WARNING_MARGIN_PTS } from "../data"
 import { hasAnthropicToken, isCodexUsable } from "../../lib/hasToken";
 import { trustedBotsValueError } from "../../lib/trustedReviewBots";
 import { mockVaultMaterial, state } from "../store";
-import { mockClaudeProviderId, mockCodexProviderId } from "./providers";
+import { mockClaudeProviderId, mockCodexProviderId, mockSelectedSourceState } from "./providers";
 import { delay, mockScenario, oidcDemo, requireSession, users } from "./shared";
 import { agentSource, mockAllowedAgentSourceHosts } from "./agentSource";
 import { secrets } from "./secrets";
@@ -1394,6 +1394,26 @@ function validateModelSettingsBody(body: Record<string, unknown>): ModelSettings
   return errors;
 }
 
+// Mirrors the server's BothHarnessesUsable gate on the plan/code cross-check toggles
+// (PRD #4574 M2): each half follows its lane decision. A selected usable provider source makes
+// the engine usable (even with no vendor credential); a selected but unusable source refuses
+// (even when the vendor credential is usable); with no selected source the vendor credential
+// decides. The Codex half is stricter: with no selected Codex source, any selected Claude source
+// (usable or not) refuses regardless of the vendor Codex credential (the server's
+// checkerLaneDecision returns Refused for a Claude source without a Codex source).
+function bothHarnessesUsable(): boolean {
+  const half = (engine: "claude" | "codex", vendorUsable: boolean): boolean => {
+    const source = mockSelectedSourceState(engine);
+    if (source === "none") {
+      if (engine === "codex" && mockSelectedSourceState("claude") !== "none") return false;
+      return vendorUsable;
+    }
+    return source === "usable";
+  };
+  return half("claude", hasAnthropicToken(secrets)) &&
+    half("codex", isCodexUsable(secrets, userSettings.codex_account_mode));
+}
+
 export const settingsApi = {
   vaultStatus: async () => delay(mockVaultStatus(), 40),
   vaultDisable: async (): Promise<VaultDisableResponse> => {
@@ -1949,15 +1969,15 @@ export const settingsApi = {
   // ── Plan cross-check consent (PRD #2149 M1) ─────────────────────────────────
   setCodeCrossCheckEnabled: async (code: boolean) => {
     const u = requireSession();
-    if (code && (!hasAnthropicToken(secrets) || !isCodexUsable(secrets, userSettings.codex_account_mode))) {
-      throw new ApiError(400, "both Claude and Codex credentials must be usable");
+    if (code && !bothHarnessesUsable()) {
+      throw new ApiError(409, "both Claude and Codex credentials must be usable");
     }
     u.code_cross_check_enabled = code;
     return delay({ user: { ...u } }, 200);
   },
   setPlanCrossCheckEnabled: async (plan: boolean) => {
     const u = requireSession();
-    if (plan && (!hasAnthropicToken(secrets) || !isCodexUsable(secrets, userSettings.codex_account_mode))) {
+    if (plan && !bothHarnessesUsable()) {
       throw new ApiError(409, "both Claude and Codex credentials must be usable");
     }
     u.plan_cross_check_enabled = plan;

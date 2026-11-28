@@ -12,6 +12,55 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const getRunLeadConfigForGeneration = `-- name: GetRunLeadConfigForGeneration :one
+SELECT c.run_id, c.claim_generation, c.phase, c.phase_entry, c.seq, c.harness,
+       c.requested_model, c.requested_model_source, c.observed_model, c.observed_model_evidence,
+       c.requested_effort, c.requested_effort_mode, c.requested_effort_source,
+       c.observed_effort, c.observed_effort_evidence, c.truncated, c.reported_at
+  FROM run_lead_configs c
+ WHERE c.run_id = $1::uuid
+   AND c.claim_generation = $2::bigint
+   AND c.phase = $3::text
+ ORDER BY c.seq DESC
+ LIMIT 1
+`
+
+type GetRunLeadConfigForGenerationParams struct {
+	RunID           uuid.UUID `json:"run_id"`
+	ClaimGeneration int64     `json:"claim_generation"`
+	Phase           string    `json:"phase"`
+}
+
+// The highest-seq lead-config row of one run, claim generation and phase (PRD #4574 M2, the
+// same-model guard's lead evidence). Unlike ListLatestRunLeadConfig it never falls back to another
+// generation: a check is judged against the generation it was submitted at. No row yields no rows
+// (pgx.ErrNoRows), which the guard treats as Unresolved. Phase is 'plan' for the plan stage and
+// 'implement' for the code stage.
+func (q *Queries) GetRunLeadConfigForGeneration(ctx context.Context, arg GetRunLeadConfigForGenerationParams) (RunLeadConfig, error) {
+	row := q.db.QueryRow(ctx, getRunLeadConfigForGeneration, arg.RunID, arg.ClaimGeneration, arg.Phase)
+	var i RunLeadConfig
+	err := row.Scan(
+		&i.RunID,
+		&i.ClaimGeneration,
+		&i.Phase,
+		&i.PhaseEntry,
+		&i.Seq,
+		&i.Harness,
+		&i.RequestedModel,
+		&i.RequestedModelSource,
+		&i.ObservedModel,
+		&i.ObservedModelEvidence,
+		&i.RequestedEffort,
+		&i.RequestedEffortMode,
+		&i.RequestedEffortSource,
+		&i.ObservedEffort,
+		&i.ObservedEffortEvidence,
+		&i.Truncated,
+		&i.ReportedAt,
+	)
+	return i, err
+}
+
 const insertRunLeadConfigFenced = `-- name: InsertRunLeadConfigFenced :one
 WITH r AS (
     SELECT id, harness FROM runs

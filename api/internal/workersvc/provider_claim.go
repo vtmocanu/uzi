@@ -298,7 +298,8 @@ func (s *Service) assembleProviderBinding(ctx context.Context, wkr store.Worker,
 // workerSupportsProvider checks only the advertised protocol for the frozen engine.
 // Wake admission and claim assembly share this conjunction without reading credentials. A Claude
 // judge additionally needs claude_provider_judge_v1 (PRD #4322 M1a), a Codex judge
-// codex_provider_judge_v1 (PRD #4574 M1), and a Claude job claude_provider_job_v1 (PRD #4322 M1b),
+// codex_provider_judge_v1 (PRD #4574 M1), a Codex cross-check checker codex_provider_checker_v1
+// (PRD #4574 M2), and a Claude job claude_provider_job_v1 (PRD #4322 M1b),
 // each mirroring the SQL claim clause.
 func workerSupportsProvider(w store.Worker, engine, kind string) bool {
 	switch engine {
@@ -311,7 +312,8 @@ func workerSupportsProvider(w store.Worker, engine, kind string) bool {
 			slices.Contains(w.ProtocolCapabilities, capability.CodexHarnessV1) &&
 			slices.Contains(w.ProtocolCapabilities, capability.CodexRuntimeV2) &&
 			slices.Contains(w.ProtocolCapabilities, capability.CodexRuntimeV3) &&
-			(kind != runkind.Judge || slices.Contains(w.ProtocolCapabilities, capability.CodexProviderJudgeV1))
+			(kind != runkind.Judge || slices.Contains(w.ProtocolCapabilities, capability.CodexProviderJudgeV1)) &&
+			(kind != runkind.CrossCheck || slices.Contains(w.ProtocolCapabilities, capability.CodexProviderCheckerV1))
 	default:
 		return false
 	}

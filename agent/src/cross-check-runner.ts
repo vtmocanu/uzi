@@ -17,7 +17,7 @@ import { CodexCrossCheck, CrossCheckMalformedError, validateCodeVerdict } from "
 import type { SdkQueryFn } from "./sdk-executor.js";
 import { ClaudeCrossCheck } from "./claude-cross-check.js";
 import { SECRET_PATH_PREFIXES } from "./guardrails.js";
-import { selectCodexBinding } from "./codex/select.js";
+import { selectCodexExecutionAuthority } from "./codex/select.js";
 import { CrossCheckCheckerUnavailableError } from "./codex/model-rejection.js";
 import { ChatSteering } from "./steering.js";
 import { makeTerminalOutboxDeps, postTerminalState, isStaleClaimRefusal } from "./terminal-resolve.js";
@@ -61,6 +61,8 @@ interface CrossCheckRunnerOptions {
   batchMs?: number;
   /** Registry of live runs' batcher rearm() hooks, shared with the other runners. */
   rearm?: Map<string, () => void>;
+  /** Validated private-CA bundle (config.codexExtraCa); reaches only a provider-bound Codex checker's launch. */
+  codexExtraCa?: import("./codex/extra-ca.js").ValidatedExtraCa;
 }
 
 /** Report-only plan checker. The child owns its checkout, usage and terminal journal. */
@@ -70,7 +72,7 @@ export class CrossCheckRunner {
   private readonly terminalDeps;
   constructor(private readonly client: WorkerClient, private readonly git: GitCache,
     private readonly log: Logger, private readonly opts: CrossCheckRunnerOptions = {}) {
-    this.model = opts.model ?? new CodexCrossCheck(client, log);
+    this.model = opts.model ?? new CodexCrossCheck(client, log, opts.codexExtraCa ? { codexExtraCa: opts.codexExtraCa } : {});
     this.claudeModel = opts.claudeModel ?? new ClaudeCrossCheck(log, {
       secretPaths: opts.secretPaths ?? SECRET_PATH_PREFIXES,
       ...(opts.claudeQueryFn ? { queryFn: opts.claudeQueryFn } : {}),
@@ -200,6 +202,8 @@ export class CrossCheckRunner {
     const runEnvClaim = runEnvClaimForms(claim.secrets.run_env, claim.secrets.run_env_redact);
     const runEnvForms = runEnvClaim.redaction;
     let runEnvRegistered = false;
+    const providerForms = claim.secrets.provider?.credential ? providerKeyForms(claim.secrets.provider.credential) : [];
+    let providerRegistered = false;
     // Identity until the secrets are known; every verdict body passes through it before it is reported.
     let redactVerdict: <T>(v: T) => T = (v) => v;
     let verdictDelivered = false;
@@ -225,18 +229,25 @@ export class CrossCheckRunner {
       }, ["checker"], this.log, codexOperationAuthorityIdentity(claim.secrets.codex.capability)) : undefined;
     operation?.own();
     try {
+      // Issue #4574 M2: the provider key forms are registered with the logger BEFORE the first awaited
+      // call, so a failure of the initial state report (or anything after it) can never log the key.
+      // Eviction is guarded by providerRegistered; SecretRegistry.remove is reference-counted because
+      // chat and judge register the same forms, so one holder's eviction never un-scrubs another's.
+      for (const s of providerForms) this.log.addSecret(s);
+      providerRegistered = true;
       const ack = await this.client.reportState(runId, { status: "running", claim_generation: claim.claim_generation });
       if (ack?.staleClaim) return;
       // PRD #4416 M2: the lead's secret run variables (run_env_redact, versions the checker may quote)
       // are registered with the logger and the redactors, and evicted in the finally below.
       for (const s of runEnvForms) this.log.addSecret(s);
       runEnvRegistered = true;
-      const secrets = [claim.secrets.forge_pat, claim.secrets.anthropic_oauth_token, ...(claim.secrets.provider?.credential ? providerKeyForms(claim.secrets.provider.credential) : []), claim.secrets.codex?.capability, ...runEnvForms];
+      const secrets = [claim.secrets.forge_pat, claim.secrets.anthropic_oauth_token, ...providerForms, claim.secrets.codex?.capability, ...runEnvForms];
       const scrubVerdictText = makeTextRedactor(secrets);
       redactVerdict = (v) => redactStrings(v, scrubVerdictText);
-      // PRD #4320: the cross-check lane cannot serve a provider until PRD #4322; the server refuses it
-      // first, this is the worker's second layer. Reported as an unavailable checker, never run.
-      if (claim.secrets.provider) throw new Error(PROVIDER_LANE_UNSUPPORTED);
+      // PRD #4320: a Claude-engine provider binding cannot serve the cross-check lane; the server refuses
+      // it first, this is the worker's second layer. Reported as an unavailable checker, never run. A
+      // Codex-engine binding (issue #4574 M2) is routed through selectCodexExecutionAuthority below.
+      if (claim.secrets.provider && claim.secrets.provider.engine !== "codex") throw new Error(PROVIDER_LANE_UNSUPPORTED);
       // An over-budget claim registered its raw values above and never runs: reported as an unavailable checker.
       if (runEnvClaim.overBudget) throw new Error(RUN_ENV_FORMS_OVER_BUDGET);
       const b = new MessageBatcher(this.client, runId, claim.last_seq ?? 0, this.opts.batchMs ?? 500, this.log,
@@ -254,7 +265,7 @@ export class CrossCheckRunner {
       const candidate = decodeCrossCheckClaim(claim.cross_check);
       // Single-family custody: a Codex checker holds only a Codex credential, a Claude checker only
       // the Anthropic token (PRD #2460); a claim carrying both, or neither, is invalid.
-      const family = selectCodexBinding(claim.secrets).kind;
+      const family = selectCodexExecutionAuthority(claim.secrets).kind;
       const hasAnthropic = Boolean(claim.secrets.anthropic_oauth_token);
       const checker = family === "codex" ? (hasAnthropic ? undefined : this.model)
         : hasAnthropic ? this.claudeModel : undefined;
@@ -488,6 +499,7 @@ export class CrossCheckRunner {
         }
       }
       if (runEnvRegistered) for (const s of runEnvForms) this.log.removeSecret(s);
+      if (providerRegistered) for (const s of providerForms) this.log.removeSecret(s);
       operation?.close();
       this.opts.activeRuns?.remove(runId);
     }
