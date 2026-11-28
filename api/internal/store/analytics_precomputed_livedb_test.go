@@ -160,9 +160,26 @@ func apWait(t *testing.T, ch <-chan error, what string) error {
 	}
 }
 
-func apAsync(fn func() error) <-chan error {
+// apGo runs fn on its own goroutine and registers a cleanup that calls cancel (which must cancel
+// the context fn uses, and release any hook fn blocks in) and then waits for fn to return. Cleanups
+// run in reverse order, so register the cleanup of every connection, transaction or session fn uses
+// before calling apGo: a test that fails mid-way then never releases a resource a worker still holds.
+func apGo(t *testing.T, cancel context.CancelFunc, fn func() error) <-chan error {
+	t.Helper()
 	ch := make(chan error, 1)
-	go func() { ch <- fn() }()
+	exited := make(chan struct{})
+	go func() {
+		defer close(exited)
+		ch <- fn()
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-exited:
+		case <-time.After(15 * time.Second):
+			t.Errorf("background worker did not exit after cancellation")
+		}
+	})
 	return ch
 }
 
@@ -220,11 +237,22 @@ func TestAnalyticsPrecomputeAtomicReplaceLiveDB(t *testing.T) {
 	if err := s.RunBuild(e.ctx, func(_ context.Context, _ *AnalyticsSnapshot, c int64) error { counter = c; return nil }); err != nil {
 		t.Fatal(err)
 	}
+	ctx, cancel := context.WithCancel(e.ctx)
 	paused, resume := make(chan string, 16), make(chan struct{})
-	pause := func(label string) { paused <- label; <-resume }
+	pause := func(label string) {
+		select {
+		case paused <- label:
+		case <-ctx.Done():
+			return
+		}
+		select {
+		case <-resume:
+		case <-ctx.Done():
+		}
+	}
 	s.hooks.afterPublishDelete = func() { pause("delete") }
 	s.hooks.afterPublishInsert = func(i int) { pause("insert") }
-	done := apAsync(func() error { return s.Publish(e.ctx, apSection, counter, atB, setB) })
+	done := apGo(t, cancel, func() error { return s.Publish(ctx, apSection, counter, atB, setB) })
 
 	for i := 0; i < 1+len(setB); i++ {
 		select {
@@ -646,14 +674,20 @@ func TestAnalyticsPrecomputeReadCommittedInterleaveLiveDB(t *testing.T) {
 	if err := s.RunBuild(e.ctx, func(_ context.Context, _ *AnalyticsSnapshot, c int64) error { counter = c; return nil }); err != nil {
 		t.Fatal(err)
 	}
+	pubCtx, pubCancel := context.WithCancel(e.ctx)
 	paused, resume := make(chan struct{}, 4), make(chan struct{})
 	s.hooks.afterPublishInsert = func(i int) {
 		if i == 0 {
 			paused <- struct{}{}
-			<-resume
+			select {
+			case <-resume:
+			case <-pubCtx.Done():
+			}
 		}
 	}
-	pub := apAsync(func() error { return s.Publish(e.ctx, apSection, counter, apNow(), apDocs("B", "b", "c")) })
+	pub := apGo(t, pubCancel, func() error {
+		return s.Publish(pubCtx, apSection, counter, apNow(), apDocs("B", "b", "c"))
+	})
 	select {
 	case <-paused:
 	case err := <-pub:
@@ -668,13 +702,14 @@ func TestAnalyticsPrecomputeReadCommittedInterleaveLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer dc.Release()
+	t.Cleanup(dc.Release) // registered before the delete worker, so it runs after the worker exits
 	var delPID int32
 	if err := dc.QueryRow(e.ctx, `SELECT pg_backend_pid()`).Scan(&delPID); err != nil {
 		t.Fatal(err)
 	}
-	del := apAsync(func() error {
-		_, err := dc.Exec(e.ctx, `DELETE FROM repos WHERE id = $1`, repos[0])
+	delCtx, delCancel := context.WithCancel(e.ctx)
+	del := apGo(t, delCancel, func() error {
+		_, err := dc.Exec(delCtx, `DELETE FROM repos WHERE id = $1`, repos[0])
 		return err
 	})
 	e.waitLockWait(t, int64(delPID), pubPID, "the delete commit")
@@ -739,16 +774,18 @@ func TestAnalyticsPrecomputeNoDeadlockLiveDB(t *testing.T) {
 	r1, r2 := repos[0], repos[1]
 	e.publish(t, apNow(), apDocs("A", "a"))
 
+	// The rollbacks are cleanups registered before the workers below, so they run after the
+	// workers have been cancelled and joined (a transaction is used by one goroutine at a time).
 	a, err := e.pool.Begin(e.ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = a.Rollback(context.Background()) }()
+	t.Cleanup(func() { _ = a.Rollback(context.Background()) })
 	b, err := e.pool.Begin(e.ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = b.Rollback(context.Background()) }()
+	t.Cleanup(func() { _ = b.Rollback(context.Background()) })
 
 	var errs []error
 	var mu sync.Mutex
@@ -767,10 +804,12 @@ func TestAnalyticsPrecomputeNoDeadlockLiveDB(t *testing.T) {
 	if _, err := a.Exec(e.ctx, `DELETE FROM repos WHERE id = $1`, r1); err != nil {
 		t.Fatalf("A delete r1: %v", err)
 	}
-	bDel := apAsync(func() error { _, err := b.Exec(e.ctx, `DELETE FROM repos WHERE id = $1`, r2); return err })
+	bCtx, bCancel := context.WithCancel(e.ctx)
+	bDel := apGo(t, bCancel, func() error { _, err := b.Exec(bCtx, `DELETE FROM repos WHERE id = $1`, r2); return err })
 	// B's delete takes only the r2 row lock (its trigger is deferred), so it returns on its own.
 	bDelErr := apWait(t, bDel, "B delete r2")
-	aDel := apAsync(func() error { _, err := a.Exec(e.ctx, `DELETE FROM repos WHERE id = $1`, r2); return err })
+	aCtx, aCancel := context.WithCancel(e.ctx)
+	aDel := apGo(t, aCancel, func() error { _, err := a.Exec(aCtx, `DELETE FROM repos WHERE id = $1`, r2); return err })
 	// Barrier: A is waiting on B's r2 row lock before B commits.
 	e.waitLockWait(t, int64(aPID), int64(bPID), "A delete r2")
 	// B's delete must have returned before B's commit starts (a transaction is used by one
@@ -782,7 +821,8 @@ func TestAnalyticsPrecomputeNoDeadlockLiveDB(t *testing.T) {
 		}
 	}
 	record("B delete r2", bDelErr)
-	bCommit := apAsync(func() error { return b.Commit(e.ctx) })
+	bCommitCtx, bCommitCancel := context.WithCancel(e.ctx)
+	bCommit := apGo(t, bCommitCancel, func() error { return b.Commit(bCommitCtx) })
 	record("B commit", apWait(t, bCommit, "B commit"))
 	record("A delete r2", apWait(t, aDel, "A delete r2"))
 	if err := a.Commit(e.ctx); err != nil {
@@ -1030,11 +1070,25 @@ func TestAnalyticsPrecomputeProcessLossLiveDB(t *testing.T) {
 		setA := apDocs("A", "a", "b")
 		e.publish(t, at, setA)
 		s := e.open(t)
+		faulted := false
 		err := s.RunBuild(e.ctx, func(ctx context.Context, snap *AnalyticsSnapshot, _ int64) error {
-			time.AfterFunc(200*time.Millisecond, func() { killSocket(s) })
+			// Capture the socket now: Close clears s.conn, and the callback must never read it.
+			raw := s.conn.PgConn().Conn()
+			ran := make(chan struct{})
+			timer := time.AfterFunc(200*time.Millisecond, func() {
+				defer close(ran)
+				_ = raw.Close()
+			})
 			_, err := snap.tx.Exec(ctx, `SELECT pg_sleep(30)`)
+			if !timer.Stop() {
+				<-ran // the fault fired: wait for its callback before the session is closed
+				faulted = true
+			}
 			return err
 		})
+		if !faulted {
+			t.Fatalf("the statement ended (%v) before the injected socket fault ran", err)
+		}
 		if err == nil {
 			t.Fatal("RunBuild succeeded on a killed connection")
 		}
