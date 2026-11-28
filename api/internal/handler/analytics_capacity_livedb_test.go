@@ -21,6 +21,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/clitoken"
@@ -60,19 +61,59 @@ func capPrivateDBEnv(t *testing.T) {
 			t.Errorf("drop private database: %v", err)
 		}
 	})
+	owned, err := capHandlerPrivateDSN(dsn, name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verify, err := store.OpenPool(ctx, owned)
+	if err != nil {
+		t.Fatal(err)
+	}
+	verifyErr := capHandlerRequireCurrentDB(ctx, verify, name)
+	verify.Close()
+	if verifyErr != nil {
+		t.Fatal(verifyErr)
+	}
+	t.Setenv("UZI_TEST_DATABASE_URL", owned)
+}
+
+// capHandlerPrivateDSN rewrites dsn to name a database. pgx treats database as an alias of
+// dbname and a query value overrides the URL path, so both keys are dropped from a URL; a keyword
+// DSN gets dbname appended last. The result must parse to exactly name, else an error is returned.
+func capHandlerPrivateDSN(dsn, name string) (string, error) {
 	owned := dsn + " dbname=" + name
 	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
 		u, err := url.Parse(dsn)
 		if err != nil {
-			t.Fatal(err)
+			return "", err
 		}
 		u.Path = "/" + name
 		q := u.Query()
 		q.Del("dbname")
+		q.Del("database")
 		u.RawQuery = q.Encode()
 		owned = u.String()
 	}
-	t.Setenv("UZI_TEST_DATABASE_URL", owned)
+	cfg, err := pgx.ParseConfig(owned)
+	if err != nil {
+		return "", errors.New("private DSN does not parse: " + err.Error())
+	}
+	if cfg.Database != name {
+		return "", errors.New("private DSN resolves to database " + strconv.Quote(cfg.Database) + ", want " + strconv.Quote(name))
+	}
+	return owned, nil
+}
+
+// capHandlerRequireCurrentDB errors unless the pool is connected to the database called name.
+func capHandlerRequireCurrentDB(ctx context.Context, pool *pgxpool.Pool, name string) error {
+	var got string
+	if err := pool.QueryRow(ctx, "SELECT current_database()").Scan(&got); err != nil {
+		return err
+	}
+	if got != name {
+		return errors.New("connected to database " + strconv.Quote(got) + ", want " + strconv.Quote(name))
+	}
+	return nil
 }
 
 // newCapFixture is newAnFixture with the poll intervals the gauges need; private selects a
@@ -1015,5 +1056,60 @@ func TestAnalyticsCapacityAdminVaultContentionLiveDB(t *testing.T) {
 	}
 	if n := waits.Load(); n != 0 {
 		t.Fatalf("lifecycle wait observer count = %d after release, want 0", n)
+	}
+}
+
+func TestCapPrivateDSNIgnoresDatabaseAliases(t *testing.T) {
+	t.Setenv("PGSERVICE", "")
+	t.Setenv("PGSERVICEFILE", "")
+	const name = "caph_private_x"
+	for _, dsn := range []string{
+		"postgres://u@h:5432/shared?dbname=shared",
+		"postgres://u@h:5432/shared?database=shared",
+		"postgres://u@h:5432/shared?%64atabase=shared",
+		"postgres://u@h:5432/shared?dbname=shared&database=shared&sslmode=disable",
+		"host=h dbname=shared",
+		"host=h database=shared",
+	} {
+		out, err := capHandlerPrivateDSN(dsn, name)
+		if err != nil {
+			t.Errorf("capHandlerPrivateDSN(%q): %v", dsn, err)
+			continue
+		}
+		cfg, err := pgx.ParseConfig(out)
+		if err != nil || cfg.Database != name {
+			t.Errorf("capHandlerPrivateDSN(%q) = %q resolves to %q (err %v), want %q", dsn, out, cfg.Database, err, name)
+		}
+	}
+	for _, dsn := range []string{
+		`host=h password=x\`,
+		"postgres://u@h:5432/shared#frag",
+	} {
+		if out, err := capHandlerPrivateDSN(dsn, name); err == nil {
+			t.Errorf("capHandlerPrivateDSN(%q) = %q, want an error", dsn, out)
+		}
+	}
+}
+
+func TestCapPrivateDBRequiresCurrentDBLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via ./e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	if err := capHandlerRequireCurrentDB(ctx, pool, "caph_"+strings.ReplaceAll(uuid.NewString(), "-", "")[:20]); err == nil {
+		t.Fatal("capHandlerRequireCurrentDB accepted a database name the pool is not connected to")
+	}
+	var actual string
+	if err := pool.QueryRow(ctx, "SELECT current_database()").Scan(&actual); err != nil {
+		t.Fatal(err)
+	}
+	if err := capHandlerRequireCurrentDB(ctx, pool, actual); err != nil {
+		t.Fatalf("capHandlerRequireCurrentDB(%q) = %v, want nil", actual, err)
 	}
 }

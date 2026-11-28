@@ -175,9 +175,9 @@ own time bases; see [Quality analytics](quality-analytics.md#response-shape).
   A run with no repo is `no_repo`.
 - On the **admin routes** every repo in the result shows its id and path. With
   `user=<uuid>` that includes a repo the selected user's run references but
-  that is on someone else's connection. The `repo` filter and the repo options
-  stay limited to the selected user's own connections, so an admin can see such
-  a repo but not filter by it.
+  that is on someone else's connection. The `repo` filter stays limited to the
+  selected user's own connections, and the repo options to those of them with a
+  run by that user, so an admin can see such a repo but not filter by it.
 - Which of the two applies comes from the route that was mounted, never from a
   query parameter.
 
@@ -341,16 +341,17 @@ Spend has an [all-time snapshot](#all-time-spend-for-all-users-snapshot)).
 
 ## Options
 
-`/options` returns the repos you can filter by, the users an admin can select
-(admin only), and the allowed windows, kinds, harnesses, splits and breakdowns.
+`/options` returns the repos in the scope that have at least one run (any
+time, any kind), the users an admin can select (admin only), and the allowed windows, kinds, harnesses, splits and breakdowns.
 On the owner route `users` is null with reason `not_applicable`.
 
 - Each list is capped at 200 and ordered by path (repos) or email (users);
-  `truncated` is true when more exist. A valid repo that was cut off is still
-  accepted as a filter.
-- It reads no usage and no history start, so it is cheap.
+  `truncated` is true when more exist. The repo filter accepts any repo the
+  scope can see, including one cut off the list and one with no runs.
+- It reads run existence only (no usage, no history start), and `window` does
+  not narrow the repo list.
 - Admin `user=<uuid>` narrows the repo list to that user's connections and
-  echoes `selected_user`. The Spend and Reliability responses carry the same `selected_user`
+  that user's runs, and echoes `selected_user`. The Spend and Reliability responses carry the same `selected_user`
   (`all` or the user id; the caller's id on the owner route).
 
 ## Capacity

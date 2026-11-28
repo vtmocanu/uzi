@@ -89,6 +89,87 @@ func TestAnalyticsSnapshotStatementTimeoutLiveDB(t *testing.T) {
 	}
 }
 
+// Issue #4780: the options lists hold only repos with a run in scope, at any time and of any kind;
+// witnesses that sort before the bulk repos would sit inside the first 201 rows of the old SQL.
+func TestAnalyticsOwnerRepoOptionsLiveDB(t *testing.T) {
+	ctx, pool := openAnalyticsSnapshotDB(t)
+	tag := uuid.NewString()[:8]
+	owner, other := uuid.New(), uuid.New()
+	ownerConn, otherConn := uuid.New(), uuid.New()
+	for i, u := range []uuid.UUID{owner, other} {
+		analyticsExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+			u, fmt.Sprintf("aorepo-%s-%d@e2e", tag, i))
+	}
+	for _, c := range []struct{ conn, user uuid.UUID }{{ownerConn, owner}, {otherConn, other}} {
+		analyticsExec(ctx, t, pool,
+			`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+			 VALUES ($1, $2, 'gitlab', 'https://forge.e2e', 'bot', 1, $3)`, c.conn, c.user, []byte{0x1})
+	}
+	addRepo := func(conn uuid.UUID, project int, path string) uuid.UUID {
+		id := uuid.New()
+		analyticsExec(ctx, t, pool,
+			`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+			 VALUES ($1, $2, $3, $4, 'https://forge.e2e/x', 'main', true)`, id, conn, project, path)
+		return id
+	}
+	iid := int64(4_780_000)
+	addRun := func(user, repo uuid.UUID) {
+		iid++
+		analyticsExec(ctx, t, pool,
+			`INSERT INTO runs (id, user_id, repo_id, issue_iid, issue_title, issue_description, kind, status, created_at, finished_at, harness)
+			 VALUES ($1, $2, $3, $4, 't', 'd', 'issue', 'completed', now(), now(), 'claude')`, uuid.New(), user, repo, iid)
+	}
+	// Bulk: 202 owner repos, each with an owner run. Witnesses sort first ("0" < "5").
+	wantPaths := make([]string, 0, 202)
+	for i := 1; i <= 202; i++ {
+		path := fmt.Sprintf("r%s5%04d", tag, i)
+		addRun(owner, addRepo(ownerConn, i, path))
+		wantPaths = append(wantPaths, path)
+	}
+	runless := addRepo(ownerConn, 1001, "r"+tag+"0w1-runless")
+	otherOnly := addRepo(ownerConn, 1002, "r"+tag+"0w2-otheronly")
+	addRun(other, otherOnly)
+	foreign := addRepo(otherConn, 1003, "r"+tag+"0w3-foreign")
+	addRun(owner, foreign)
+
+	q := New(pool)
+	rows, err := q.AnalyticsOwnerRepoOptions(ctx, owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(wantPaths)
+	wantPaths = wantPaths[:201]
+	if len(rows) != len(wantPaths) {
+		t.Fatalf("owner options = %d rows, want %d", len(rows), len(wantPaths))
+	}
+	for i, r := range rows {
+		if r.PathWithNamespace != wantPaths[i] {
+			t.Fatalf("row %d path %q, want %q", i, r.PathWithNamespace, wantPaths[i])
+		}
+		if r.ID == runless || r.ID == otherOnly || r.ID == foreign {
+			t.Fatalf("witness repo %s (%s) leaked into owner options", r.ID, r.PathWithNamespace)
+		}
+	}
+
+	// The all-users list lives in the shared database: no exact count, only its contract.
+	all, err := q.AnalyticsAllRepoOptions(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) == 0 || len(all) > 201 || !sort.SliceIsSorted(all, func(i, j int) bool { return all[i].PathWithNamespace < all[j].PathWithNamespace }) {
+		t.Fatalf("all options: %d rows or unsorted", len(all))
+	}
+	for _, r := range all {
+		var ok bool
+		if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM runs WHERE repo_id = $1)`, r.ID).Scan(&ok); err != nil {
+			t.Fatal(err)
+		}
+		if !ok {
+			t.Fatalf("all options returned run-less repo %s (%s)", r.ID, r.PathWithNamespace)
+		}
+	}
+}
+
 func TestAnalyticsOptionsQueriesLiveDB(t *testing.T) {
 	ctx, pool := openAnalyticsSnapshotDB(t)
 	tag := uuid.NewString()[:8]
@@ -114,29 +195,6 @@ func TestAnalyticsOptionsQueriesLiveDB(t *testing.T) {
 		 VALUES ($1, $2, 1, 'r'||$3||'0000foreign', 'https://forge.e2e/x', 'main', true)`, otherRepo, otherConn, tag)
 
 	q := New(pool)
-	rows, err := q.AnalyticsOwnerRepoOptions(ctx, owner)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(rows) != 201 {
-		t.Fatalf("owner options = %d rows, want 201", len(rows))
-	}
-	for i, r := range rows {
-		if want := fmt.Sprintf("r%s%04d", tag, i+1); r.PathWithNamespace != want {
-			t.Fatalf("row %d path %q, want %q", i, r.PathWithNamespace, want)
-		}
-		if r.ID == otherRepo {
-			t.Fatal("other user's repo leaked into owner options")
-		}
-	}
-
-	all, err := q.AnalyticsAllRepoOptions(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(all) != 201 || !sort.SliceIsSorted(all, func(i, j int) bool { return all[i].PathWithNamespace < all[j].PathWithNamespace }) {
-		t.Fatalf("all options: %d rows or unsorted", len(all))
-	}
 	users, err := q.AnalyticsUserOptions(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -173,7 +231,26 @@ func TestAnalyticsOptionsQueriesLiveDB(t *testing.T) {
 	}
 
 	// History start: owner runs in repo 1 and 2, kinds issue/chat/self_improve, harness mixed.
-	repo1, repo2 := rows[0].ID, rows[1].ID
+	var repo1, repo2 uuid.UUID
+	{
+		ids, err := pool.Query(ctx, `SELECT id FROM repos WHERE connection_id = $1 ORDER BY path_with_namespace COLLATE "C", id LIMIT 2`, ownerConn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got []uuid.UUID
+		for ids.Next() {
+			var id uuid.UUID
+			if err := ids.Scan(&id); err != nil {
+				t.Fatal(err)
+			}
+			got = append(got, id)
+		}
+		ids.Close()
+		if err := ids.Err(); err != nil || len(got) != 2 {
+			t.Fatalf("owner repos for history seeds: %d, %v", len(got), err)
+		}
+		repo1, repo2 = got[0], got[1]
+	}
 	base := time.Date(2025, 3, 1, 12, 0, 0, 0, time.UTC)
 	iid := int64(4_684_000)
 	seed := func(u, repo uuid.UUID, kind, harness string, at time.Time) {

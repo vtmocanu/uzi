@@ -13,17 +13,21 @@
 SELECT name::text AS name FROM pg_catalog.pg_timezone_names ORDER BY name COLLATE "C";
 
 -- name: AnalyticsOwnerRepoOptions :many
--- Repos on the caller's connections. LIMIT 201 lets the caller serve 200 and flag truncation.
+-- Repos on the caller's connections that have at least one run by the caller, at any time and of
+-- any kind. LIMIT 201 lets the caller serve 200 and flag truncation.
 SELECT r.id, r.path_with_namespace
 FROM repos r
 JOIN forge_connections c ON c.id = r.connection_id
 WHERE c.user_id = @user_id::uuid
+  AND EXISTS (SELECT 1 FROM runs ru WHERE ru.repo_id = r.id AND ru.user_id = @user_id::uuid)
 ORDER BY r.path_with_namespace COLLATE "C", r.id
 LIMIT 201;
 
 -- name: AnalyticsAllRepoOptions :many
+-- Repos with at least one run, at any time and of any kind. Same LIMIT 201 truncation contract.
 SELECT r.id, r.path_with_namespace
 FROM repos r
+WHERE EXISTS (SELECT 1 FROM runs ru WHERE ru.repo_id = r.id)
 ORDER BY r.path_with_namespace COLLATE "C", r.id
 LIMIT 201;
 

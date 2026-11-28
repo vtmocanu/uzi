@@ -508,6 +508,12 @@ func TestAnalyticsOptionsTruncationLiveDB(t *testing.T) {
 		`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
 		 SELECT gen_random_uuid(), $1, 7000000 + g, $2 || lpad(g::text, 4, '0'), 'https://forge.e2e/x', 'main', true
 		 FROM generate_series(1, 205) g`, conn, prefix)
+	// The options list only repos with a run in scope (#4780), so each repo gets one.
+	var repoIDs []uuid.UUID
+	if err := f.pool.QueryRow(context.Background(), `SELECT array_agg(id) FROM repos WHERE connection_id = $1`, conn).Scan(&repoIDs); err != nil {
+		t.Fatal(err)
+	}
+	anSeedRunsOn(t, f.pool, owner, repoIDs, f.now.Add(-3*time.Hour))
 	var lastID uuid.UUID
 	if err := f.pool.QueryRow(context.Background(), `SELECT id FROM repos WHERE connection_id = $1 AND path_with_namespace = $2`,
 		conn, prefix+"0205").Scan(&lastID); err != nil {
