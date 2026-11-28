@@ -9,7 +9,8 @@ import (
 
 // SetBudgetHookForTest replaces the remaining-budget read of the folder's fullBudget; site is
 // one of "retry", "fold", "foldEach", "kick", "missingQuery". Like SetWaitHookForTest it must
-// be called before any Notify or Pass on f.
+// be called before any Notify or Pass on f. The hook is consulted only when the ctx has a
+// deadline; a ctx without one always counts as having the full budget.
 func SetBudgetHookForTest(f *UsageFolder, fn func(ctx context.Context, site string) time.Duration) {
 	f.budgetHook = func(ctx context.Context, site budgetSite) time.Duration { return fn(ctx, string(site)) }
 }

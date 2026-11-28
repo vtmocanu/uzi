@@ -202,7 +202,8 @@ func (f *UsageFolder) materialize(ctx context.Context, ids []uuid.UUID, site bud
 }
 
 // materializerBusyError means ctx ended while the call was still waiting for the folder-wide
-// semaphore (a kick held it): the run itself was never attempted, so it must not be skipped.
+// semaphore (a kick held it), or was already done on entry: the run itself was never attempted,
+// so it must not be skipped.
 type materializerBusyError struct{ err error }
 
 func (e *materializerBusyError) Error() string {

@@ -1140,3 +1140,83 @@ func TestUsageFolderLateMaterializerSlotNotSkippedLiveDB(t *testing.T) {
 	}
 	e.wantFresh(t, "retried late run", x)
 }
+
+// cancelOnRollbackDB cancels a context when the n-th read transaction it began ends, which is
+// after that lane's query returned its rows and before the lane folds them.
+type cancelOnRollbackDB struct {
+	store.UsageFolderDB
+	cancel   context.CancelFunc
+	cancelAt int32
+	rollback atomic.Int32
+}
+
+type cancelOnRollbackTx struct {
+	pgx.Tx
+	db *cancelOnRollbackDB
+}
+
+func (d *cancelOnRollbackDB) BeginTx(ctx context.Context, o pgx.TxOptions) (pgx.Tx, error) {
+	tx, err := d.UsageFolderDB.BeginTx(ctx, o)
+	if err != nil {
+		return nil, err
+	}
+	return &cancelOnRollbackTx{Tx: tx, db: d}, nil
+}
+
+func (t *cancelOnRollbackTx) Rollback(ctx context.Context) error {
+	err := t.Tx.Rollback(ctx)
+	if t.db.rollback.Add(1) == t.db.cancelAt {
+		t.db.cancel()
+	}
+	return err
+}
+
+// A ctx that is already done when the fold reaches the materializer must not take the free
+// semaphore: the run was never attempted, so it is queued for the next tick, not skipped.
+func TestUsageFolderCancelledBeforeAcquireQueuesNotSkipsLiveDB(t *testing.T) {
+	e := newFolderEnv(t)
+	x := e.pinnedMissingRuns(t, 1)[0]
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	defer cancel1()
+	// Tick 1 runs the stale lane (its read transaction ends first), then the missing lane.
+	db := &cancelOnRollbackDB{UsageFolderDB: e.pool, cancel: cancel1, cancelAt: 2}
+	frozen := time.Now()
+	var mu sync.Mutex
+	var calls []uuid.UUID
+	f := store.NewUsageFolder(db, store.UsageFolderOptions{
+		ParentTimeout: 60 * time.Second,
+		LaneTimeout:   30 * time.Second,
+		LaneLimit:     1,
+		Now:           func() time.Time { return frozen },
+		Materialize: func(ctx context.Context, ids []uuid.UUID) (int64, error) {
+			mu.Lock()
+			calls = append(calls, ids...)
+			mu.Unlock()
+			if err := ctx.Err(); err != nil {
+				return 0, err
+			}
+			return e.realMaterialize(ctx, ids)
+		},
+	})
+
+	if _, err := f.Pass(ctx1); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Pass 1: got %v, want context cancellation", err)
+	}
+	mu.Lock()
+	if containsID(calls, x) {
+		t.Errorf("the materializer was called for %s with a cancelled ctx: %v", x, calls)
+	}
+	mu.Unlock()
+	if containsID(f.SkippedForTest(), x) {
+		t.Errorf("run %s was skipped for the TTL", x)
+	}
+	if !containsID(f.RetryMissingForTest(), x) {
+		t.Errorf("run %s is not queued for retry: %v", x, f.RetryMissingForTest())
+	}
+
+	if _, err := f.Pass(context.Background()); err != nil {
+		t.Fatalf("Pass 2: %v", err)
+	}
+	e.wantFresh(t, "retried run", x)
+}
