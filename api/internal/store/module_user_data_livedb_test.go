@@ -15,7 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Issue #4784: live-DB coverage for module_user_data (migration 00551). Run via
+// Issue #4784: live-DB coverage for module_user_data (migration 00560). Run via
 // e2e/run-store-it.sh. Hooks are process globals, so none of these tests run in
 // parallel.
 
