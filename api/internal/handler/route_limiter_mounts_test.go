@@ -66,7 +66,7 @@ var limiterNames = [...]string{
 	limOAuth,
 }
 
-// The limiter names, as constants so a typo in the 389-row table below is a compile
+// The limiter names, as constants so a typo in the 483-row table below is a compile
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
@@ -561,6 +561,11 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/me/secrets/", noLimiter},
 	{"GET", "/api/me/secrets/{kind}/{id}/dependents", noLimiter},
 	{"GET", "/api/me/settings/", noLimiter},
+	// Issue #4784: per-user module documents, cookie-only local DB reads and writes, no
+	// forge call and no spend -> noLimiter.
+	{"GET", "/api/modules/{module_id}/user-data/", noLimiter},
+	{"PUT", "/api/modules/{module_id}/user-data/", noLimiter},
+	{"DELETE", "/api/modules/{module_id}/user-data/", noLimiter},
 	{"GET", "/api/me/slack/", noLimiter},
 	// PRD #1349 M5: the owner-wide custody hold list + aggregate. Owner-scoped RequireUser read,
 	// no forge call, no token spend → noLimiter, like the owner recovery-archive reads.

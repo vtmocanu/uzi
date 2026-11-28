@@ -2091,6 +2091,7 @@ PRD at `prds/done/4686-runtime-web-modules.md`.
 - Operators can enable trusted runtime web modules through deployment config (chart `web.modules[]`, or the compose generator and override), served same-origin under `/modules/<id>/` with no web image rebuild and an unchanged CSP. A module failing to load, render or match the host contract is contained to its own page. (AI-synced 2026-11-25)
 - Operators can give modules-group entries a named sidebar section through the optional `navSection` field (1 to 24 characters; entries sharing a heading share a section). (AI-synced 2026-11-27)
 - Module nav entries animate on click/Enter like built-in entries when sidebar motion is on (each vocabulary icon has its own `module-<icon>` motion; a module still only names an icon), and the icon vocabulary includes `chart-line`. (AI-synced 2026-11-27)
+- Users can store one JSON document per module id (cookie-only API, 64 KiB, 32 per user, revision-checked writes); numbers must be in the JavaScript number range (zeros are stored as 0) and data may nest at most 10,000 levels. (AI-synced 2026-11-27)
 
 ## Demo mode branding
 

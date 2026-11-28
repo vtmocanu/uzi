@@ -840,6 +840,14 @@ type ModelProviderRevision struct {
 	Engine     string             `json:"engine"`
 }
 
+type ModuleUserDatum struct {
+	UserID    uuid.UUID          `json:"user_id"`
+	ModuleID  string             `json:"module_id"`
+	Data      []byte             `json:"data"`
+	Revision  int64              `json:"revision"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+}
+
 type MrReviewAuthorQueue struct {
 	RepoID        uuid.UUID          `json:"repo_id"`
 	Ref           string             `json:"ref"`

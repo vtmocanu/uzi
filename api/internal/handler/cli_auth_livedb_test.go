@@ -542,6 +542,11 @@ func TestCLIRejectsBearerOnCookieOnlyRoutesLiveDB(t *testing.T) {
 		{"template list (prompt bodies, D5)", http.MethodGet, "/api/agent-templates"},
 		{"template get (prompt body, D5)", http.MethodGet, "/api/agent-templates/" + tplID.String()},
 		{"template rendered (prompt body, D5)", http.MethodGet, "/api/agent-templates/" + tplID.String() + "/rendered"},
+		// Issue #4784: per-user module documents are cookie-only (requireAuth). A uzc_ on
+		// requireUser would skip CSRF on the writes.
+		{"module user data read", http.MethodGet, "/api/modules/notes/user-data/"},
+		{"module user data write", http.MethodPut, "/api/modules/notes/user-data/"},
+		{"module user data delete", http.MethodDelete, "/api/modules/notes/user-data/?expected_revision=1"},
 	}
 	for _, tc := range cases {
 		rec := bearerReq(router, tc.method, tc.path, uzc)

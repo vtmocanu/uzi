@@ -52,6 +52,8 @@ The example module imports its types from `sdk-contract.ts` the same way.
 
 A module can call any API route the user can; `sdk.api` is a convenience that keeps auth in one place, not a permission boundary.
 
+For preferences, a module can store one JSON document per user at `/modules/<id>/user-data` (`GET`, `PUT`, `DELETE`; call it as `sdk.api.request("PUT", "/modules/<id>/user-data", { data, expected_revision })`). The whole `PUT` body is capped at 64 KiB (413 above it), and a write with a stale `expected_revision` gets 409 with the current revision, so re-read before retrying. Do not store secrets: any module can read any id. Full contract, limits and the unknown-outcome (503) rule: [web-modules.md](./web-modules.md#per-user-storage).
+
 ## Shared libraries
 
 The host provides `react`, `react-dom`, `react-router-dom` and `react/jsx-runtime` as strict singletons with `loaded-first` sharing. If your build requires a version the host's does not satisfy (for example React 18 against React 19), the host **refuses** to render the module with a "not compatible" card; it never loads a second copy of React. Match the host's ranges from `web/package.json` at the uzi tag you target.
