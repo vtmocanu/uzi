@@ -74,6 +74,9 @@ const (
 	heMinBatch    = int32(50)
 	heSampleArr   = 250
 	heMarker      = "recovery-reset-v1"
+	// heEvidenceMarker marks only the hrev database this harness created. An ordinary LiveDB
+	// database that happens to be named hrev carries heMarker alone and is refused.
+	heEvidenceMarker = "history-retention-evidence-v1"
 )
 
 // heBase is bucket-aligned (day-aligned) and is the fixed start of every warm and cold fixture.
@@ -241,10 +244,10 @@ func TestHistoryRetentionEvidenceDSN(t *testing.T) {
 }
 
 // newHeFx connects to the evidence database. The marker of the database UZI_TEST_DATABASE_URL names
-// is checked first (admin paths); the evidence database hrev is created with its own marker row
-// (the e2e/test-database-marker.sql shape) and EVERY path, including the cold one, verifies that
-// hrev itself carries the marker before anything mutates it, so a hrev that something else made
-// is refused. With admin=true it then migrates hrev; with admin=false (the cold tick) it opens the
+// is checked first (admin paths); the evidence database hrev is created with its own evidence
+// marker row (heEvidenceMarker, in the e2e/test-database-marker.sql shape) and EVERY path, including
+// the cold one, verifies that hrev carries only that marker before anything mutates it, so a hrev
+// that something else made, an ordinary marked LiveDB database included, is refused. With admin=true it then migrates hrev; with admin=false (the cold tick) it opens the
 // pool and nothing else (the marker check ran on a separate pool of its own), so no query touches
 // the history tables, and none runs on fx.pool, before the first measured tick.
 func newHeFx(t *testing.T, admin bool) *heFx {
@@ -313,8 +316,27 @@ func newHeFx(t *testing.T, admin bool) *heFx {
 	return fx
 }
 
-// markEvidenceDB writes the throwaway-database marker row into the freshly created hrev, in the
-// shape of e2e/test-database-marker.sql.
+// heCheckEvidenceMarkers accepts exactly the harness's own evidence marker.
+func heCheckEvidenceMarkers(markers []string) error {
+	if len(markers) != 1 || markers[0] != heEvidenceMarker {
+		return fmt.Errorf("it does not carry only the evidence marker %q (markers=%q)", heEvidenceMarker, markers)
+	}
+	return nil
+}
+
+func TestHistoryRetentionEvidenceMarker(t *testing.T) {
+	if err := heCheckEvidenceMarkers([]string{heEvidenceMarker}); err != nil {
+		t.Fatalf("evidence marker refused: %v", err)
+	}
+	for _, bad := range [][]string{nil, {heMarker}, {heMarker, heEvidenceMarker}, {"other"}} {
+		if err := heCheckEvidenceMarkers(bad); err == nil {
+			t.Fatalf("markers %q accepted, want refusal", bad)
+		}
+	}
+}
+
+// markEvidenceDB writes the evidence marker row (heEvidenceMarker) into the freshly created hrev,
+// in the shape of e2e/test-database-marker.sql.
 func (fx *heFx) markEvidenceDB() {
 	fx.t.Helper()
 	p, err := pgxpool.New(fx.ctx, fx.dsn)
@@ -326,7 +348,7 @@ func (fx *heFx) markEvidenceDB() {
 	for _, q := range []string{
 		`CREATE SCHEMA uzi_test_harness`,
 		`CREATE TABLE uzi_test_harness.database_marker (marker text PRIMARY KEY)`,
-		`INSERT INTO uzi_test_harness.database_marker (marker) VALUES ('` + heMarker + `')`,
+		`INSERT INTO uzi_test_harness.database_marker (marker) VALUES ('` + heEvidenceMarker + `')`,
 	} {
 		if _, err := p.Exec(fx.ctx, q); err != nil {
 			fx.t.Fatalf("write hrev marker: %v\n%s", err, q)
@@ -344,9 +366,16 @@ func (fx *heFx) requireEvidenceMarker() {
 	}
 	defer p.Close()
 	fx.requireEvidenceDatabase(p)
-	var marker string
-	if err := p.QueryRow(fx.ctx, `SELECT marker FROM uzi_test_harness.database_marker`).Scan(&marker); err != nil || marker != heMarker {
-		fx.t.Fatalf("refusing to touch database %s: it does not carry the throwaway marker (marker=%q err=%v)", heDBName, marker, err)
+	rows, err := p.Query(fx.ctx, `SELECT marker FROM uzi_test_harness.database_marker ORDER BY marker`)
+	if err != nil {
+		fx.t.Fatalf("refusing to touch database %s: cannot read its marker: %v", heDBName, err)
+	}
+	markers, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		fx.t.Fatalf("refusing to touch database %s: cannot read its marker: %v", heDBName, err)
+	}
+	if err := heCheckEvidenceMarkers(markers); err != nil {
+		fx.t.Fatalf("refusing to touch database %s: %v", heDBName, err)
 	}
 	// server_version is read here, on the marker check's own backend, so fx.pool never runs it.
 	if err := p.QueryRow(fx.ctx, `SHOW server_version`).Scan(&fx.version); err != nil {
