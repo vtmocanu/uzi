@@ -29,7 +29,18 @@ func hrSeedMixed(f *hrFx) (fresh time.Time, expired int64) {
 		expired += 5
 	}
 	f.seedFirstMerge(2, old)
+	// Expired heads (older than the 24h cutoff): the pass must leave them untouched.
+	f.exec(`INSERT INTO pr_history_heads (repo_id, mr_iid, state, observed_at, last_to_state)
+	        SELECT $1, $2::bigint + g, 'merged', $3, 'merged' FROM generate_series(1, 3) g`, f.repoQ, f.nextIID(3), old)
 	return fresh, expired
+}
+
+// hrWantHeadsUnchanged fails when pr_history_heads differs by value from the snapshot before.
+func hrWantHeadsUnchanged(t *testing.T, f *hrFx, before []string, when string) {
+	t.Helper()
+	if diff := hrHeadsEqual(before, f.heads()); diff != "" {
+		t.Errorf("pr_history_heads changed %s: %s", when, diff)
+	}
 }
 
 func hrWantAfterPass(t *testing.T, f *hrFx, fresh time.Time) {
@@ -59,6 +70,10 @@ func TestHistoryRetentionPassLiveDB(t *testing.T) {
 
 func hrPassOffThenOn(t *testing.T, f *hrFx) {
 	fresh, expired := hrSeedMixed(f)
+	heads := f.heads()
+	if len(heads) != 3 {
+		t.Fatalf("seeded %d heads, want 3", len(heads))
+	}
 	before := map[store.HistoryRetentionTable]int{}
 	for _, table := range hrTables {
 		before[table] = f.total(table)
@@ -74,6 +89,8 @@ func hrPassOffThenOn(t *testing.T, f *hrFx) {
 		}
 	}
 
+	hrWantHeadsUnchanged(t, f, heads, "with retention off")
+
 	// positive control: the same rows, enabled
 	on := historyretention.New(f.pool, 24*time.Hour)
 	n, err := on.Pass(f.ctx)
@@ -81,10 +98,12 @@ func hrPassOffThenOn(t *testing.T, f *hrFx) {
 		t.Fatalf("retention on: Pass = (%d, %v), want (%d, nil)", n, err, expired)
 	}
 	hrWantAfterPass(t, f, fresh)
+	hrWantHeadsUnchanged(t, f, heads, "by the pass")
 }
 
 func hrPassContended(t *testing.T, f *hrFx) {
 	fresh, expired := hrSeedMixed(f)
+	heads := f.heads()
 	pass := historyretention.New(f.pool, 24*time.Hour)
 
 	holder, got, err := store.OpenHistoryRetentionSession(f.ctx, f.ctx, f.pool, time.Second, time.Second)
@@ -114,6 +133,7 @@ func hrPassContended(t *testing.T, f *hrFx) {
 		t.Fatalf("after release: Pass = (%d, %v), want (%d, nil)", n, err, expired)
 	}
 	hrWantAfterPass(t, f, fresh)
+	hrWantHeadsUnchanged(t, f, heads, "by the pass")
 	if n := f.lockHolders(); n != 0 {
 		t.Fatalf("%d sessions hold the lock after the pass, want 0", n)
 	}

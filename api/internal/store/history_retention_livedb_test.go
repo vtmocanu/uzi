@@ -9,6 +9,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -25,8 +26,10 @@ import (
 // test must never see another top-level test's rows; its subtests share that database and each
 // starts from emptied history tables (hrFx.run). Standing a database (create plus migrate) costs
 // about four seconds, so one per table or per case dominated the package's LiveDB time. The tests
-// do not use t.Parallel: the surrounding store LiveDB tests do not, and lockHolders counts the
-// advisory lock server-wide, so two tests holding it at once would confuse each other. Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres; run
+// do not use t.Parallel: the surrounding store LiveDB tests do not, and lockHolders counts only the
+// lock of the fixture's own database (two-int form, current database), so another database's
+// holder of the same key cannot confuse it, but two top-level tests in one database would.
+// Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres; run
 // via ./e2e/run-store-it.sh. The session tests live in package store_test (not store) so they
 // can use the isolated-database helpers; the unexported seams come from
 // history_retention_export_test.go.
@@ -167,11 +170,50 @@ func (f *hrFx) lockRelation(table store.HistoryRetentionTable) (release func()) 
 	return release
 }
 
-// lockHolders counts backends holding the history retention advisory lock.
+// lockHolders counts backends holding the history retention advisory lock in the fixture database:
+// the two-int form (objsubid 2) of (HistoryRetentionLockClass, 0), scoped to the current database.
 func (f *hrFx) lockHolders() int {
 	f.t.Helper()
-	return f.count(`SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted AND objid = 0 AND classid = $1::int8::oid`,
+	return f.count(`SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted AND objid = 0 AND classid = $1::int8::oid
+	        AND objsubid = 2 AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`,
 		int64(store.HistoryRetentionLockClass))
+}
+
+// heads snapshots pr_history_heads by value, one string per row in key order, so a test can tell a
+// changed or replaced row from an untouched one (a row count cannot).
+func (f *hrFx) heads() []string {
+	f.t.Helper()
+	rows, err := f.pool.Query(f.ctx, `SELECT concat_ws('|', repo_id::text, mr_iid::text, state, observed_at::text, coalesce(last_to_state, '<null>'))
+	        FROM pr_history_heads ORDER BY repo_id, mr_iid`)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var s string
+		if err := rows.Scan(&s); err != nil {
+			f.t.Fatal(err)
+		}
+		out = append(out, s)
+	}
+	if err := rows.Err(); err != nil {
+		f.t.Fatal(err)
+	}
+	return out
+}
+
+// hrHeadsEqual reports the first difference between two heads snapshots ("" when equal).
+func hrHeadsEqual(a, b []string) string {
+	if len(a) != len(b) {
+		return fmt.Sprintf("row count %d -> %d", len(a), len(b))
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return fmt.Sprintf("row %d: %q -> %q", i, a[i], b[i])
+		}
+	}
+	return ""
 }
 
 func (f *hrFx) pidAlive(pid uint32) bool {
@@ -231,7 +273,19 @@ func TestHistoryRetentionDeleteLiveDB(t *testing.T) {
 	}
 
 	root.run(t, "cutoff exact", func(t *testing.T, f *hrFx) {
-		s := f.open(time.Second, time.Second)
+		// The session runs on a probe pool whose socket delays traffic by d while the cutoff
+		// statement is in flight (armed at its trace start, disarmed at its end): writes sleep before
+		// reaching the server, reads sleep before returning to the client. A reference taken on the
+		// database clock at execution therefore lies at least d after the client's "before" reading
+		// and at least d before its "after" reading; a reference taken from the Go clock at call
+		// time or at return time cannot satisfy both.
+		const d = 300 * time.Millisecond
+		p := hrDelayPool(t, f, d)
+		s, got, err := store.OpenHistoryRetentionSession(f.ctx, f.ctx, p, time.Second, time.Second)
+		if err != nil || !got {
+			t.Fatalf("open session on the delay pool: got=%v err=%v", got, err)
+		}
+		t.Cleanup(func() { _, _ = s.Close(context.Background()) })
 		retention := 720*time.Hour + 1234567*time.Microsecond
 		before := time.Now()
 		ref, cut, err := s.Cutoff(f.ctx, retention)
@@ -243,8 +297,9 @@ func TestHistoryRetentionDeleteLiveDB(t *testing.T) {
 			t.Errorf("reference - cutoff = %v, want exactly %v", got, retention)
 		}
 		// The reference is the database clock; the test and the database share the host clock.
-		if ref.Before(before.Add(-time.Millisecond)) || ref.After(after.Add(time.Millisecond)) {
-			t.Errorf("reference %v is not between the client readings %v and %v", ref, before, after)
+		if ref.Before(before.Add(d-time.Millisecond)) || ref.After(after.Add(-d+time.Millisecond)) {
+			t.Errorf("reference %v is not inside [%v, %v] (client readings %v and %v, delay %v each way)",
+				ref, before.Add(d-time.Millisecond), after.Add(-d+time.Millisecond), before, after, d)
 		}
 		for _, bad := range []time.Duration{0, -time.Hour} {
 			if _, _, err := s.Cutoff(f.ctx, bad); err == nil {
@@ -260,15 +315,19 @@ func TestHistoryRetentionDeleteLiveDB(t *testing.T) {
 		f.seedFirstMerge(3, old)
 		f.exec(`INSERT INTO pr_history_heads (repo_id, mr_iid, state, observed_at, last_to_state)
 		        SELECT $1, $2::bigint + g, 'merged', $3, 'merged' FROM generate_series(1, 5) g`, f.repoQ, f.nextIID(5), old)
+		headsBefore := f.heads()
+		if len(headsBefore) != 5 {
+			t.Fatalf("seeded %d heads, want 5", len(headsBefore))
+		}
 		hrMustDelete(t, s, store.HistoryRetentionPRHistoryEvents, old.Add(24*time.Hour), 1000, 4)
+		if diff := hrHeadsEqual(headsBefore, f.heads()); diff != "" {
+			t.Errorf("pr_history_heads changed by the delete: %s", diff)
+		}
 		if got := f.count(`SELECT count(*) FROM pr_history_events WHERE first_merge`); got != 3 {
 			t.Errorf("first_merge events = %d, want all 3 kept", got)
 		}
 		if got := f.total(store.HistoryRetentionPRHistoryEvents); got != 3 {
 			t.Errorf("pr_history_events rows = %d, want only the 3 protected ones", got)
-		}
-		if got := f.count(`SELECT count(*) FROM pr_history_heads`); got != 5 {
-			t.Errorf("pr_history_heads rows = %d, want all 5 kept", got)
 		}
 	})
 
@@ -392,7 +451,7 @@ func TestHistoryRetentionDeleteLiveDB(t *testing.T) {
 		pid := s.PIDForTest()
 		release := f.lockRelation(table)
 
-		workCtx, cancelWork := context.WithTimeout(f.ctx, 1500*time.Millisecond)
+		workCtx, cancelWork := context.WithCancel(f.ctx)
 		defer cancelWork()
 		type res struct {
 			n   int64
@@ -415,18 +474,27 @@ func TestHistoryRetentionDeleteLiveDB(t *testing.T) {
 			n, err := s.DeleteBatch(workCtx, table, hrBase.Add(time.Hour), 1000)
 			done <- res{n, err, time.Since(started)}
 		}()
-		waiting := false
-		for deadline := time.Now().Add(1200 * time.Millisecond); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
-			if f.count(`SELECT count(*) FROM pg_stat_activity WHERE pid = $1 AND wait_event_type = 'Lock'`, int64(pid)) == 1 {
-				waiting = true
-				break
+		// Cancel only once the server shows the delete waiting on the relation lock; a 20s watchdog
+		// bounds both the gate and the wait for the result.
+		watchdog := time.NewTimer(20 * time.Second)
+		defer watchdog.Stop()
+		for f.count(`SELECT count(*) FROM pg_stat_activity WHERE pid = $1 AND wait_event_type = 'Lock'`, int64(pid)) != 1 {
+			select {
+			case r := <-done:
+				t.Fatalf("DeleteBatch returned (%d, %v) before wait_event_type = Lock was observed", r.n, r.err)
+			case <-watchdog.C:
+				t.Fatal("watchdog: the delete never showed wait_event_type = Lock in pg_stat_activity")
+			case <-time.After(10 * time.Millisecond):
 			}
 		}
-		if !waiting {
-			t.Fatal("the delete never showed wait_event_type = Lock in pg_stat_activity")
+		cancelWork()
+		var r res
+		select {
+		case r = <-done:
+		case <-watchdog.C:
+			t.Fatal("watchdog: DeleteBatch did not return after the work context was cancelled")
 		}
-		r := <-done
-		t.Logf("work context expired: DeleteBatch returned after %v", r.at)
+		t.Logf("work context cancelled: DeleteBatch returned after %v", r.at)
 		var rb *store.HistoryRetentionRollbackError
 		if r.err == nil || errors.As(r.err, &rb) || r.n != 0 {
 			t.Fatalf("DeleteBatch = (%d, %v), want an UNKNOWN outcome (not a known rollback)", r.n, r.err)
@@ -609,16 +677,17 @@ func TestHistoryRetentionFailedOpenLiveDB(t *testing.T) {
 	})
 
 	// The try-lock IS sent and the server acquires the lock, but its reply never reaches the client
-	// and the work deadline expires: the open cannot know whether it holds the lock. The probe
+	// and the work context is cancelled: the open cannot know whether it holds the lock. The probe
 	// pool's connection is wrapped so that, once the try-lock statement has been executed on the
-	// server, every client read blocks until its deadline or the close. The open must return an
+	// server, every client read blocks until its deadline or the close. The cancel is gated on the
+	// observed state (lock held, hold armed, a read blocked), not on a timer. The open must return an
 	// error, the session must still be ended by the client side (the server-side lock was really
 	// taken, so a leaked backend would keep it), and all of this is asserted while the probe pool
 	// is still open.
-	root.run(t, "try-lock sent, reply lost, work deadline expires", func(t *testing.T, f *hrFx) {
+	root.run(t, "try-lock sent, reply lost, work context cancelled", func(t *testing.T, f *hrFx) {
 		p, w := hrReplyLostPool(t, f)
 		// Warm the probe pool (dial and handshake) before the work context exists: the wrapper only
-		// arms on the try-lock write, so the 500 ms work budget is spent on the open itself.
+		// arms on the try-lock write.
 		warm, err := p.pool.Acquire(f.ctx)
 		if err != nil {
 			t.Fatalf("warm the probe pool: %v", err)
@@ -626,7 +695,7 @@ func TestHistoryRetentionFailedOpenLiveDB(t *testing.T) {
 		warm.Release()
 		cleanupCtx, cancelCleanup := context.WithTimeout(f.ctx, 6*time.Second)
 		defer cancelCleanup()
-		workCtx, cancelWork := context.WithTimeout(f.ctx, 500*time.Millisecond)
+		workCtx, cancelWork := context.WithCancel(f.ctx)
 		defer cancelWork()
 
 		type res struct {
@@ -660,6 +729,7 @@ func TestHistoryRetentionFailedOpenLiveDB(t *testing.T) {
 			}
 			err := f.pool.QueryRow(f.ctx, `SELECT l.pid FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
 			        WHERE l.locktype = 'advisory' AND l.granted AND l.objid = 0 AND l.classid = $1::int8::oid
+			          AND l.objsubid = 2 AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
 			          AND a.application_name = $2`, int64(store.HistoryRetentionLockClass), p.tag).Scan(&holderPID)
 			switch {
 			case err == nil:
@@ -679,11 +749,27 @@ func TestHistoryRetentionFailedOpenLiveDB(t *testing.T) {
 			t.Fatalf("open returned (%v, %v, %v) while the server-side lock was held and the reply withheld", r.s, r.got, r.err)
 		default:
 		}
-		if !w.armed() {
-			t.Fatal("the lock is held but the wrapper never saw the try-lock execute: the reply was not withheld by the design under test")
+		// Cancel only once the reply is provably withheld: the wrapper saw the try-lock execute
+		// (armed) and a client read is blocked on the lost reply.
+		gate := time.NewTimer(20 * time.Second)
+		defer gate.Stop()
+		for !(w.armed() && w.blockedRead()) {
+			select {
+			case r := <-done:
+				t.Fatalf("open returned (%v, %v, %v) before the reply hold was armed and a read blocked", r.s, r.got, r.err)
+			case <-gate.C:
+				t.Fatalf("watchdog: the reply hold never armed and blocked a read (armed=%v blocked=%v)", w.armed(), w.blockedRead())
+			case <-time.After(5 * time.Millisecond):
+			}
 		}
+		cancelWork()
 
-		r := <-done
+		var r res
+		select {
+		case r = <-done:
+		case <-gate.C:
+			t.Fatal("watchdog: the open did not return after the work context was cancelled")
+		}
 		if r.s != nil || r.got || r.err == nil || !strings.Contains(r.err.Error(), "try lock") {
 			t.Fatalf("open = (%v, %v, %v), want (nil, false, a try-lock error)", r.s, r.got, r.err)
 		}
@@ -935,6 +1021,130 @@ func hrReplyLostPool(t *testing.T, f *hrFx) (*wcsProbe, *hrReplyLostConn) {
 	})
 	p.pool = pool
 	return p, w
+}
+
+// hrDelayConn wraps a client socket and, while armed is set, sleeps d before every write reaches
+// the server and after every read, before returning to the client.
+type hrDelayConn struct {
+	net.Conn
+	armed *atomic.Bool
+	d     time.Duration
+}
+
+func (c *hrDelayConn) Write(b []byte) (int, error) {
+	if c.armed.Load() {
+		time.Sleep(c.d)
+	}
+	return c.Conn.Write(b)
+}
+
+func (c *hrDelayConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	if c.armed.Load() {
+		time.Sleep(c.d)
+	}
+	return n, err
+}
+
+// hrDelayTracer arms the delay for the duration of any statement that reads statement_timestamp.
+type hrDelayTracer struct{ armed *atomic.Bool }
+
+func (t hrDelayTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, d pgx.TraceQueryStartData) context.Context {
+	if strings.Contains(d.SQL, "statement_timestamp") {
+		t.armed.Store(true)
+	}
+	return ctx
+}
+
+func (t hrDelayTracer) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {
+	t.armed.Store(false)
+}
+
+// hrDelayPool is a pool on the fixture database whose sockets delay traffic by d each way while a
+// statement mentioning statement_timestamp is in flight.
+func hrDelayPool(t *testing.T, f *hrFx, d time.Duration) *pgxpool.Pool {
+	t.Helper()
+	cfg, err := pgxpool.ParseConfig(f.pool.Config().ConnString())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.MaxConns = 1
+	armed := &atomic.Bool{}
+	cfg.ConnConfig.Tracer = hrDelayTracer{armed: armed}
+	dialer := &net.Dialer{}
+	cfg.ConnConfig.DialFunc = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		c, err := dialer.DialContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		return &hrDelayConn{Conn: c, armed: armed, d: d}, nil
+	}
+	pool, err := pgxpool.NewWithConfig(f.ctx, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	return pool
+}
+
+// TestHistoryRetentionLockHoldersScopingLiveDB pins the scope of lockHolders: it must count the
+// two-int advisory lock (HistoryRetentionLockClass, 0) in the fixture's own database only. Two
+// sentinels that match every other filter are held: the one-int form of the same numeric key in the
+// fixture database (objsubid 1) and the two-int form in another database. Each is shown granted
+// server-wide first, so a zero count cannot come from a lock that was never taken.
+func TestHistoryRetentionLockHoldersScopingLiveDB(t *testing.T) {
+	f := newHrFx(t)
+	class := int64(store.HistoryRetentionLockClass)
+
+	oneKey, err := f.pool.Acquire(f.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer oneKey.Release()
+	if _, err := oneKey.Exec(f.ctx, `SELECT pg_advisory_lock($1::bigint)`, class<<32); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _, _ = oneKey.Exec(context.Background(), `SELECT pg_advisory_unlock($1::bigint)`, class<<32) }()
+
+	otherCtx, otherDSN := standIsolatedDB(t, "hrsent_")
+	other, err := pgx.Connect(otherCtx, otherDSN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close(context.Background())
+	if _, err := other.Exec(otherCtx, `SELECT pg_advisory_lock($1, 0)`, int32(class)); err != nil {
+		t.Fatal(err)
+	}
+
+	var fixtureOID, otherOID uint32
+	if err := f.pool.QueryRow(f.ctx, `SELECT oid FROM pg_database WHERE datname = current_database()`).Scan(&fixtureOID); err != nil {
+		t.Fatal(err)
+	}
+	if err := other.QueryRow(otherCtx, `SELECT oid FROM pg_database WHERE datname = current_database()`).Scan(&otherOID); err != nil {
+		t.Fatal(err)
+	}
+	if fixtureOID == otherOID {
+		t.Fatalf("both sentinels are in database %d", fixtureOID)
+	}
+	serverWide := func(subid int16, db uint32) int {
+		return f.count(`SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted AND classid = $1::int8::oid
+		        AND objid = 0 AND objsubid = $2 AND database = $3::oid`, class, int32(subid), int64(db))
+	}
+	if n := serverWide(1, fixtureOID); n != 1 {
+		t.Fatalf("one-key sentinel in the fixture database: %d granted locks, want 1", n)
+	}
+	if n := serverWide(2, otherOID); n != 1 {
+		t.Fatalf("two-int sentinel in the other database: %d granted locks, want 1", n)
+	}
+	if n := f.lockHolders(); n != 0 {
+		t.Errorf("lockHolders = %d with only a one-key lock here and a two-int lock in another database, want 0", n)
+	}
+
+	// Positive control: a real session in the fixture database is counted exactly once.
+	_ = f.open(time.Second, time.Second)
+	if n := f.lockHolders(); n != 1 {
+		t.Errorf("lockHolders = %d with one real session, want 1", n)
+	}
 }
 
 // hrPlan is the part of an EXPLAIN (FORMAT JSON) node this test reads.
