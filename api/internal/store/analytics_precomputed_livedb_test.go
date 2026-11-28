@@ -177,7 +177,10 @@ func apGo(t *testing.T, cancel context.CancelFunc, fn func() error) <-chan error
 		select {
 		case <-exited:
 		case <-time.After(15 * time.Second):
-			t.Errorf("background worker did not exit after cancellation")
+			// Report the hang, but keep waiting: the cleanups after this one release what the
+			// worker uses. The test binary's own timeout bounds a genuine hang.
+			t.Errorf("background worker did not exit 15s after cancellation; still waiting")
+			<-exited
 		}
 	})
 	return ch
