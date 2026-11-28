@@ -34,41 +34,56 @@ func (q *Queries) BankCodeCrossCheckWait(ctx context.Context, checkID uuid.UUID)
 const createCodeCrossCheckChild = `-- name: CreateCodeCrossCheckChild :one
 INSERT INTO runs (id, user_id, repo_id, kind, target_run_id, harness, priority,
  report_only, budget_wall_seconds, dispatched_at, auto_approve, issue_title,
- issue_description, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, trigger_source, worker_id, model_provider_key_mode)
+ issue_description, required_capabilities, hinted_capabilities, ignored_inferred_capabilities, trigger_source, worker_id, model_provider_id, model_provider_revision, model_provider_key_mode, model_provider_key_secret_id, model_provider_key_rev)
 SELECT $1, lead.user_id, lead.repo_id, 'cross_check', lead.id, $2::text, 2,
  true, $3::int, now(), true, lead.issue_title, lead.issue_description,
- COALESCE(repo.required_capabilities, '{}'), COALESCE(repo.required_capabilities, '{}'), lead.ignored_inferred_capabilities, 'cross_check', lead.worker_id, NULL::text
+ COALESCE(repo.required_capabilities, '{}'), COALESCE(repo.required_capabilities, '{}'), lead.ignored_inferred_capabilities, 'cross_check', lead.worker_id, $4::uuid, $5::int, $6::text, $7::uuid, $8::bigint
 FROM runs lead JOIN repos repo ON repo.id = lead.repo_id JOIN workers w ON w.id = lead.worker_id
-WHERE lead.id = $4 AND lead.user_id = $5 AND lead.worker_id = $6
- AND lead.claim_generation = $7 AND lead.claim_released_at IS NULL
+WHERE lead.id = $9 AND lead.user_id = $10 AND lead.worker_id = $11
+ AND lead.claim_generation = $12 AND lead.claim_released_at IS NULL
  AND (lead.status IN ('claimed','running') OR (lead.status = 'awaiting_followup' AND lead.kind = 'task' AND lead.interactive)) AND lead.code_cross_check_required
  AND lead.kind IN ('issue','prompt','self_improve','ci_fix','mr_rework','task')
  AND lead.harness IN ('claude','codex') AND lead.harness <> $2::text
  AND 'cross_check_code_v1' = ANY(w.protocol_capabilities)
  AND 'cross_check_lane_v1' = ANY(w.protocol_capabilities)
  AND w.max_cross_check_slots > 0 AND NOT w.isolated_lane AND NOT w.maintenance_fenced
+ AND ($4::uuid IS NULL OR
+      ('codex_provider_v1' = ANY(w.protocol_capabilities) AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
+       AND 'codex_runtime_v2' = ANY(w.protocol_capabilities) AND 'codex_runtime_v3' = ANY(w.protocol_capabilities)
+       AND 'codex_provider_checker_v1' = ANY(w.protocol_capabilities)))
  AND NOT lead.report_only AND lead.fix_verdict IS DISTINCT FROM 'not_code'
  AND NOT EXISTS (SELECT 1 FROM cross_checks cc WHERE cc.lead_run_id = lead.id AND cc.stage = 'code')
 RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before, completion_contract_version, contract_revision, completion_contract, completion_attempts, latest_completion_attempt, milestones_agents, hold_reason, hold_captured_head, completion_budget_exhausted_at, completion_question_at, budget_extension_seconds, claim_generation, harness, recovery_wait_cause, forge_park_count, credential_override_mode, credential_override_secret_id, claim_released_at, credential_switch_requested_at, credential_switch_generation, stale_requeue_generation, budget_finalize_seconds, released_worker_id, released_worker_nonce, gate_revision, gate_presentation_id, gate_presented_payload, gate_payload_digest, gate_refusal_count, gate_refusal_generation, disk_park_count, checkpoint_contains_latest, egress_profile_id, egress_snapshot, job_type, finalize_resume_generation, job_protocol, first_started_at, plan_cross_check_required, plan_cross_check_gate_reason, issue_raw_digest, issue_saved_body, issue_input_reason, auto_approve_blocked_reasons, plan_cross_check_diff_refusal, worker_recovery_episode, requeue_episode_baseline, worker_recovery_evidence, cross_check_lane, cross_check_lane_generation, completion_final_head, code_cross_check_required, provider_park_count, provider_park_streak_started_at, ci_config_guard, memory_episode, memory_intervention_count, memory_policy, completion_non_closing_reason, ci_artifact_manifest, checkpoint_attested_source, source_publication_intent, continued_issue_iid, checkpoint_coordinates, retained_park_count, ignored_inferred_capabilities, reserve_hold_reason, reserve_exempt_until, reserve_exempt_granted_at, reserve_exempt_credential_id, reserve_exempt_window_reset, reserve_exempt_prior_pct, hinted_capabilities, capability_inference_evidence, idle_stall_park_count, forge_admission, codex_select_reason, recovery_wait_phase, plan_cross_check_gated, policy_preserve_required, policy_pending_fresh, policy_outcome_id, policy_continuation_mode, policy_resolved_at, policy_applying_worker_id, policy_applying_generation, policy_source_generation, policy_refusal_count, policy_refusal_tag, policy_refusal_phase, policy_refusal_correlation_id, policy_hold_published, harness_preferred, harness_decision_reason, harness_preferred_score, harness_other_score, harness_preferred_measured, harness_other_measured, harness_preferred_held, harness_other_held, harness_preferred_weekly_reset_at, harness_other_weekly_reset_at, registration_evidence_generation, registration_evidence_nonce, registration_evidence_epoch, snapshot_departed_generation, snapshot_departed_nonce, snapshot_departed_epoch, repo_agent_source_commit, repo_agent_source_required, agent_source_requested, agent_source_requested_basis, plan_agent_source, ci_fix_mr_iid, policy_required_head, policy_recovery_verified_generation, policy_recovery_verified_head, policy_hold_cause, policy_fresh_consumed_generation, policy_fresh_confirmed_generation, recovery_wait_detail, credential_switch_op_id, credential_switch_hold_op_id, credential_switch_hold_generation, credential_switch_hold_worker_id, credential_switch_hold_register_nonce, effort, model_source, effort_source, checkpoint_withheld_since, checkpoint_withheld_status_since, checkpoint_withheld_worker_id, checkpoint_withheld_generation, checkpoint_withheld_nonce, checkpoint_withheld_report_seq, model_provider_id, model_provider_revision, model_provider_key_mode, model_provider_key_secret_id, model_provider_key_rev, model_provider_limit_streak, claim_provenance_worker_id, claim_provenance_generation, health_owner_hold_since, followup_park_seq, followup_finalize_generation, codex_switch_target_secret_id, codex_switch_target_generation, codex_switch_target_op_id, codex_switch_target_auth_mode, codex_switch_target_material_revision, codex_switch_target_account_key, codex_switch_target_account_revision, ci_autofix_enabled, fresh_hold_version, checkpoint_tip_generation, checkpoint_tip_generation_tip
 `
 
 type CreateCodeCrossCheckChildParams struct {
-	ChildID           uuid.UUID   `json:"child_id"`
-	ChildHarness      string      `json:"child_harness"`
-	BudgetWallSeconds int32       `json:"budget_wall_seconds"`
-	LeadRunID         uuid.UUID   `json:"lead_run_id"`
-	UserID            uuid.UUID   `json:"user_id"`
-	WorkerID          pgtype.UUID `json:"worker_id"`
-	ClaimGeneration   int64       `json:"claim_generation"`
+	ChildID                  uuid.UUID   `json:"child_id"`
+	ChildHarness             string      `json:"child_harness"`
+	BudgetWallSeconds        int32       `json:"budget_wall_seconds"`
+	ModelProviderID          pgtype.UUID `json:"model_provider_id"`
+	ModelProviderRevision    pgtype.Int4 `json:"model_provider_revision"`
+	ModelProviderKeyMode     pgtype.Text `json:"model_provider_key_mode"`
+	ModelProviderKeySecretID pgtype.UUID `json:"model_provider_key_secret_id"`
+	ModelProviderKeyRev      pgtype.Int8 `json:"model_provider_key_rev"`
+	LeadRunID                uuid.UUID   `json:"lead_run_id"`
+	UserID                   uuid.UUID   `json:"user_id"`
+	WorkerID                 pgtype.UUID `json:"worker_id"`
+	ClaimGeneration          int64       `json:"claim_generation"`
 }
 
 // Preserve the lead's frozen inference policy; declared requirements keep their repo-hint source.
-// model_provider_key_mode (PRD #4320 M4), class REFUSED-LANE: written as an explicit NULL because this lane does not support provider-sourced runs yet (PRD #4322); workersvc refuses provider_lane_unsupported BEFORE this INSERT for a provider-sourced owner.
+// The five model_provider_* columns (PRD #4574 M2) are stamped from sqlc.narg parameters: all NULL is a vendor checker, all set is a provider-bound checker. createRunAtomic decides the lane under the shared secret-mutation lock (checkerLaneDecision) and verifyRunBinding asserts the inserted row equals the resolution, so an unstamped provider decision fails closed (errProviderBindingMismatch).
+// Code stage only: the child runs on the lead's worker, so a provider-bound stamp additionally requires that worker to carry the Codex provider capabilities and codex_provider_checker_v1 (the SQL twin of workerSupportsProvider for kind cross_check); a vendor stamp (model_provider_id NULL) is unaffected.
 func (q *Queries) CreateCodeCrossCheckChild(ctx context.Context, arg CreateCodeCrossCheckChildParams) (Run, error) {
 	row := q.db.QueryRow(ctx, createCodeCrossCheckChild,
 		arg.ChildID,
 		arg.ChildHarness,
 		arg.BudgetWallSeconds,
+		arg.ModelProviderID,
+		arg.ModelProviderRevision,
+		arg.ModelProviderKeyMode,
+		arg.ModelProviderKeySecretID,
+		arg.ModelProviderKeyRev,
 		arg.LeadRunID,
 		arg.UserID,
 		arg.WorkerID,

@@ -540,3 +540,105 @@ for (const row of ["stalled", "trusted", "no-extra", "unrelated"] as const) {
     }
   });
 }
+
+// Issue #4574 M2: the provider-bound Codex CHECKER (plan stage) carries the same startup-captured private
+// CA bundle as the lead and advice lanes. It runs the baked production CodexCrossCheck against the baked
+// default launcher, the baked fileop helper and the pinned runtime; the checker holds only the frozen
+// provider key, so any request to the (fixture) worker API is a vendor operation and fails the case.
+for (const row of ["checker-trusted", "checker-no-extra"] as const) {
+  const trusted = row === "checker-trusted";
+  test(trusted ? "provider checker completes with the private CA bundle" : "provider checker refuses private TLS without the CA bundle", async () => {
+    const { loadConfig } = await import("/app/src/config.ts");
+    const { WorkerClient } = await import("/app/src/client.ts");
+    const { createLogger } = await import("/app/src/log.ts");
+    const { CodexCrossCheck } = await import("/app/src/codex/cross-check.ts");
+    const { rmHomeTree } = await import("/app/src/rmtree.ts");
+    assert.equal(process.getuid?.(), 10001);
+    assert.equal(process.env.UZI_UID_SPLIT, "1");
+    const credential = ["cdr", "synthetic", "checker", "claim"].join("-");
+    const verdict = JSON.stringify({ verdict: "approve", summary: "private CA checker complete", items: [] });
+    const receipts: { url?: string; model?: string }[] = [], unexpected: unknown[] = [], apiRequests: string[] = [];
+    let tlsErrors = 0, httpRequests = 0;
+    const api = httpServer((req, res) => { apiRequests.push(req.url ?? ""); res.writeHead(500).end("unexpected worker API request"); });
+    const server = httpsServer({
+      key: await fs.readFile("/fixture/server.key"), cert: await fs.readFile("/fixture/server.pem"),
+    }, (req, res) => {
+      httpRequests++;
+      assert.ok(httpRequests <= 16, "fixture request capacity exceeded");
+      const chunks: Buffer[] = [];
+      req.on("data", (c: Buffer) => { if (chunks.reduce((n, b) => n + b.length, 0) < 4 * 1024 * 1024) chunks.push(c); });
+      req.on("end", () => {
+        if (req.method !== "POST" || req.url !== "/v1/responses" || req.headers.authorization !== `Bearer ${credential}`) {
+          unexpected.push({ method: req.method, url: req.url });
+          res.writeHead(401).end();
+          return;
+        }
+        const parsed = JSON.parse(Buffer.concat(chunks).toString());
+        if (parsed.model !== "corp-code") { unexpected.push({ model: parsed.model }); res.writeHead(400).end(); return; }
+        receipts.push({ url: req.url, model: parsed.model });
+        const id = `cdr-checker-${receipts.length}`;
+        const frames = [
+          { type: "response.created", response: { id } },
+          { type: "response.output_item.done", item: { type: "message", role: "assistant", content: [{ type: "output_text", text: verdict }] } },
+          { type: "response.completed", response: { id, usage: { input_tokens: 0, output_tokens: 0, total_tokens: 0,
+            input_tokens_details: null, output_tokens_details: null } } },
+        ];
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.end(frames.map(f => `event: ${f.type}\ndata: ${JSON.stringify(f)}\n\n`).join(""));
+      });
+    });
+    server.on("tlsClientError", error => { tlsErrors++; console.log("tlsClientError", error.message); });
+    await new Promise<void>(resolve => api.listen(0, "127.0.0.1", resolve));
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    const id = `ca-${row}`;
+    const checkout = `/data/${id}-checkout`;
+    let home: string | undefined;
+    try {
+      const cfg = loadConfig({ UZI_API_URL: `http://127.0.0.1:${(api.address() as any).port}`,
+        UZI_WORKER_TOKEN: ["cdr", "synthetic", "worker"].join("-"), UZI_DATA_DIR: "/data", UZI_EXECUTOR: "sdk",
+        ...(trusted ? { UZI_CODEX_CA_FILE: source } : {}) });
+      assert.equal(cfg.codexExtraCa !== undefined, trusted, "the startup-captured bundle follows the configuration");
+      await fs.mkdir(checkout, { mode: 0o2770 });
+      await fs.chown(checkout, 10001, 10002);
+      await fs.chmod(checkout, 0o2770);
+      await fs.mkdir("/data/agent-home", { recursive: true });
+      home = await fs.mkdtemp("/data/agent-home/uzi-cross-check-");
+      await fs.chmod(home, 0o2770);
+      const log = createLogger("debug");
+      const claim = {
+        kind: "cross_check", run_id: id, claim_generation: 1, last_seq: 0, agents: [], issue_iid: null,
+        issue_title: "Private CA checker proof", issue_description: "Check the plan",
+        repo: { id: "repo", full_name: "owner/repo", url: "https://example.test/repo", clone_url: "https://example.test/repo.git", default_branch: "main" },
+        config: { default_model: "gpt-6-astra", default_effort: "high" },
+        secrets: { forge_pat: "", provider: { provider_id: "cdr-private-ca-checker", revision: 1, engine: "codex",
+          protocol: "openai_responses", base_url: `https://127.0.0.1:${(server.address() as any).port}/v1`, auth_style: "bearer",
+          credential, model_map: { default: { model: "corp-code", context_window: 32768 } } } },
+        cross_check: { stage: "plan", lead_run_id: "lead", round: 1, candidate_digest: "digest", deadline_at: "2099-01-01T00:00:00Z",
+          plan_md: "Plan", milestones: [], required_capabilities: [], required_tools: [], size_class: "small",
+          base_commit: "a".repeat(40), planning_diff: "diff" },
+      } as any;
+      const client = new WorkerClient(cfg.apiUrl, cfg.workerToken, "cdr-private-ca", log);
+      const checker = new CodexCrossCheck(client, log, { codexExtraCa: cfg.codexExtraCa });
+      const run = checker.run(claim, checkout, home, AbortSignal.timeout(trusted ? 90_000 : 45_000), async () => {}, () => {});
+      if (trusted) {
+        assert.equal(await run, verdict, "the checker completed through the private CA");
+        assert.deepEqual(receipts, [{ url: "/v1/responses", model: "corp-code" }], "one authenticated request, the mapped target");
+        assert.equal(tlsErrors, 0, "no failed handshake");
+      } else {
+        await assert.rejects(run);
+        assert.deepEqual(receipts, [], "no request completed without the bundle");
+        assert.equal(httpRequests, 0, "zero HTTP requests, including rejected routes");
+        assert.ok(tlsErrors > 0, "our listener observed failed handshakes");
+      }
+      assert.deepEqual(unexpected, []);
+      assert.deepEqual(apiRequests, [], "zero vendor/control API requests");
+      console.log("provider-checker-observed", row);
+    } finally {
+      if (home) await rmHomeTree(home).catch(() => {});
+      await fs.rm(checkout, { recursive: true, force: true }).catch(() => {});
+      server.closeAllConnections();
+      api.closeAllConnections();
+      await Promise.all([new Promise<void>(r => server.close(() => r())), new Promise<void>(r => api.close(() => r()))]);
+    }
+  });
+}

@@ -34,24 +34,31 @@ type harnessCreationOrigin struct {
 	// verbatim and the owner's current source never read; a vendor source gives a vendor successor
 	// resolved WITHOUT the owner's provider source. Nil for a fresh creation.
 	InheritFrom *store.Run
-	// RefuseProviderOwner refuses the creation (ErrProviderLaneUnsupported) when the owner selected
-	// a Claude source (both lanes), or a Codex source (Codex lane only). Guarded origins
-	// require an explicit recognized harness, and resolve vendor credentials only. The plan/code
-	// checkers use it; the judge (JudgeLane) and the job (JobLane) do not.
-	RefuseProviderOwner bool
+	// CheckerLane marks a plan or code cross-check child creation (PRD #4574 M2). Under the shared
+	// secret-mutation lock, taken before the source read as JobLane's is, checkerLaneDecision decides
+	// the lane from LeadProviderBound, the checker engine and one GetUserProviderLaneSources read:
+	// Refused returns ErrProviderLaneUnsupported before any resolution, Vendor resolves vendor
+	// credentials only (vendorOnly), and Provider resolves the owner's source and freezes it (a
+	// resolution that carries no source is ProviderSourceUnusableError, never a vendor child). It
+	// requires an explicit recognized harness and is mutually exclusive with JudgeLane and JobLane.
+	CheckerLane bool
+	// LeadProviderBound is the lead's frozen provider boundness as the caller read it under the lead
+	// row lock. createRunAtomic has no lead row, so the create closure re-asserts it against the
+	// locked lead and a mismatch is Refused. Only meaningful with CheckerLane.
+	LeadProviderBound bool
 	// JudgeLane marks a judge creation (PRD #4322 M1a). The judge's own pin policy and provider
 	// sources decide its lane in the create transaction under the shared secret-mutation lock: a
 	// Claude judge is vendor (pinned with a credential, or no Claude source) or provider-bound to
 	// the owner's Claude source; a Codex judge is vendor (no Codex source) or provider-bound to the
 	// owner's Codex source (PRD #4574 M1). It
-	// requires an explicit recognized harness and is mutually exclusive with RefuseProviderOwner.
+	// requires an explicit recognized harness and is mutually exclusive with CheckerLane.
 	JudgeLane bool
 	// JobLane marks a job creation (PRD #4322 M1b). Under the shared secret-mutation lock, taken
 	// before the lane read, a job whose owner selected no Claude source is a vendor job (resolved
 	// exactly as before), and one whose owner selected a Claude source is provider-bound to it (frozen
 	// under the same lock, then verified against its model map); a job on a site list (JobSiteList) with
 	// a Claude source selected is refused (ErrProviderLaneUnsupported), usable or not. It requires an
-	// explicit recognized harness and is mutually exclusive with RefuseProviderOwner and JudgeLane.
+	// explicit recognized harness and is mutually exclusive with CheckerLane and JudgeLane.
 	JobLane bool
 	// JobSiteList says the job names an egress profile (a site list). Only meaningful with JobLane.
 	JobSiteList bool

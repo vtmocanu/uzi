@@ -3,7 +3,7 @@ import { freshResumeCapabilities } from "./fresh-resume.js";
 import { TASK_CHECKPOINT_COORDINATES_CAPABILITY } from "./checkpoint-coordinates.js";
 import type { WorkerClient } from "./client.js";
 import { RequestError } from "./client.js";
-import { CLAUDE_PROVIDER_CAPABILITY, CLAUDE_PROVIDER_JOB_CAPABILITY, CLAUDE_PROVIDER_JUDGE_CAPABILITY, CODEX_PROVIDER_CAPABILITY, CODEX_PROVIDER_JUDGE_CAPABILITY } from "./provider-binding.js";
+import { CLAUDE_PROVIDER_CAPABILITY, CLAUDE_PROVIDER_JOB_CAPABILITY, CLAUDE_PROVIDER_JUDGE_CAPABILITY, CODEX_PROVIDER_CAPABILITY, CODEX_PROVIDER_CHECKER_CAPABILITY, CODEX_PROVIDER_JUDGE_CAPABILITY } from "./provider-binding.js";
 import { RUN_ENV_CAPABILITY } from "./run-env-claim.js";
 import { TerminalRejectionCoordinator } from "./terminal-rejections.js";
 import { replaySegment } from "./batcher.js";
@@ -1159,7 +1159,13 @@ export class Worker {
         if (this.config.memoryGuard?.enabled) protocolCapabilities.push("worker_memory_pressure_v1", "worker_memory_authority_claim_v1", "memory_park_settlement_v1");
         if (this.config.crossCheckSlots > 0) {
           protocolCapabilities.push("cross_check_lane_v1");
-          if (this.crossCheckRunner && this.config.codexHarness?.advertise) protocolCapabilities.push("cross_check_code_v1");
+          if (this.crossCheckRunner && this.config.codexHarness?.advertise) {
+            protocolCapabilities.push("cross_check_code_v1");
+            // Issue #4574 M2: this build runs a Codex provider-bound cross-check (cross-check-runner.ts
+            // provider branch), so it advertises codex_provider_checker_v1 under the Codex harness gate
+            // with a cross-check slot and runner.
+            protocolCapabilities.push(CODEX_PROVIDER_CHECKER_CAPABILITY);
+          }
         }
         protocolCapabilities.push("pending_outcome_scoped_claim_v1");
         // Issue #4628: fresh resume destination. Only a hosted slot (a UUID UZI_POD_UID) is a destination, and the api also

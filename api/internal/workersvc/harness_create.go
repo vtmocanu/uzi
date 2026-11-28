@@ -148,7 +148,7 @@ func (s *Service) createRunResolved(ctx context.Context, userID uuid.UUID, expli
 		}, origins...)
 		return run, err
 	}
-	if len(origins) > 0 && origins[0].RefuseProviderOwner {
+	if len(origins) > 0 && origins[0].CheckerLane {
 		if explicit == nil {
 			return store.Run{}, ErrProviderLaneUnsupported
 		}
@@ -159,7 +159,10 @@ func (s *Service) createRunResolved(ctx context.Context, userID uuid.UUID, expli
 		if !ok {
 			return store.Run{}, errHarnessStoreUnavailable
 		}
-		if err := s.refuseProviderLane(ctx, q, userID, *explicit); err != nil {
+		// No transaction here: Refused keeps its refusal, a Vendor decision keeps today's outcome per
+		// checker engine below, and only a Provider decision fails closed (its freeze needs the
+		// atomic create).
+		if err := s.checkerLaneNonAtomic(ctx, q, userID, *explicit, origins[0].LeadProviderBound); err != nil {
 			return store.Run{}, err
 		}
 	}

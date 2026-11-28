@@ -111,14 +111,18 @@ func crossCheckCandidateInput(cc store.CrossCheck, semantic ...*apitypes.Semanti
 }
 
 // singleFamilyCheckerCustody is the checker's credential custody rule (PRD #2149 D3,
-// PRD #2460): a child holds only its OWN family's credential. A codex child carries Codex
-// credentials and no Anthropic token; a claude child carries the Anthropic token and no
-// Codex credentials. Any other harness, or a child holding both or neither, is refused,
-// so a checker can never act as the lead's family.
+// PRD #2460): a child holds only its OWN family's credential. A codex child carries no
+// Anthropic token and EXACTLY ONE Codex credential source: the vendor Codex block, or (PRD
+// #4574 M2) a provider binding whose engine is codex. A claude child carries the Anthropic
+// token and no Codex credentials. Any other harness, or a child holding both or neither,
+// is refused, so a checker can never act as the lead's family.
 func singleFamilyCheckerCustody(harness string, payload *ClaimPayload) bool {
 	switch harness {
 	case string(HarnessCodex):
-		return payload.Secrets.Codex != nil && payload.Secrets.AnthropicOAuthToken == ""
+		if payload.Secrets.AnthropicOAuthToken != "" || (payload.Secrets.Provider != nil && payload.Secrets.Provider.Engine != harnessCodex) {
+			return false
+		}
+		return (payload.Secrets.Codex != nil) != (payload.Secrets.Provider != nil)
 	case string(HarnessClaude):
 		// PRD #4320 module 5: a checker child never holds a provider binding (cross-check has no
 		// provider support until PRD #4322); assembleClaim refuses a provider-bound child first.
@@ -145,11 +149,12 @@ func (s *Service) assemblePlanCrossCheckInput(ctx context.Context, worker store.
 	if err != nil {
 		return ErrCrossCheckRefused
 	}
+	var lead store.Run
 	if persisted.Stage == "code" {
-		_, err = q.LockCodeCrossCheckLeadForVerdict(ctx, store.LockCodeCrossCheckLeadForVerdictParams{
+		lead, err = q.LockCodeCrossCheckLeadForVerdict(ctx, store.LockCodeCrossCheckLeadForVerdictParams{
 			ChildID: run.ID, WorkerID: pgconv.UUID(worker.ID), ClaimGeneration: run.ClaimGeneration})
 	} else {
-		_, err = q.LockPlanCrossCheckLeadForVerdict(ctx, store.LockPlanCrossCheckLeadForVerdictParams{
+		lead, err = q.LockPlanCrossCheckLeadForVerdict(ctx, store.LockPlanCrossCheckLeadForVerdictParams{
 			ChildID: run.ID, WorkerID: pgconv.UUID(worker.ID), ClaimGeneration: run.ClaimGeneration})
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -172,6 +177,16 @@ func (s *Service) assemblePlanCrossCheckInput(ctx context.Context, worker store.
 	var modelSource, effortSource *string
 	if len(resolutions) > 0 && resolutions[0] != nil {
 		modelSource, effortSource = &resolutions[0].ModelSource, &resolutions[0].EffortSource
+	}
+	// PRD #4574 M2: the same-model guard runs under the lead verdict lock, after the checker's
+	// config and provider binding are assembled and before the claim is recorded. A refusal rolls
+	// this transaction back and settles through finishRunClaimTx's errCheckerPinUnavailable arm.
+	var resolution *agenttmpl.CrossCheckResolution
+	if len(resolutions) > 0 {
+		resolution = resolutions[0]
+	}
+	if err := checkSameModel(ctx, q, lead, run, persisted, payload, resolution); err != nil {
+		return err
 	}
 	var cc store.CrossCheck
 	if persisted.Stage == "code" {

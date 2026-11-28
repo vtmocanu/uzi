@@ -709,7 +709,7 @@ func TestProviderLanesRefuseAProviderSourcedOwnerLiveDB(t *testing.T) {
 	fx.anthropic()
 	fx.codexDefault()
 	lane := func() error {
-		_, _, err := fx.svc.createRunAtomic(fx.env.ctx, fx.userID, h(HarnessCodex), fx.insertAt(nil), harnessCreationOrigin{RefuseProviderOwner: true})
+		_, _, err := fx.svc.createRunAtomic(fx.env.ctx, fx.userID, h(HarnessCodex), fx.insertAt(nil), harnessCreationOrigin{CheckerLane: true})
 		return err
 	}
 	if err := lane(); err != nil {
@@ -731,7 +731,9 @@ func TestProviderLanesRefuseAProviderSourcedOwnerLiveDB(t *testing.T) {
 }
 
 // TestProviderCrossCheckFailsClosedToTheHumanGateLiveDB: a required plan cross-check of a
-// provider-bound lead cannot get a checker (the lane is refused), and the lead's "checker
+// provider-bound lead whose owner selected a Claude source and no Codex source cannot get a checker
+// (checkerLaneDecision: Refused; with a Codex source it would be Provider, see
+// TestCheckerLaneProviderFreezesTheCodexSourceLiveDB), and the lead's "checker
 // unavailable" report is the non-pass that forces the human gate: the run parks at
 // awaiting_approval with auto_approve cleared, never an auto-approval. The same report from a
 // vendor lead whose checker family is usable stays refused (the attestation is the provider rule's).
@@ -743,7 +745,7 @@ func TestProviderCrossCheckFailsClosedToTheHumanGateLiveDB(t *testing.T) {
 	lead := mustRun(t, fx.env, mustCreate(t, fx).ID)
 	fx.wantBound(lead, 1, fx.keyRev())
 	// The checker is the lead's opposite family (codex), usable, yet the lane is refused.
-	_, _, err := fx.svc.createRunAtomic(fx.env.ctx, fx.userID, h(HarnessCodex), fx.insertAt(nil), harnessCreationOrigin{RefuseProviderOwner: true})
+	_, _, err := fx.svc.createRunAtomic(fx.env.ctx, fx.userID, h(HarnessCodex), fx.insertAt(nil), harnessCreationOrigin{CheckerLane: true})
 	if !errors.Is(err, ErrProviderLaneUnsupported) {
 		t.Fatalf("checker creation err = %v, want provider_lane_unsupported", err)
 	}

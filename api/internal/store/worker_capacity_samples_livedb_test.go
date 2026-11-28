@@ -941,12 +941,19 @@ type wcsProbe struct {
 	conns      []net.Conn
 	lastSQL    string
 	afterSetup func() // runs when the session-settings statement has just completed
+	// onQueryStart, when set, runs at the start of every statement with its SQL text, before
+	// anything is sent: a test uses it to end the connection around one particular statement.
+	onQueryStart func(sql string)
 }
 
 func (p *wcsProbe) TraceQueryStart(ctx context.Context, _ *pgx.Conn, d pgx.TraceQueryStartData) context.Context {
 	p.mu.Lock()
 	p.lastSQL = d.SQL
+	hook := p.onQueryStart
 	p.mu.Unlock()
+	if hook != nil {
+		hook(d.SQL)
+	}
 	return ctx
 }
 

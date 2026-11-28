@@ -222,6 +222,12 @@ export interface CodexProviderConfigOptions {
   readonly codeModeHost?: boolean;
 }
 
+/** The custom-provider table id of a frozen binding. Hashes only non-secret authority identifiers;
+ * caller text never becomes a table identity. */
+export function codexCustomProviderName(binding: Pick<ClaimCodexProviderBinding, "provider_id" | "revision">): string {
+  return `uzi-provider-${createHash("sha256").update(JSON.stringify([binding.provider_id, binding.revision])).digest("hex")}`;
+}
+
 /** Build managed-login Responses HTTP config without granting execution authority.
  * The credential is delivered separately through account/login/start, never TOML. */
 export function buildCodexProviderConfigToml(opts: CodexProviderConfigOptions): string {
@@ -250,9 +256,7 @@ export function buildCodexProviderConfigToml(opts: CodexProviderConfigOptions): 
   if (Object.keys(opts.binding.model_map[slot]!).some(key => key !== "model" && key !== "context_window")) {
     throw new TrustedExecutionRefusal("Codex provider model received an unsupported option");
   }
-  // Hash only non-secret authority identifiers; caller text never becomes a table identity.
-  const identity = createHash("sha256").update(JSON.stringify([binding.provider_id, binding.revision])).digest("hex");
-  const providerName = `uzi-provider-${identity}`;
+  const providerName = codexCustomProviderName(binding);
   return [
     ...(entry.context_window === undefined ? [] : [`model_context_window = ${entry.context_window}`]),
     ...nativeDisabledConfigLines(entry.model, providerName, opts.projectPath, opts.codeModeHost ?? false),

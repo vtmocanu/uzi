@@ -20,7 +20,11 @@ import { ExecutionRegistry, newLocalExecutionEpoch } from "./registry.js";
 import { createCodexTransport, CodexTransportError, type CodexTransport, type CodexNotification, type CodexThreadTokenUsage } from "./transport.js";
 import { CrossCheckCheckerUnavailableError } from "./model-rejection.js";
 import { createCodexAppServerAuth, type CodexAppServerAuthSession } from "./appserver-auth.js";
-import { selectCodexBinding } from "./select.js";
+import { selectCodexExecutionAuthority } from "./select.js";
+import { codexCustomProviderName } from "./config.js";
+import { ProviderModelUnmappedError, resolveCodexProviderModelSlot } from "../provider-binding.js";
+import { providerKeyForms } from "../redact.js";
+import type { ClaimCodexProviderBinding } from "../protocol.js";
 import { CodexUsageAccountant } from "./token-accounting.js";
 import { launchCodexRoot, launchCodexEffectRoot, CODEX_BIN, SUPERVISOR_BIN, PROVIDER_CHILD_ARGV, type CodexRootHandle } from "./launcher.js";
 import { prepareCodexRunHome, buildAppServerRefreshBridge } from "./codex-executor.js";
@@ -350,6 +354,8 @@ function ownerSteeringFences(steering: ClaimResponse["cross_check_owner_steering
 
 export interface CrossCheckModelDeps {
  launchProvider?: typeof launchCodexRoot;
+ /** Validated private-CA bundle (config.codexExtraCa); carried only by a provider-bound launch. */
+ codexExtraCa?: import("./extra-ca.js").ValidatedExtraCa;
  launchFileop?: typeof launchCodexEffectRoot;
  prepareHome?: typeof prepareCodexRunHome;
  wireFileop?: typeof wireFileopHelper;
@@ -362,24 +368,46 @@ export class CodexCrossCheck {
   postUsage: (payload: Record<string, unknown>) => Promise<void>, confirmNativeCleanup?: () => void,
     /** Activity recorder (PRD #3166); fed paths, line ranges and counts only: never a query or file content. */
     activity?: CheckActivityRecorder): Promise<string> {
-  const selected = selectCodexBinding(claim.secrets);
+  const selected = selectCodexExecutionAuthority(claim.secrets);
   if (claim.kind !== "cross_check" || selected.kind !== "codex") throw new Error("cross-check requires Codex");
   const prompt = crossCheckPrompt(claim);
   const verdictLimit = claim.cross_check?.stage === "code" ? CODE_COVERAGE_LIMITS.verdictBytes : 64 * 1024;
-  const model = claim.config?.default_model?.trim();
-  if (!model) throw new Error("cross-check claim has no model");
+  const logicalModel = claim.config?.default_model?.trim();
+  const authority = selected.binding;
+  const providerAuthority = authority.authMode === "provider" ? authority : undefined;
+  const binding = authority.authMode === "provider" ? undefined : authority;
+  // A vendor checker needs the claimed model; a provider checker resolves it through its frozen map.
+  if (!logicalModel && !providerAuthority) throw new Error("cross-check claim has no model");
   if (claim.cross_check?.effort_source === "pin"
    && !["low", "medium", "high", "xhigh", "max"].includes(claim.config?.default_effort ?? "")) {
    throw new CrossCheckCheckerUnavailableError();
   }
   const modelPinned = claim.cross_check?.model_source === "pin";
-  const binding = selected.binding;
+  // Provider: the map slot selects the launch config; the slot's mapped target is the model every RPC
+  // and the usage accountant carry. An explicit owner pin must have its own slot; a missing slot is
+  // reported as checker_unavailable (CrossCheckCheckerUnavailableError), like the server's same-model guard.
+  const providerMap = providerAuthority?.providerBinding.model_map;
+  let providerSlot: ReturnType<typeof resolveCodexProviderModelSlot> | undefined;
+  if (providerMap) {
+   try {
+    providerSlot = resolveCodexProviderModelSlot(logicalModel, providerMap as ClaimCodexProviderBinding["model_map"], modelPinned);
+   } catch (err) {
+    if (err instanceof ProviderModelUnmappedError) throw new CrossCheckCheckerUnavailableError();
+    throw err;
+   }
+  }
+  const providerEntry = providerMap && providerSlot ? providerMap[providerSlot]! : undefined;
+  const model = providerEntry ? providerEntry.model : logicalModel!;
   const secrets = new Set<string>();
   const registerToken = (token: string): void => {
    if (!secrets.has(token)) { secrets.add(token); this.log.addSecret(token); }
   };
-  registerToken(binding.accessToken);
-  registerToken(binding.capability);
+  if (binding) {
+   registerToken(binding.accessToken);
+   registerToken(binding.capability);
+  }
+  // Reference-counted against the runner's own registration of the same forms.
+  if (providerAuthority) for (const form of providerKeyForms(providerAuthority.providerBinding.credential)) registerToken(form);
   const registry = new ExecutionRegistry(newLocalExecutionEpoch(0));
   const handles: CodexRootHandle[] = [];
   let transport: CodexTransport | undefined;
@@ -391,7 +419,7 @@ export class CodexCrossCheck {
   let succeeded = false;
   let completedText: string | undefined;
   let failure: { error: unknown } | undefined;
-  const operation = binding.authMode === "subscription"
+  const operation = binding?.authMode === "subscription"
    ? acquireCodexOperationScope(this.client, claim.run_id, claim.claim_generation ?? 0, {}, undefined, undefined, this.log, codexOperationAuthorityIdentity(binding.capability)) : undefined;
   const failedRoot = new AbortController();
   signal = AbortSignal.any([signal, failedRoot.signal]);
@@ -426,22 +454,36 @@ export class CodexCrossCheck {
    const ready = await fileopHandle.client.op({ op: "stat", path: "." });
    signal.throwIfAborted();
    if (!ready.ok) throw new Error("cross-check fileop confinement unverified");
-   const released = await this.client.releaseCodex(claim.run_id, { capability: binding.capability },
-    binding.authMode === "subscription"
-     ? { authMode: "subscription", chatgptAccountId: binding.chatgptAccountId, minimumGeneration: binding.generation }
-     : { authMode: "api_key" }, signal);
-   signal.throwIfAborted();
-   registerToken(released.access_token);
-   auth = createCodexAppServerAuth(binding.authMode === "subscription"
-    ? { mode: "subscription", initial: { accessToken: released.access_token, accountId: binding.chatgptAccountId },
-        bridge: buildAppServerRefreshBridge(claim.run_id, this.client, binding,
-         { value: released.auth_mode === "subscription" ? released.generation : binding.generation }, registerToken) }
-    : { mode: "api_key", apiKey: released.access_token });
-   const provider = await (this.deps.launchProvider ?? launchCodexRoot)({
-    kind: "provider", ownedDataRoot: path.join(home, "codex-data", randomUUID()),
+   if (providerAuthority) {
+    // The frozen provider key is the only credential: no vendor release or refresh, no operation scope.
+    auth = createCodexAppServerAuth({ mode: "provider", apiKey: providerAuthority.providerBinding.credential });
+   } else {
+    const vendor = binding!;
+    const released = await this.client.releaseCodex(claim.run_id, { capability: vendor.capability },
+     vendor.authMode === "subscription"
+      ? { authMode: "subscription", chatgptAccountId: vendor.chatgptAccountId, minimumGeneration: vendor.generation }
+      : { authMode: "api_key" }, signal);
+    signal.throwIfAborted();
+    registerToken(released.access_token);
+    auth = createCodexAppServerAuth(vendor.authMode === "subscription"
+     ? { mode: "subscription", initial: { accessToken: released.access_token, accountId: vendor.chatgptAccountId },
+         bridge: buildAppServerRefreshBridge(claim.run_id, this.client, vendor,
+          { value: released.auth_mode === "subscription" ? released.generation : vendor.generation }, registerToken) }
+     : { mode: "api_key", apiKey: released.access_token });
+   }
+   const ownedDataRoot = path.join(home, "codex-data", randomUUID());
+   const provider = await (this.deps.launchProvider ?? launchCodexRoot)(providerAuthority ? {
+    kind: "provider", ownedDataRoot,
+    providerBinding: providerAuthority.providerBinding as ClaimCodexProviderBinding,
+    ...(this.deps.codexExtraCa ? { codexExtraCa: this.deps.codexExtraCa } : {}),
+    model: providerSlot!, codexBin: CODEX_BIN, supervisorBin: SUPERVISOR_BIN, childArgv: PROVIDER_CHILD_ARGV,
+    cwd: checkout, useAppServerAuth: true, authMode: "provider", codeModeHost: true,
+    crossCheckReadOnly: true,
+   } : {
+    kind: "provider", ownedDataRoot,
     provider: { name: "openai", baseUrl: "https://api.openai.com/v1", envKey: "OPENAI_API_KEY" },
     model, codexBin: CODEX_BIN, supervisorBin: SUPERVISOR_BIN, childArgv: PROVIDER_CHILD_ARGV,
-    cwd: checkout, useAppServerAuth: true, authMode: binding.authMode, codeModeHost: true,
+    cwd: checkout, useAppServerAuth: true, authMode: binding!.authMode, codeModeHost: true,
     crossCheckReadOnly: true,
    });
    own(provider);
@@ -488,10 +530,12 @@ export class CodexCrossCheck {
     delegate: async () => { throw new Error("checker has no delegation authority"); },
    });
    const thread = await startupRequest<{ thread?: { id?: string } }>("thread/start", {
-    model, modelProvider: "openai", cwd: checkout, approvalPolicy: "never", ephemeral: true,
+    model, modelProvider: providerAuthority ? codexCustomProviderName(providerAuthority.providerBinding) : "openai",
+    cwd: checkout, approvalPolicy: "never", ephemeral: true,
     environments: [], dynamicTools: buildCodexDynamicTools(GRANTS), developerInstructions: claim.cross_check?.stage === "code"
     ? codeCrossCheckBriefWithGuidance("Read and Search", codeGuidanceOf(claim)) : BRIEF,
-    config: { shell_tool: false, project_doc_max_bytes: 0, projects: { [checkout]: { trust_level: "untrusted" } } },
+    config: { shell_tool: false, project_doc_max_bytes: 0, projects: { [checkout]: { trust_level: "untrusted" } },
+     ...(providerEntry?.context_window !== undefined ? { model_context_window: providerEntry.context_window } : {}) },
    });
    threadId = thread.thread?.id;
    if (typeof threadId !== "string" || !threadId) throw new Error("cross-check missing thread");
@@ -504,7 +548,10 @@ export class CodexCrossCheck {
     signal.throwIfAborted();
    } while (permit?.() === false);
    startingTurn = true;
-   const admissionAttempt = this.client.codexAdmissionReporter?.(claim.run_id, claim.claim_generation)?.begin(threadId);
+   // The admission reporter feeds the vendor account's rate-limit state; a gateway limit on a provider
+   // checker is a non-pass only and must never reach a vendor cooldown, so a provider run opens none.
+   const admissionAttempt = providerAuthority ? undefined
+    : this.client.codexAdmissionReporter?.(claim.run_id, claim.claim_generation)?.begin(threadId);
    const turn = await startupRequest<{ turn?: { id?: string } }>("turn/start", {
     threadId, model, ...(claim.config?.default_effort ? { effort: claim.config.default_effort } : {}),
     input: [{ type: "text", text: prompt }], environments: [],
@@ -682,7 +729,8 @@ export class CodexCrossCheck {
    try { await fileopHandle?.dispose(); } catch { cleanupOK = false; }
    try {
     if (usageInit) await postUsage({ event: "result", subtype: "cross_check", is_error: !succeeded || !cleanupOK || signal.aborted,
-     modelUsage: accountant.aggregateByModel({ authMode: binding.authMode, now: new Date() }) ?? {} });
+     // A provider run reports tokens but never a vendor-table cost: no pricing context at all.
+     modelUsage: accountant.aggregateByModel(binding ? { authMode: binding.authMode, now: new Date() } : undefined) ?? {} });
    } catch (error) {
     failure ??= { error };
    } finally {

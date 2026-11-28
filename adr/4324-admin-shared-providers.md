@@ -202,6 +202,8 @@ Pinned by `TestSharedScopeImageOnlyRollbackLiveDB` and `TestSharedScopeDownGuard
 
 Admin-shared **Codex** definitions (issue #4633). The Claude decisions above stand; this section records what changed. Not shipped: operator-key custody (#4540, `credential_mode` still admits only `per_user_key`), Codex on the judge and cross-check lanes (#4574), and hosted acceptance of the Codex path, which is owner acceptance and not verified here.
 
+Amended 2026-11-27: Codex on the judge shipped in #4574 M1 and Codex provider checkers in #4574 M2 (see ADR-4320 D9). The "not shipped" text above is kept as the record at #4633.
+
 ### Behaviour
 
 - An admin creates a shared definition for either engine; the engine is chosen at creation, Claude is the default, and it never changes afterwards (D4, D5). A Codex definition is `openai_responses` with Bearer auth and a `default` model slot. An omitted protocol defaults per engine, which differs from personal create (D4).

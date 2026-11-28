@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { afterEach, beforeEach, describe, it, mock } from "node:test";
 import { WorkerClient } from "../src/client.js";
-import { CLAUDE_PROVIDER_CAPABILITY, CLAUDE_PROVIDER_JOB_CAPABILITY, CLAUDE_PROVIDER_JUDGE_CAPABILITY, CODEX_PROVIDER_JUDGE_CAPABILITY } from "../src/provider-binding.js";
+import { CLAUDE_PROVIDER_CAPABILITY, CLAUDE_PROVIDER_JOB_CAPABILITY, CLAUDE_PROVIDER_JUDGE_CAPABILITY, CODEX_PROVIDER_CHECKER_CAPABILITY, CODEX_PROVIDER_JUDGE_CAPABILITY } from "../src/provider-binding.js";
 import { makeClaim, recordingLogger } from "./helpers.js";
 
 // PRD #4320 module 5: the claim decoder is fail-closed on a provider binding, on the run lane
@@ -178,6 +178,36 @@ describe("a Codex provider judge claim requires codex_provider_judge_v1", () => 
     await client.register("provider-worker", undefined, undefined, undefined, [...CODEX_CAPS, CLAUDE_PROVIDER_CAPABILITY, CLAUDE_PROVIDER_JUDGE_CAPABILITY]);
     setBody("judge", { forge_pat: "", anthropic_oauth_token: "", provider: codexProvider() });
     await assert.rejects(client.claimRun(), /judge capability not advertised/);
+  });
+});
+
+// Issue #4574 M2: a Codex provider-bound CROSS-CHECK claim also needs codex_provider_checker_v1.
+describe("a Codex provider cross-check claim requires codex_provider_checker_v1", () => {
+  // The dedicated cross-check lane answers with the X-Uzi-Claim-Kind marker the client cross-checks.
+  beforeEach(() => {
+    mock.restoreAll();
+    mock.method(globalThis, "fetch", async (input: string | URL | Request) => {
+      const pathname = new URL(String(input)).pathname;
+      if (pathname.endsWith("/register")) return Response.json({ worker_id: "provider-worker" });
+      if (pathname.endsWith("/runs/claim")) return Response.json(body, { headers: { "X-Uzi-Claim-Kind": "cross_check" } });
+      throw new Error("unexpected request: " + pathname);
+    });
+  });
+
+  it("refuses a Codex provider checker on the trio alone, accepts it with the checker capability", async () => {
+    await client.register("provider-worker", undefined, undefined, undefined, CODEX_CAPS);
+    setBody("cross_check", { forge_pat: "", provider: codexProvider() });
+    await assert.rejects(client.claimCrossCheck(), (e: Error) => /malformed provider binding on claim: checker capability not advertised/.test(e.message) && !e.message.includes(KEY));
+    await client.register("provider-worker", undefined, undefined, undefined, [...CODEX_CAPS, CODEX_PROVIDER_CHECKER_CAPABILITY]);
+    setBody("cross_check", { forge_pat: "", provider: codexProvider() });
+    const decoded = await client.claimCrossCheck();
+    assert.equal((decoded!.secrets as { provider?: { engine: string } }).provider?.engine, "codex");
+  });
+
+  it("does not let the judge capability stand in for the checker one", async () => {
+    await client.register("provider-worker", undefined, undefined, undefined, [...CODEX_CAPS, CODEX_PROVIDER_JUDGE_CAPABILITY]);
+    setBody("cross_check", { forge_pat: "", provider: codexProvider() });
+    await assert.rejects(client.claimCrossCheck(), /checker capability not advertised/);
   });
 });
 

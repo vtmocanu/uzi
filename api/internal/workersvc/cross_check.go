@@ -267,26 +267,16 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return store.CrossCheck{}, err
 	}
-	// Recover an immutable attempt first, then refuse the actual frozen lead before
-	// any fresh checker credential usability or resolution work.
-	if providerBoundRun(locked) {
-		return store.CrossCheck{}, ErrCrossCheckUnavailable
-	}
+	// Only the immutable retry/recover handling above and the lead's frozen binding are read before
+	// the create transaction. Whether a provider-bound lead (or a selected source) has a checker lane
+	// is decided once, in the create transaction under the shared secret-mutation lock
+	// (checkerLaneDecision); the closure re-asserts this binding against the locked lead.
+	leadProviderBound := providerBoundRun(locked)
 	_, _, err = s.preparePlanCrossCheckRound(ctx, retryQ, locked, worker, round)
 	if err != nil {
 		return store.CrossCheck{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return store.CrossCheck{}, err
-	}
-	rq, ok := s.q.(providerLaneSourceReader)
-	if !ok {
-		return store.CrossCheck{}, errHarnessStoreUnavailable
-	}
-	if err := s.refuseProviderLane(ctx, rq, lead.UserID, childHarness); err != nil {
-		if errors.Is(err, ErrProviderLaneUnsupported) {
-			return store.CrossCheck{}, ErrCrossCheckUnavailable
-		}
 		return store.CrossCheck{}, err
 	}
 	if s.planCrossCheckAfterPreflightHook != nil {
@@ -328,8 +318,8 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 			validateCrossCheckContext(locked.IssueTitle, locked.IssueDescription) != nil {
 			return store.Run{}, ErrCrossCheckRefused
 		}
-		if providerBoundRun(locked) {
-			// A provider-bound lead has no checker lane in this slice.
+		if providerBoundRun(locked) != leadProviderBound {
+			// The lane decision was taken over a different lead binding: Refused.
 			return store.Run{}, ErrProviderLaneUnsupported
 		}
 		candidate.RequiredCapabilities = applyInferredCapabilityPolicy(locked, candidate.RequiredCapabilities)
@@ -360,6 +350,11 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 		childID := uuid.New()
 		child, e := txq.CreatePlanCrossCheckChild(ctx, store.CreatePlanCrossCheckChildParams{
 			ChildID: childID, ChildHarness: string(childHarness), LeadRunID: leadID, UserID: lead.UserID, WorkerID: pgconv.UUID(worker.ID), ClaimGeneration: generation, BudgetWallSeconds: budgetWallSeconds,
+			ModelProviderID:          bindingOf(resolved).ProviderID,
+			ModelProviderRevision:    bindingOf(resolved).Revision,
+			ModelProviderKeyMode:     bindingOf(resolved).KeyMode,
+			ModelProviderKeySecretID: bindingOf(resolved).KeySecret,
+			ModelProviderKeyRev:      bindingOf(resolved).KeyRev,
 		})
 		if errors.Is(e, pgx.ErrNoRows) {
 			// The guarded write found no lead of the opposite family in this state.
@@ -391,12 +386,12 @@ func (s *Service) SubmitPlanCrossCheck(ctx context.Context, worker store.Worker,
 			return store.Run{}, fmt.Errorf("freeze owner steering: %w", e)
 		}
 		return child, nil
-	}, harnessCreationOrigin{RefuseProviderOwner: true}) // Enforce the engine-aware unsupported-lane selection policy.
+	}, harnessCreationOrigin{CheckerLane: true, LeadProviderBound: leadProviderBound}) // checkerLaneDecision, under the shared secret lock.
 	if errors.Is(err, errRetry) {
 		return existing, nil
 	}
 	if errors.Is(err, ErrNoCredentialForHarness) || errors.Is(err, ErrHarnessCredentialDisabled) ||
-		errors.Is(err, ErrProviderLaneUnsupported) || errors.Is(err, ErrProviderSourceUnusable) {
+		errors.Is(err, ErrProviderLaneUnsupported) || errors.Is(err, errProviderCreateRequiresTx) || errors.Is(err, ErrProviderSourceUnusable) {
 		// A refused provider selection or frozen provider lead has the same non-pass as a missing
 		// checker credential gives, so the plan fails closed to the human gate, never auto-approves.
 		return store.CrossCheck{}, ErrCrossCheckUnavailable

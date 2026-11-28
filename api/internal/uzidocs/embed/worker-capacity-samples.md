@@ -78,12 +78,17 @@ gap until the lock is released, and in a larger fleet every worker from that
 batch onward is. A failed batch can be retried in the same bucket without
 duplicating samples.
 
-## No age-based expiry
+## Retention
 
-No sample is deleted by age. Samples are kept until their owner is deleted,
-which removes them (cascade). Deleting a worker, including an ephemeral worker
-when its run ends, keeps its samples. A configurable, off-by-default deletion
-mechanism for analytics history is left to a later issue.
+Age-based expiry is opt-in and off by default. Set `UZI_HISTORY_RETENTION` (a Go duration of at
+least `24h`; see [History retention](configuration.md#history-retention-issue-4695)) and the
+`history_retention` sweeper pass deletes `worker_capacity_samples` rows whose `bucket_start` is
+older than that age. The age applies to these ordinary samples only; the protected records of the
+other history pages (`pr_history_heads` and `first_merge` events) are exempt and keep their
+repository cascade. Cascades are unchanged: with retention off, no sample is deleted by age, and
+samples are removed with their owner (cascade). Deleting a worker, including an ephemeral worker
+when its run ends, keeps its samples. Deletes by the pass are irreversible; a database backup is
+the only recovery.
 
 ## Growth
 
@@ -93,6 +98,10 @@ Every registered worker row is sampled, online or offline, so each one writes
 288 samples a day, 105,120 a year, until the worker is deleted. The owner index
 compresses well with many workers per owner; with one worker per owner, an
 estimate (not measured) is nearer 28 MiB per worker-year.
+
+These figures were measured before the retention index (migration 00558, a btree on
+`bucket_start`) existed and do not include it. Without retention they are the growth to
+plan for; with `UZI_HISTORY_RETENTION` set, rows older than that age are deleted.
 
 | Quantity | Value |
 |---|---|
