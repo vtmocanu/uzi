@@ -451,3 +451,13 @@ func TestHistoryRetentionEvidenceParseBuffersSharedOnly(t *testing.T) {
 		t.Fatalf("temp-only line gave hit=%d read=%d, want 0 0", h, r)
 	}
 }
+
+// An unavailable residual count is reported as unknown (nil), never as a drained zero.
+func TestHistoryRetentionEvidenceResidualFieldUnknownWhenUnavailable(t *testing.T) {
+	if v := heResidualField(heProbe{Unavailable: "context deadline exceeded"}); v != nil {
+		t.Fatalf("residual field = %v for an unavailable count, want nil", v)
+	}
+	if v := heResidualField(heProbe{Residual: 7}); v != int64(7) {
+		t.Fatalf("residual field = %v (%T), want int64 7", v, v)
+	}
+}

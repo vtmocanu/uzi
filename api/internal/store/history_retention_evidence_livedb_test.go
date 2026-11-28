@@ -1795,6 +1795,15 @@ func heNearEmptyGate(residual int64) (runProbes bool, reason string) {
 
 // nearEmptyProbe counts the rows still eligible at the cutoff of the last tick (everything below it
 // should be gone). With any left no near-empty probe runs: a probe that deletes is not near-empty.
+// heResidualField is the residual for a record: nil when the count was unavailable, so an
+// unknown residual never reads as a drained table.
+func heResidualField(p heProbe) any {
+	if p.Unavailable != "" {
+		return nil
+	}
+	return p.Residual
+}
+
 func (fx *heFx) nearEmptyProbe(mode, cand string, table store.HistoryRetentionTable, r *heTabRun, done int) heProbe {
 	fx.t.Helper()
 	cut := r.cutoff0.Add(time.Duration(done) * heTick)
@@ -1833,11 +1842,18 @@ func (fx *heFx) nearEmptyProbe(mode, cand string, table store.HistoryRetentionTa
 		kv["noop_median_ms"], kv["noop_max_ms"], kv["noop_deleted"] = heQuant(del, 0.5), heMaxF(del), p.NoopDeleted
 		kv["probe_errors"], kv["probe_error_sample"] = len(p.Errors), heSample(p.Errors)
 	}
-	for a, b := range fx.sizes(table, cand).kv() {
-		kv[a] = b
-	}
-	for a, b := range fx.tableStats(table) {
-		kv[a] = b
+	if p.Unavailable != "" {
+		// The residual count could not complete (a lock or a stall). The size and stats queries
+		// would wait on the same lock with no deadline, so they are skipped and the record is
+		// written without them; residual_backlog is unknown, not zero.
+		kv["residual_backlog"] = nil
+	} else {
+		for a, b := range fx.sizes(table, cand).kv() {
+			kv[a] = b
+		}
+		for a, b := range fx.tableStats(table) {
+			kv[a] = b
+		}
 	}
 	fx.log.rec("near_empty", kv)
 	return p
@@ -1902,7 +1918,7 @@ func (fx *heFx) reportCompressed(mode, cand string, table store.HistoryRetention
 		"stop_reason": o.stop, "stop_detail": o.stopDetail,
 		"arrivals_per_tick": r.arrivals, "eligible_initial": r.eligible0,
 		"window_deleted": total, "window_arrivals": int64(done * r.arrivals),
-		"residual_backlog": o.probe.Residual, "residual_unavailable": o.probe.Unavailable, "near_empty_valid": o.probe.Valid,
+		"residual_backlog": heResidualField(o.probe), "residual_unavailable": o.probe.Unavailable, "near_empty_valid": o.probe.Valid,
 		"probe_errors": len(o.probe.Errors), "probe_error_sample": heSample(o.probe.Errors), "probe_noop_deleted": o.probe.NoopDeleted,
 		"pass_errors": len(o.passErrs), "pass_error_sample": heSample(o.passErrs),
 		"first_short_batch_tick": r.firstShort, "info_cycles": cycles, "info_cycles_not_exceeding": badCycles,
