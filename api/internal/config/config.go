@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -481,6 +482,10 @@ type Config struct {
 	RunIdleTimeout             time.Duration // worker-side no-message idle cap
 	WorkerTaskIdleTimeout      time.Duration // PRD #517 M5: interactive-task park idle cap (worker-side); rides the claim
 	RunMaxIterations           int           // implement⇄review loop cap (worker-side)
+
+	// AnalyticsSnapshotInterval is the cadence of the stored admin all-time Spend documents
+	// (issue #4771); 0 turns the feature off. UZI_ANALYTICS_SNAPSHOT_INTERVAL, default 4h.
+	AnalyticsSnapshotInterval time.Duration
 	// HandoffRunTimeout / HandoffRunMaxIterations (issue #785) are the dedicated default
 	// wall-clock budget and iteration cap for a NON-interactive `uzi handoff` task run.
 	// Decoupled from RunTimeout / RunMaxIterations so raising one does not move the other.
@@ -1002,6 +1007,13 @@ const minSecretLen = 16
 // FORGE_ALLOWED_BASE_URLS.
 const defaultForgeBaseURL = "https://github.com"
 
+// DefaultAnalyticsSnapshotInterval is the stored-analytics build cadence when
+// UZI_ANALYTICS_SNAPSHOT_INTERVAL is absent.
+const DefaultAnalyticsSnapshotInterval = 4 * time.Hour
+
+// AnalyticsSnapshotIntervalError is Load's error for an invalid UZI_ANALYTICS_SNAPSHOT_INTERVAL.
+const AnalyticsSnapshotIntervalError = "UZI_ANALYTICS_SNAPSHOT_INTERVAL must be 0 (off) or a Go duration of at least 1h"
+
 // Load reads configuration from the environment and validates it. It returns
 // an error (rather than exiting) so the caller controls the failure path.
 func Load() (Config, error) {
@@ -1243,6 +1255,14 @@ func Load() (Config, error) {
 		if cfg.RunWallCeiling < time.Second || cfg.RunWallCeiling < cfg.RunTimeout || cfg.RunWallCeiling > 72*time.Hour {
 			return Config{}, fmt.Errorf("RUN_WALL_CEILING must be at least 1s, at least RUN_TIMEOUT, and at most 72h")
 		}
+	}
+	cfg.AnalyticsSnapshotInterval = DefaultAnalyticsSnapshotInterval
+	if raw, present := os.LookupEnv("UZI_ANALYTICS_SNAPSHOT_INTERVAL"); present {
+		d, err := time.ParseDuration(raw)
+		if err != nil || d < 0 || (d != 0 && d < time.Hour) {
+			return Config{}, errors.New(AnalyticsSnapshotIntervalError)
+		}
+		cfg.AnalyticsSnapshotInterval = d
 	}
 	cfg.PlanCrossCheckMaxRevisions = DefaultPlanCrossCheckMaxRevisions
 	if raw, present := os.LookupEnv("PLAN_CROSS_CHECK_MAX_REVISIONS"); present {

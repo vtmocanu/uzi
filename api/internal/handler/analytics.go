@@ -154,12 +154,20 @@ type analyticsRequest struct {
 	// an admin request with user=<uuid>.
 	allUsers  bool
 	scopeUser uuid.UUID
+
+	// snapshotOn is whether the stored all-time Spend feature is on (issue #4771); it only
+	// widens what an admin all-users request may ask for.
+	snapshotOn bool
+	// precomputed is true for the one request shape served from a stored document: admin
+	// all-users Spend, window=all, unfiltered, UTC, with the feature on.
+	precomputed bool
 }
 
 // parseAnalyticsRequest validates the query without touching the database. The returned
 // message is the 400 text and names the offending parameter; it never echoes the value.
-func parseAnalyticsRequest(q url.Values, admin bool, section string, caller uuid.UUID) (analyticsRequest, string) {
-	req := analyticsRequest{admin: admin, section: section, scopeUser: caller}
+// snapshotOn says whether the stored all-time Spend documents are enabled.
+func parseAnalyticsRequest(q url.Values, admin bool, section string, caller uuid.UUID, snapshotOn bool) (analyticsRequest, string) {
+	req := analyticsRequest{admin: admin, section: section, scopeUser: caller, snapshotOn: snapshotOn}
 
 	allowed := []string{"window", "tz", "repo", "harness", "kind"}
 	switch section { // capacity takes no grouping controls
@@ -249,12 +257,18 @@ func parseAnalyticsRequest(q url.Values, admin bool, section string, caller uuid
 		}
 	}
 
-	// Owner decision: admin all-users all-time spend is deferred to a follow-up that adds
-	// per-run totals for finished runs; Reliability, Capacity (issue #4731), Quality (#4730) and
-	// Flow (#4729) follow the same window choices. Options still accepts and ignores window, so
-	// the check is skipped for it.
-	if section != analytics.SectionOptions && !slices.Contains(req.windowChoices(), string(req.window)) {
-		return req, msgAnalyticsWindowAllAllUsers
+	// Owner decision: admin all-users all-time is served only for Spend, from a stored document
+	// (issue #4771), and only unfiltered and in UTC; Reliability, Capacity (issue #4731), Quality
+	// (#4730) and Flow (#4729) refuse it. Options still accepts and ignores window, so the check
+	// is skipped for it. This runs after value validation and before split/breakdown validation.
+	if section != analytics.SectionOptions && req.allUsers && req.window == analytics.WindowAll {
+		if section != analytics.SectionSpend || !snapshotOn {
+			return req, msgAnalyticsWindowAllAllUsers
+		}
+		if req.repo != uuid.Nil || req.harness != "" || req.kindName != "" || req.tzName != "UTC" {
+			return req, msgAnalyticsAllTimeUnfilteredUTC
+		}
+		req.precomputed = true
 	}
 
 	splits, breakdowns := req.splitChoices(), req.breakdownChoices()
@@ -287,11 +301,11 @@ func parseCanonicalUUID(v string) (uuid.UUID, bool) {
 	return id, err == nil && id != uuid.Nil
 }
 
-// windowChoices are the windows this scope may use; the all-time window is not offered for
-// an admin response spanning every user.
-func (r analyticsRequest) windowChoices() []string {
+// optionWindows are the windows the options response lists: the all-time window is offered to
+// an admin response spanning every user only while the stored all-time Spend is on.
+func (r analyticsRequest) optionWindows() []string {
 	w := slices.Clone(analyticsWindows)
-	if r.allUsers {
+	if r.allUsers && !r.snapshotOn {
 		w = slices.DeleteFunc(w, func(s string) bool { return s == string(analytics.WindowAll) })
 	}
 	return w
@@ -401,9 +415,13 @@ func (h *Handler) serveAnalytics(w http.ResponseWriter, r *http.Request, admin b
 		httpx.Error(w, http.StatusBadRequest, "invalid query")
 		return
 	}
-	req, msg := parseAnalyticsRequest(query, admin, section, user.ID)
+	req, msg := parseAnalyticsRequest(query, admin, section, user.ID, h.cfg.AnalyticsSnapshotInterval > 0)
 	if msg != "" {
 		httpx.Error(w, http.StatusBadRequest, msg)
+		return
+	}
+	if req.precomputed {
+		h.serveAllTimeSpend(w, r, req)
 		return
 	}
 
@@ -514,7 +532,7 @@ func (d *analyticsDeps) options(ctx context.Context, s *store.AnalyticsSnapshot,
 		Scope:        req.scope(),
 		GeneratedAt:  now,
 		SelectedUser: req.scope().User,
-		Windows:      req.windowChoices(),
+		Windows:      req.optionWindows(),
 		Kinds:        append(runkind.All(), analyticsKindSets...),
 		Harnesses:    slices.Clone(analyticsHarnesses),
 		Splits:       req.splitChoices(),
@@ -799,6 +817,10 @@ func (m *spendMapper) createdAt(s string) time.Time {
 // msgAnalyticsWindowAllAllUsers is the 400 message for an admin all-users window=all request on
 // any section except options (Spend, Reliability, Capacity and Quality).
 const msgAnalyticsWindowAllAllUsers = "window all not available for all users"
+
+// msgAnalyticsAllTimeUnfilteredUTC is the 400 message for an admin all-users all-time Spend
+// request that carries a filter or a timezone other than UTC (issue #4771).
+const msgAnalyticsAllTimeUnfilteredUTC = "all-time view across all users is only available unfiltered in UTC"
 
 // analyticsEnvelope builds the calendar envelope every analytics response is indexed against.
 func analyticsEnvelope(req analyticsRequest, b analytics.Bounds) apitypes.AnalyticsEnvelopeDTO {

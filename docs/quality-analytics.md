@@ -62,9 +62,12 @@ into the `zero` group, and deleting a review moves a target from `complete` to
 - **Admin all-users `window=all` is refused.** With `user` omitted or
   `user=all`, `window=all` is a 400 `window all not available for all users`.
   The answer is identical for both spellings, is given before any analytics
-  database work (authentication runs first) and is not a 503. Options does not
-  list `all` for that scope. The owner route and admin `user=<uuid>` accept
-  `window=all`. This follows the owner decision recorded for Spend.
+  database work (authentication runs first) and is not a 503. Quality keeps
+  this 400 whatever `UZI_ANALYTICS_SNAPSHOT_INTERVAL` is set to. Options lists
+  `all` for that scope only while that setting is not `0`, and that is for the
+  Spend snapshot (see [All-time Spend for all users](usage-analytics.md#all-time-spend-for-all-users-snapshot));
+  Quality never serves it. The owner route and admin `user=<uuid>` accept
+  `window=all`.
 
 ## Admission and timeouts
 

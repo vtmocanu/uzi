@@ -68,6 +68,9 @@ type Handler struct {
 	adminProbeAfterDial func()
 	pool                *pgxpool.Pool
 	q                   *store.Queries
+	// analyticsPrecomputedDoc is a test seam for the stored all-time Spend read; nil reads h.q
+	// (issue #4771).
+	analyticsPrecomputedDoc func(ctx context.Context, section, key string) (doc []byte, generatedAt time.Time, err error)
 	// anthropicHistory is a test-only override of the usage-history recorder the test-connection
 	// handler copies accepted Anthropic readings through; nil means h.q (issue #4692).
 	anthropicHistory anthropicUsageHistory
