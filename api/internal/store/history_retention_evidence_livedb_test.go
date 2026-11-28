@@ -189,6 +189,11 @@ func heEvidenceDSN(base string) (string, error) {
 	if cfg.Database != heDBName {
 		return "", fmt.Errorf("evidence DSN selects database %q, want %q", cfg.Database, heDBName)
 	}
+	// A multi-host DSN lets each new connection (the marker check, store.Migrate, store.OpenPool)
+	// select a different server, so the marker verified on one would not cover writes on another.
+	if len(cfg.Fallbacks) > 0 {
+		return "", fmt.Errorf("evidence DSN names %d hosts, want exactly one", len(cfg.Fallbacks)+1)
+	}
 	return dsn, nil
 }
 
@@ -208,6 +213,9 @@ func TestHistoryRetentionEvidenceDSN(t *testing.T) {
 
 	if _, err := heEvidenceDSN(base + "&dbname=sweep"); err == nil || !strings.Contains(err.Error(), "database") {
 		t.Fatalf("conflicting dbname error = %v, want a database identity refusal", err)
+	}
+	if _, err := heEvidenceDSN("postgres://tester@host-a,host-b/sweep?sslmode=disable"); err == nil || !strings.Contains(err.Error(), "hosts") {
+		t.Fatalf("multi-host error = %v, want a single-host refusal", err)
 	}
 }
 
